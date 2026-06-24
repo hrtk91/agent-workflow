@@ -123,7 +123,7 @@ go run ./cmd/worker \
   -mode trigger \
   -kind takt \
   -repo /home/h-taminato/repos/eb-temp \
-  -takt-args '--pipeline --skip-git --quiet --workflow eb-temp-fix --task "Fix issue #123"' \
+  -takt-args '--pipeline --skip-git --quiet --workflow default --issue 123' \
   -timeout-seconds 7200 \
   -verify-command 'test -n "$(find .takt/runs -mindepth 1 -maxdepth 1 -type d -printf x -quit)"'
 ```
@@ -155,5 +155,5 @@ go run ./cmd/worker \
   -meta-repo /home/h-taminato/repos/eb-temp \
   -meta-target-workflow ebtemp-next-workflow \
   -meta-request 'Create an eb-temp takt workflow draft' \
-  -meta-generator-command 'cp .takt/workflows/eb-temp-fix.yaml .takt/workflows/ebtemp-next-workflow.yaml'
+  -meta-generator-command 'cp .takt/workflows/default.yaml .takt/workflows/ebtemp-next-workflow.yaml'
 ```
