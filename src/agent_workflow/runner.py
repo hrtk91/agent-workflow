@@ -124,6 +124,7 @@ class WorkflowRunner:
             subprocess.run(["git", "-C", state.repo_path, "worktree", "prune"], check=False)
             shutil.rmtree(Path(state.worktree_path).parent, ignore_errors=True)
             state.worktree_path = None
+            self._write_summary(state)
             self.save_state(state)
 
     def load_state(self, run_id: str) -> RunState:

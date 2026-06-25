@@ -49,6 +49,11 @@ class LightweightRunnerTest(unittest.TestCase):
         row = conn.execute("select status, summary_path from jobs where run_id = ?", (state["run_id"],)).fetchone()
         self.assertEqual(("succeeded", str(summary)), row)
 
+        self._aw("cleanup", "--run-id", state["run_id"])
+        cleaned_state = self._state(summary)
+        self.assertIsNone(cleaned_state["worktree_path"])
+        self.assertIn("worktree: ``", summary.read_text())
+
     def test_resume_continues_from_failed_qc_step(self) -> None:
         first = self._aw(
             "run",
