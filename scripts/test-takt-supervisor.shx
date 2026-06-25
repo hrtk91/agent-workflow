@@ -7,6 +7,7 @@ ORIG_HOME=${HOME:-}
 export GOPATH="${GOPATH:-$ORIG_HOME/go}"
 export GOMODCACHE="${GOMODCACHE:-$GOPATH/pkg/mod}"
 export GOCACHE="$TMP_DIR/go-build-cache"
+export GOFLAGS="${GOFLAGS:--buildvcs=false}"
 export HOME="$TMP_DIR/home"
 export PATH="$TMP_DIR/bin:$PATH"
 

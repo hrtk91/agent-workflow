@@ -1,0 +1,16 @@
+[project]
+name = "agent-workflow"
+version = "0.1.0"
+description = "Lightweight resumable runner for local agent workflows"
+requires-python = ">=3.11"
+
+[project.optional-dependencies]
+otel = [
+  "opentelemetry-sdk>=1.25",
+  "opentelemetry-exporter-otlp-proto-http>=1.25",
+]
+
+[tool.pyright]
+pythonVersion = "3.11"
+include = ["src"]
+

@@ -1,6 +1,6 @@
 # agent-workflow
 
-Hatchet-based workflow harness for local agent work.
+Lightweight resumable runner for local agent workflows.
 
 The goal is not to make the agent smarter. The goal is to stop treating an
 agent response, a queued run, or a created PR as proof that the workflow is
@@ -9,151 +9,133 @@ done.
 ## Shape
 
 ```text
-Hatchet
-  queue / retry / durable state / cron / dashboard / OpenTelemetry
-
-Go worker
-  lock target repo
-  run takt
-  verify takt outcome
-  report
-
-Meta-workflow
-  generate takt workflow patch
-  takt workflow doctor
-  prompt preview
-  failure injection
-  draft report
-  cleanup
-
 Hermes
-  optional UI / trigger / notification only
+  trigger / notification UI only
+
+agent-workflow runner
+  task packet
+  per-run worktree
+  takt pipeline
+  QC command
+  state.json / jobs.sqlite
+  summary.md / trace.jsonl
+
+takt
+  actual agentic implementation
 ```
+
+Hatchet is intentionally not required for the default path. If worker fleets,
+remote machines, or a durable distributed queue become necessary later, Hatchet
+can be added as an outer backend. The current focus is one issue/task being
+implemented and verified reliably.
+
+## Task Packets
+
+The runner is not GitHub-issue centric. It consumes text packets:
+
+```text
+task.md
+acceptance.md     optional
+constraints.md    optional
+context.md        optional
+source.json       optional provenance
+```
+
+GitHub issues, Hermes messages, Discord text, or local notes should be converted
+to this packet format before execution. The core runner only needs the text.
 
 ## Workflow States
 
-The main workflow is `run-takt-workflow`. It keeps these boundaries explicit:
+Each run records these steps:
 
-- `prepare-takt-run`: create a run directory and record the target repo state.
-- `run-takt`: acquire a lock, check preconditions, and run `takt`.
-- `verify-takt-run`: inspect exit code, timeout, explicit verifier, and known unsafe output such as
-  `--no-verify`.
-- `report-takt-run`: write a summary file under
-  `~/.local/state/agent-workflow/runs`.
+- `load_task`
+- `create_worktree`
+- `run_takt`
+- `run_qc`
+- `write_summary`
 
-`takt run` success is not workflow success. Only `verify-takt-run` can mark a
-run as done. A run without `-verify-command` is never marked done.
-
-The older `agent` workflow is still available for direct command experiments,
-but the default path is to let `takt` do the actual agentic work and let
-Hatchet supervise it.
-
-## Meta-Workflow
-
-`create-workflow-definition` is the workflow for creating takt workflow
-definitions. It exists so Hermes can request or generate `.takt/workflows/*.yaml`
-without being trusted to decide that the generated workflow is production-ready.
-
-The meta-workflow:
-
-- creates a detached worktree of the target repo.
-- runs `-meta-generator-command` in that worktree.
-- requires the generator to produce a git diff.
-- runs `takt workflow doctor .takt/workflows`.
-- previews takt prompts.
-- injects a malformed workflow and confirms `takt workflow doctor` rejects it.
-- optionally confirms Docker label cleanup with
-  `-meta-require-docker-cleanup`.
-- writes `meta-review.md`, `draft.patch`, and `draft.json` under
-  `~/.local/state/agent-workflow/runs/<run-id>`.
-
-The draft record always has `autoSchedule: false`. This tool does not merge,
-deploy, or register production schedules automatically.
-
-## Docker
-
-Docker is optional in v0. If `-docker` is set, the worker runs:
+Step state is stored in:
 
 ```text
-docker run --rm \
-  --label agent-workflow=true \
-  --label agent-workflow.run-id=<run-id> \
-  --label agent-workflow.workflow=<workflow> \
-  -v <worktree>:/workspace \
-  -w /workspace \
-  agent-workflow-runner:latest \
-  bash -lc <command>
+~/.local/state/agent-workflow/
+  jobs.sqlite
+  runs/<run-id>/state.json
+  runs/<run-id>/summary.md
+  runs/<run-id>/trace.jsonl
+  runs/<run-id>/logs/*.log
+  worktrees/<run-id>/repo
 ```
 
-Containers are labelled so cleanup can target only this system. The image is
-not built by this repo yet. The worker uses `--rm` and bind mounts rather than
-named volumes. If a run is interrupted, clean labelled containers with:
+`takt` success is not workflow success. The run is only `succeeded` after the
+explicit QC command passes. Test failures become `qc_failed`; timeouts become
+`timed_out`; missing task text or policy stops become `blocked`.
 
-```bash
-go run ./cmd/worker -mode cleanup-docker
-```
+## OpenTelemetry
 
-Do not run broad `docker system prune` from this tool. Images and unrelated
-volumes are intentionally left alone.
+Every step writes one OpenTelemetry-shaped span record to `trace.jsonl`. This is
+always available without external services and includes:
 
-## microsandbox
+- `trace_id`
+- `span_id`
+- step name
+- duration
+- status code
+- exit code
+- timeout flag
+- stdout/stderr log paths
 
-This host is WSL2 and has no `/dev/kvm`, so microsandbox is not a viable local
-executor here. Keep isolation behind an executor boundary. Docker is the v0
-fallback.
+The JSONL format is intentionally close to OTel span fields so an OTLP exporter
+can be added without changing the runner state model.
 
 ## Run
 
-Start Hatchet locally first:
+Run a text task:
 
 ```bash
-hatchet server start
+scripts/aw run \
+  --repo /home/h-taminato/repos/eb-temp-hermes-runtime \
+  --task-file /path/to/task.md \
+  --workflow default \
+  --verify-command 'mise run clippy' \
+  --timeout-seconds 7200
 ```
 
-Export the client token shown by Hatchet, then start the worker:
+Resume a failed or interrupted run:
 
 ```bash
-go run ./cmd/worker -mode worker
+scripts/aw resume --run-id <run-id>
 ```
 
-Trigger a takt workflow:
+Retry one step and all downstream steps:
 
 ```bash
-go run ./cmd/worker \
-  -mode trigger \
-  -kind takt \
-  -repo /home/h-taminato/repos/eb-temp \
-  -takt-args '--pipeline --skip-git --quiet --workflow default --issue 123' \
-  -timeout-seconds 7200 \
-  -verify-command 'test -n "$(find .takt/runs -mindepth 1 -maxdepth 1 -type d -printf x -quit)"'
+scripts/aw retry --run-id <run-id> --step run_qc
 ```
 
-Dry-run without Hatchet:
+Show recent runs:
 
 ```bash
-go run ./cmd/worker \
-  -mode dry-run \
-  -kind takt \
-  -repo /home/h-taminato/repos/eb-temp \
-  -takt-args '--version' \
-  -require-clean-repo=false \
-  -verify-command 'takt --version >/dev/null'
+scripts/aw status
 ```
 
-If you intentionally want to consume `.takt/tasks.yaml`, pass `-takt-args
-'run --ignore-exceed'` explicitly. That path can create takt-managed
-worktrees, so the verifier fails by default if new git worktrees remain after
-the run. Use `-allow-new-worktrees` only when leaving those worktrees around is
-the intended outcome.
-
-Dry-run the meta-workflow without Hatchet:
+Remove a run worktree:
 
 ```bash
-go run ./cmd/worker \
-  -mode dry-run \
-  -kind meta \
-  -meta-repo /home/h-taminato/repos/eb-temp \
-  -meta-target-workflow ebtemp-next-workflow \
-  -meta-request 'Create an eb-temp takt workflow draft' \
-  -meta-generator-command 'cp .takt/workflows/default.yaml .takt/workflows/ebtemp-next-workflow.yaml'
+scripts/aw cleanup --run-id <run-id>
 ```
+
+## Tests
+
+```bash
+shx scripts/test.shx
+```
+
+The Python tests use a fake git repo and fake `takt` binary, so they do not call
+an external model.
+
+## Legacy Go Supervisor
+
+The existing Go supervisor remains in the repo while the lightweight runner is
+validated. It still supports the earlier Hatchet and dry-run experiments, but it
+is not the default path for Hermes-triggered issue work.
+
