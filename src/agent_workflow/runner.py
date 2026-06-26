@@ -306,6 +306,7 @@ class WorkflowRunner:
 
     def _write_summary(self, state: RunState) -> None:
         task_preview = render_task_text(Path(state.task_dir))[:1200]
+        elapsed = elapsed_seconds(state.created_at, None if state.status == "running" else state.updated_at)
         lines = [
             f"# agent-workflow run {state.run_id}",
             "",
@@ -314,12 +315,22 @@ class WorkflowRunner:
             f"- worktree: `{state.worktree_path or ''}`",
             f"- workflow: `{state.workflow}`",
             f"- base_ref: `{state.base_ref or ''}`",
+            f"- created_at: `{state.created_at}`",
+            f"- updated_at: `{state.updated_at}`",
+            f"- elapsed_seconds: `{elapsed}`",
+            f"- timeout_seconds: `{format_seconds(state.timeout_seconds)}`",
             f"- trace: `{state.trace_path}`",
             "",
             "## steps",
         ]
         for step in state.steps:
             line = f"- {step.name}: `{step.status}` attempts={step.attempts}"
+            duration = step_duration_seconds(step)
+            if duration is not None:
+                line += f" duration_seconds={duration}"
+            remaining = step_timeout_remaining_seconds(step, state.timeout_seconds)
+            if remaining is not None:
+                line += f" timeout_remaining_seconds={remaining}"
             if step.exit_code is not None:
                 line += f" exit={step.exit_code}"
             if step.timed_out:
@@ -371,6 +382,7 @@ class WorkflowRunner:
         monitor_json = takt_run / "monitor.json"
         if monitor_json.exists():
             lines.append(f"- takt_monitor: `{monitor_json}`")
+            lines.extend(self._takt_monitor_overview(monitor_json))
         logs = takt_run / "logs"
         if logs.exists():
             for path in sorted(logs.glob("*-otel-session-shadow.jsonl")):
@@ -386,6 +398,53 @@ class WorkflowRunner:
             if line.startswith(prefixes):
                 overview.append(f"  {line}")
         return overview
+
+    def _takt_monitor_overview(self, monitor_json: Path) -> list[str]:
+        try:
+            data = json.loads(monitor_json.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        points_by_metric: dict[str, list[dict[str, object]]] = {}
+        for scope in data.get("scopeMetrics") or []:
+            for metric in scope.get("metrics") or []:
+                points_by_metric[str(metric.get("name") or "")] = list(metric.get("points") or [])
+
+        lines: list[str] = []
+        for point in points_by_metric.get("takt.workflow.runs", [])[-1:]:
+            attrs = point.get("attributes") or {}
+            status = attrs.get("takt.workflow.status")
+            abort_kind = attrs.get("takt.workflow.abort.kind")
+            if status:
+                lines.append(f"- takt_workflow_status: `{status}`")
+            if abort_kind:
+                lines.append(f"- takt_workflow_abort_kind: `{abort_kind}`")
+
+        for point in points_by_metric.get("takt.workflow.duration", [])[-1:]:
+            duration = monitor_duration_ms(point)
+            if duration is not None:
+                lines.append(f"- takt_workflow_duration_ms: `{duration}`")
+
+        for point in points_by_metric.get("takt.workflow.step.duration", []):
+            attrs = point.get("attributes") or {}
+            duration = monitor_duration_ms(point)
+            if duration is None:
+                continue
+            name = attrs.get("takt.step.name") or "unknown"
+            status = attrs.get("takt.step.status") or "unknown"
+            model = attrs.get("takt.model.name") or ""
+            suffix = f" model={model}" if model else ""
+            lines.append(f"- takt_step_duration: `{name}` status=`{status}` duration_ms=`{duration}`{suffix}")
+
+        for point in points_by_metric.get("takt.workflow.phase.duration", [])[-8:]:
+            attrs = point.get("attributes") or {}
+            duration = monitor_duration_ms(point)
+            if duration is None:
+                continue
+            step = attrs.get("takt.step.name") or "unknown"
+            phase = attrs.get("takt.phase.name") or "unknown"
+            status = attrs.get("takt.phase.status") or "unknown"
+            lines.append(f"- takt_phase_duration: `{step}/{phase}` status=`{status}` duration_ms=`{duration}`")
+        return lines
 
     def _latest_takt_run(self, runs_dir: Path, min_mtime: float | None = None) -> Path | None:
         if not runs_dir.exists():
@@ -603,6 +662,62 @@ def render_task_text(task_dir: Path) -> str:
 def count_lines(path: Path) -> int:
     with path.open("r", encoding="utf-8", errors="replace") as f:
         return sum(1 for _ in f)
+
+
+def parse_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def format_seconds(value: float | int | None) -> str:
+    if value is None:
+        return ""
+    seconds = float(value)
+    if seconds.is_integer():
+        return str(int(seconds))
+    return str(round(seconds, 3))
+
+
+def elapsed_seconds(start: str | None, end: str | None = None) -> str:
+    started_at = parse_time(start)
+    if started_at is None:
+        return ""
+    ended_at = parse_time(end) or datetime.now(timezone.utc)
+    return format_seconds(max(0.0, (ended_at - started_at).total_seconds()))
+
+
+def step_duration_seconds(step: StepState) -> str | None:
+    if not step.started_at:
+        return None
+    return elapsed_seconds(step.started_at, step.finished_at)
+
+
+def step_timeout_remaining_seconds(step: StepState, timeout_seconds: float) -> str | None:
+    if timeout_seconds <= 0 or step.status != "running" or not step.started_at:
+        return None
+    started_at = parse_time(step.started_at)
+    if started_at is None:
+        return None
+    elapsed = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
+    return format_seconds(max(0.0, timeout_seconds - elapsed))
+
+
+def monitor_duration_ms(point: dict[str, object]) -> int | None:
+    value = point.get("value")
+    if isinstance(value, dict):
+        raw = value.get("sum")
+    else:
+        raw = value
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return None
 
 
 def config_to_dict(config: RunnerConfig) -> dict[str, object]:

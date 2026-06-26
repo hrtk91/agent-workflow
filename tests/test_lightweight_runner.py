@@ -46,6 +46,11 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertIn("## executor observability", summary_text)
         self.assertIn("- takt_trace: `", summary_text)
         self.assertIn("- takt_monitor: `", summary_text)
+        self.assertIn("- takt_workflow_status: `succeeded`", summary_text)
+        self.assertIn("- takt_workflow_duration_ms: `1000`", summary_text)
+        self.assertIn("- takt_step_duration: `implement` status=`done` duration_ms=`1000`", summary_text)
+        self.assertIn("- timeout_seconds: `7200`", summary_text)
+        self.assertIn("duration_seconds=", summary_text)
         self.assertIn("- takt_session_shadow: `", summary_text)
         self.assertIn("- takt_phase_usage: `", summary_text)
         trace_rows = [json.loads(line) for line in Path(state["trace_path"]).read_text().splitlines()]
@@ -107,6 +112,9 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertEqual(1, result.returncode)
         state = self._state(Path(result.stdout.strip()))
         self.assertEqual("timed_out", state["status"])
+        summary_text = Path(state["summary_path"]).read_text()
+        self.assertIn("- timeout_seconds: `0.2`", summary_text)
+        self.assertIn("timed_out=true", summary_text)
         run_executor = next(step for step in state["steps"] if step["name"] == "run_executor")
         self.assertTrue(run_executor["timed_out"])
         trace_rows = [json.loads(line) for line in Path(state["trace_path"]).read_text().splitlines()]
@@ -185,7 +193,41 @@ class LightweightRunnerTest(unittest.TestCase):
             "- Iterations: 1\n"
             "- Reason: complete\n"
             "TRACE\n"
-            "printf '{\"ok\":true}\\n' > .takt/runs/fake-run/monitor.json\n"
+            "cat > .takt/runs/fake-run/monitor.json <<'MONITOR'\n"
+            "{\n"
+            "  \"schemaVersion\": 1,\n"
+            "  \"scopeMetrics\": [\n"
+            "    {\n"
+            "      \"metrics\": [\n"
+            "        {\n"
+            "          \"name\": \"takt.workflow.runs\",\n"
+            "          \"points\": [\n"
+            "            {\"attributes\": {\"takt.workflow.status\": \"succeeded\"}, \"value\": 1}\n"
+            "          ]\n"
+            "        },\n"
+            "        {\n"
+            "          \"name\": \"takt.workflow.duration\",\n"
+            "          \"points\": [\n"
+            "            {\"value\": {\"sum\": 1000}}\n"
+            "          ]\n"
+            "        },\n"
+            "        {\n"
+            "          \"name\": \"takt.workflow.step.duration\",\n"
+            "          \"points\": [\n"
+            "            {\"attributes\": {\"takt.step.name\": \"implement\", \"takt.step.status\": \"done\"}, \"value\": {\"sum\": 1000}}\n"
+            "          ]\n"
+            "        },\n"
+            "        {\n"
+            "          \"name\": \"takt.workflow.phase.duration\",\n"
+            "          \"points\": [\n"
+            "            {\"attributes\": {\"takt.step.name\": \"implement\", \"takt.phase.name\": \"execute\", \"takt.phase.status\": \"done\"}, \"value\": {\"sum\": 900}}\n"
+            "          ]\n"
+            "        }\n"
+            "      ]\n"
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "MONITOR\n"
             "printf '{\"type\":\"workflow_start\"}\\n' > .takt/runs/fake-run/logs/session-otel-session-shadow.jsonl\n"
             "printf '{\"type\":\"phase_usage\"}\\n' > .takt/runs/fake-run/logs/session-usage-events.phase.jsonl\n"
             "echo ok > implemented.txt\n",
