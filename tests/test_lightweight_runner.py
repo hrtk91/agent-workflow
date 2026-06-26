@@ -41,7 +41,13 @@ class LightweightRunnerTest(unittest.TestCase):
         state = self._state(summary)
         self.assertEqual("succeeded", state["status"])
         self.assertTrue(summary.exists())
-        self.assertIn("status: `succeeded`", summary.read_text())
+        summary_text = summary.read_text()
+        self.assertIn("status: `succeeded`", summary_text)
+        self.assertIn("## executor observability", summary_text)
+        self.assertIn("- takt_trace: `", summary_text)
+        self.assertIn("- takt_monitor: `", summary_text)
+        self.assertIn("- takt_session_shadow: `", summary_text)
+        self.assertIn("- takt_phase_usage: `", summary_text)
         trace_rows = [json.loads(line) for line in Path(state["trace_path"]).read_text().splitlines()]
         self.assertEqual(["OK"] * 5, [row["status"]["code"] for row in trace_rows])
 
@@ -52,7 +58,9 @@ class LightweightRunnerTest(unittest.TestCase):
         self._aw("cleanup", "--run-id", state["run_id"])
         cleaned_state = self._state(summary)
         self.assertIsNone(cleaned_state["worktree_path"])
-        self.assertIn("worktree: ``", summary.read_text())
+        cleaned_summary_text = summary.read_text()
+        self.assertIn("worktree: ``", cleaned_summary_text)
+        self.assertIn("## executor observability", cleaned_summary_text)
 
     def test_resume_continues_from_failed_qc_step(self) -> None:
         first = self._aw(
@@ -168,6 +176,18 @@ class LightweightRunnerTest(unittest.TestCase):
             "if [[ \"${FAKE_TAKT_EXIT:-0}\" != \"0\" ]]; then\n"
             "  exit \"$FAKE_TAKT_EXIT\"\n"
             "fi\n"
+            "mkdir -p .takt/runs/fake-run/logs\n"
+            "cat > .takt/runs/fake-run/trace.md <<'TRACE'\n"
+            "# Execution Trace: default\n"
+            "- Started: 2026-01-01T00:00:00.000Z\n"
+            "- Ended: 2026-01-01T00:00:01.000Z\n"
+            "- Status: succeeded\n"
+            "- Iterations: 1\n"
+            "- Reason: complete\n"
+            "TRACE\n"
+            "printf '{\"ok\":true}\\n' > .takt/runs/fake-run/monitor.json\n"
+            "printf '{\"type\":\"workflow_start\"}\\n' > .takt/runs/fake-run/logs/session-otel-session-shadow.jsonl\n"
+            "printf '{\"type\":\"phase_usage\"}\\n' > .takt/runs/fake-run/logs/session-usage-events.phase.jsonl\n"
             "echo ok > implemented.txt\n",
             encoding="utf-8",
         )

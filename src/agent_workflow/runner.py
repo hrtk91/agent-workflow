@@ -275,7 +275,11 @@ class WorkflowRunner:
         result = run_logged(args, Path(state.worktree_path or state.repo_path), Path(state.run_dir) / "logs", "run_executor", state.timeout_seconds)
         step.exit_code = result.exit_code
         step.timed_out = result.timed_out
-        span["attributes"] = {**span["attributes"], **result.attrs()}
+        attrs = result.attrs()
+        snapshot = self._snapshot_executor_observability(state)
+        if snapshot:
+            attrs["executor_observability_path"] = str(snapshot)
+        span["attributes"] = {**span["attributes"], **attrs}
         if result.timed_out:
             raise StepFailure("timed_out", "timed_out", "executor command timed out", result.exit_code, True)
         if result.exit_code != 0:
@@ -322,8 +326,73 @@ class WorkflowRunner:
             if step.error:
                 line += f" error={step.error}"
             lines.append(line)
+        lines.extend(self._executor_observability_summary(state))
         lines.extend(["", "## task", "", "```text", task_preview, "```", ""])
         Path(state.summary_path).write_text("\n".join(lines), encoding="utf-8")
+
+    def _snapshot_executor_observability(self, state: RunState) -> Path | None:
+        if not state.worktree_path:
+            return None
+        takt_run = self._latest_takt_run(Path(state.worktree_path) / ".takt" / "runs")
+        if takt_run is None:
+            return None
+        dest = Path(state.run_dir) / "executor_observability" / "takt" / takt_run.name
+        if dest.exists():
+            shutil.rmtree(dest)
+        copied = False
+        for rel in [Path("trace.md"), Path("monitor.json")]:
+            source = takt_run / rel
+            if source.exists():
+                (dest / rel.parent).mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, dest / rel)
+                copied = True
+        logs = takt_run / "logs"
+        if logs.exists():
+            for source in sorted([*logs.glob("*-otel-session-shadow.jsonl"), *logs.glob("*-usage-events.phase.jsonl")]):
+                target = dest / "logs" / source.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+                copied = True
+        return dest if copied else None
+
+    def _executor_observability_summary(self, state: RunState) -> list[str]:
+        takt_run = self._latest_takt_run(Path(state.run_dir) / "executor_observability" / "takt")
+        if takt_run is None and state.worktree_path:
+            takt_run = self._latest_takt_run(Path(state.worktree_path) / ".takt" / "runs")
+        if takt_run is None:
+            return []
+
+        lines = ["", "## executor observability", f"- takt_run: `{takt_run}`"]
+        trace_md = takt_run / "trace.md"
+        if trace_md.exists():
+            lines.append(f"- takt_trace: `{trace_md}`")
+            lines.extend(self._takt_trace_overview(trace_md))
+        monitor_json = takt_run / "monitor.json"
+        if monitor_json.exists():
+            lines.append(f"- takt_monitor: `{monitor_json}`")
+        logs = takt_run / "logs"
+        if logs.exists():
+            for path in sorted(logs.glob("*-otel-session-shadow.jsonl")):
+                lines.append(f"- takt_session_shadow: `{path}` lines={count_lines(path)}")
+            for path in sorted(logs.glob("*-usage-events.phase.jsonl")):
+                lines.append(f"- takt_phase_usage: `{path}` lines={count_lines(path)}")
+        return lines
+
+    def _takt_trace_overview(self, trace_md: Path) -> list[str]:
+        prefixes = ("- Status:", "- Iterations:", "- Reason:", "- Started:", "- Ended:")
+        overview: list[str] = []
+        for line in trace_md.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith(prefixes):
+                overview.append(f"  {line}")
+        return overview
+
+    def _latest_takt_run(self, runs_dir: Path) -> Path | None:
+        if not runs_dir.exists():
+            return None
+        candidates = [path for path in runs_dir.iterdir() if path.is_dir()]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime)
 
     def _pending_task_source(self, state: RunState) -> Path | None:
         marker = state.run_path / "task_source.json"
@@ -526,6 +595,11 @@ def render_task_text(task_dir: Path) -> str:
         if path.exists():
             parts.append(f"# {name}\n\n{path.read_text(encoding='utf-8').strip()}")
     return "\n\n".join(parts).strip()
+
+
+def count_lines(path: Path) -> int:
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        return sum(1 for _ in f)
 
 
 def config_to_dict(config: RunnerConfig) -> dict[str, object]:
