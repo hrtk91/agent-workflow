@@ -15,6 +15,16 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="start a new task run")
     add_run_args(run)
 
+    enqueue = sub.add_parser("enqueue", help="queue a task run and return immediately")
+    add_run_args(enqueue)
+
+    tick = sub.add_parser("tick", help="run queued jobs once and exit")
+    tick.add_argument("--max-runs", type=int, default=1)
+
+    worker = sub.add_parser("worker", help="run queued jobs in a loop")
+    worker.add_argument("--interval-seconds", type=float, default=60)
+    worker.add_argument("--max-runs-per-tick", type=int, default=1)
+
     resume = sub.add_parser("resume", help="resume a failed or interrupted run")
     resume.add_argument("--run-id", required=True)
     resume.add_argument("--verify-command")
@@ -47,7 +57,7 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--workflow", default="default")
     parser.add_argument("--verify-command", required=True)
     parser.add_argument("--timeout-seconds", type=float, default=7200)
-    parser.add_argument("--takt-bin", default="takt")
+    parser.add_argument("--executor-bin", default="takt")
     parser.add_argument("--provider")
     parser.add_argument("--model")
     parser.add_argument("--base-ref")
@@ -64,7 +74,7 @@ def config_from_args(args: argparse.Namespace) -> RunnerConfig:
         workflow=getattr(args, "workflow", "default"),
         verify_command=getattr(args, "verify_command", None),
         timeout_seconds=getattr(args, "timeout_seconds", None),
-        takt_bin=getattr(args, "takt_bin", "takt"),
+        executor_bin=getattr(args, "executor_bin", "takt"),
         provider=getattr(args, "provider", None),
         model=getattr(args, "model", None),
         base_ref=getattr(args, "base_ref", None),
@@ -80,6 +90,17 @@ def main(argv: list[str] | None = None) -> int:
             state = runner.run_new(config_from_args(args))
             print(state.summary_path)
             return 0 if state.status == "succeeded" else 1
+        if args.command == "enqueue":
+            print(runner.enqueue(config_from_args(args)))
+            return 0
+        if args.command == "tick":
+            results = runner.tick(max_runs=args.max_runs)
+            for result in results:
+                print("\t".join(str(result.get(key, "")) for key in ["job_id", "status", "run_id", "summary_path", "error"]))
+            return 0 if all(result.get("status") == "succeeded" for result in results) else 1
+        if args.command == "worker":
+            runner.worker(interval_seconds=args.interval_seconds, max_runs_per_tick=args.max_runs_per_tick)
+            return 0
         if args.command == "resume":
             state = runner.resume(args.run_id, verify_command=args.verify_command, timeout_seconds=args.timeout_seconds)
             print(state.summary_path)
@@ -101,4 +122,3 @@ def main(argv: list[str] | None = None) -> int:
         print(f"agent-workflow: {exc}", file=sys.stderr)
         return 2
     return 2
-

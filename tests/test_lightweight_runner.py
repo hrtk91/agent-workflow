@@ -33,7 +33,7 @@ class LightweightRunnerTest(unittest.TestCase):
             "Implement the fixture task.",
             "--verify-command",
             "test -f implemented.txt",
-            "--takt-bin",
+            "--executor-bin",
             str(self.fake_takt),
         )
 
@@ -63,7 +63,7 @@ class LightweightRunnerTest(unittest.TestCase):
             "Implement but wait for a human-created QC marker.",
             "--verify-command",
             "test -f qc-pass",
-            "--takt-bin",
+            "--executor-bin",
             str(self.fake_takt),
             check=False,
         )
@@ -76,7 +76,7 @@ class LightweightRunnerTest(unittest.TestCase):
         resumed_state = self._state(Path(resumed.stdout.strip()))
         attempts = {step["name"]: step["attempts"] for step in resumed_state["steps"]}
         self.assertEqual("succeeded", resumed_state["status"])
-        self.assertEqual(1, attempts["run_takt"])
+        self.assertEqual(1, attempts["run_executor"])
         self.assertEqual(2, attempts["run_qc"])
 
     def test_timeout_marks_takt_step_and_trace_error(self) -> None:
@@ -88,7 +88,7 @@ class LightweightRunnerTest(unittest.TestCase):
             "This task intentionally sleeps.",
             "--verify-command",
             "test -f implemented.txt",
-            "--takt-bin",
+            "--executor-bin",
             str(self.fake_takt),
             "--timeout-seconds",
             "0.2",
@@ -99,10 +99,34 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertEqual(1, result.returncode)
         state = self._state(Path(result.stdout.strip()))
         self.assertEqual("timed_out", state["status"])
-        run_takt = next(step for step in state["steps"] if step["name"] == "run_takt")
-        self.assertTrue(run_takt["timed_out"])
+        run_executor = next(step for step in state["steps"] if step["name"] == "run_executor")
+        self.assertTrue(run_executor["timed_out"])
         trace_rows = [json.loads(line) for line in Path(state["trace_path"]).read_text().splitlines()]
         self.assertIn("ERROR", [row["status"]["code"] for row in trace_rows])
+
+    def test_enqueue_then_tick_runs_job(self) -> None:
+        enqueued = self._aw(
+            "enqueue",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Queue this fixture task.",
+            "--verify-command",
+            "test -f implemented.txt",
+            "--executor-bin",
+            str(self.fake_takt),
+        )
+        job_id = enqueued.stdout.strip()
+        self.assertRegex(job_id, r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
+
+        status_before = self._aw("status")
+        self.assertIn(f"job\t{job_id}\tqueued", status_before.stdout)
+
+        ticked = self._aw("tick", "--max-runs", "1")
+        self.assertIn(f"{job_id}\tsucceeded", ticked.stdout)
+
+        status_after = self._aw("status")
+        self.assertIn(f"job\t{job_id}\tsucceeded", status_after.stdout)
 
     def _aw(self, *args: str, env: dict[str, str] | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
         merged_env = os.environ.copy()

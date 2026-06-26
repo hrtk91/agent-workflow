@@ -12,22 +12,18 @@ done.
 Hermes
   trigger / notification UI only
 
-agent-workflow runner
+agent-workflow
   task packet
+  queue
   per-run worktree
-  takt pipeline
+  executor
   QC command
   state.json / jobs.sqlite
   summary.md / trace.jsonl
-
-takt
-  actual agentic implementation
 ```
 
-Hatchet is intentionally not required for the default path. If worker fleets,
-remote machines, or a durable distributed queue become necessary later, Hatchet
-can be added as an outer backend. The current focus is one issue/task being
-implemented and verified reliably.
+Hermes should normally enqueue work and exit quickly. Long-running execution is
+owned by `aw tick` or `aw worker`.
 
 ## Task Packets
 
@@ -50,7 +46,7 @@ Each run records these steps:
 
 - `load_task`
 - `create_worktree`
-- `run_takt`
+- `run_executor`
 - `run_qc`
 - `write_summary`
 
@@ -66,9 +62,68 @@ Step state is stored in:
   worktrees/<run-id>/repo
 ```
 
-`takt` success is not workflow success. The run is only `succeeded` after the
+Executor success is not workflow success. The run is only `succeeded` after the
 explicit QC command passes. Test failures become `qc_failed`; timeouts become
 `timed_out`; missing task text or policy stops become `blocked`.
+
+## Queue
+
+Queue a task and return immediately:
+
+```bash
+aw enqueue \
+  --repo /home/h-taminato/repos/eb-temp-hermes-runtime \
+  --task-file /path/to/task.md \
+  --workflow default \
+  --verify-command 'mise run check-all' \
+  --timeout-seconds 7200
+```
+
+Run queued work once:
+
+```bash
+aw tick --max-runs 1
+```
+
+Run queued work continuously:
+
+```bash
+aw worker --interval-seconds 60 --max-runs-per-tick 1
+```
+
+Direct synchronous execution is available for smoke tests and manual use:
+
+```bash
+aw run \
+  --repo /home/h-taminato/repos/eb-temp-hermes-runtime \
+  --task-file /path/to/task.md \
+  --workflow default \
+  --verify-command 'mise run check-all'
+```
+
+Resume a failed or interrupted run:
+
+```bash
+aw resume --run-id <run-id>
+```
+
+Retry one step and all downstream steps:
+
+```bash
+aw retry --run-id <run-id> --step run_qc
+```
+
+Show recent queued jobs and runs:
+
+```bash
+aw status
+```
+
+Remove a run worktree:
+
+```bash
+aw cleanup --run-id <run-id>
+```
 
 ## OpenTelemetry
 
@@ -87,55 +142,11 @@ always available without external services and includes:
 The JSONL format is intentionally close to OTel span fields so an OTLP exporter
 can be added without changing the runner state model.
 
-## Run
-
-Run a text task:
-
-```bash
-scripts/aw run \
-  --repo /home/h-taminato/repos/eb-temp-hermes-runtime \
-  --task-file /path/to/task.md \
-  --workflow default \
-  --verify-command 'mise run clippy' \
-  --timeout-seconds 7200
-```
-
-Resume a failed or interrupted run:
-
-```bash
-scripts/aw resume --run-id <run-id>
-```
-
-Retry one step and all downstream steps:
-
-```bash
-scripts/aw retry --run-id <run-id> --step run_qc
-```
-
-Show recent runs:
-
-```bash
-scripts/aw status
-```
-
-Remove a run worktree:
-
-```bash
-scripts/aw cleanup --run-id <run-id>
-```
-
 ## Tests
 
 ```bash
 shx scripts/test.shx
 ```
 
-The Python tests use a fake git repo and fake `takt` binary, so they do not call
-an external model.
-
-## Legacy Go Supervisor
-
-The existing Go supervisor remains in the repo while the lightweight runner is
-validated. It still supports the earlier Hatchet and dry-run experiments, but it
-is not the default path for Hermes-triggered issue work.
-
+The Python tests use a fake git repo and fake executor binary, so they do not
+call an external model.

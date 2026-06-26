@@ -15,7 +15,7 @@ from typing import Sequence
 from agent_workflow.state import RunState, StepState
 from agent_workflow.tracing import TraceRecorder, trace_enabled_hint
 
-STEPS = ["load_task", "create_worktree", "run_takt", "run_qc", "write_summary"]
+STEPS = ["load_task", "create_worktree", "run_executor", "run_qc", "write_summary"]
 
 
 @dataclass
@@ -28,7 +28,7 @@ class RunnerConfig:
     workflow: str = "default"
     verify_command: str | None = None
     timeout_seconds: float | None = 7200
-    takt_bin: str = "takt"
+    executor_bin: str = "takt"
     provider: str | None = None
     model: str | None = None
     base_ref: str | None = None
@@ -50,6 +50,7 @@ class WorkflowRunner:
         self._init_db()
 
     def run_new(self, config: RunnerConfig) -> RunState:
+        config = self._normalize_config(config)
         if config.repo_path is None:
             raise ValueError("--repo is required")
         if not config.verify_command:
@@ -69,7 +70,7 @@ class WorkflowRunner:
             workflow=config.workflow,
             verify_command=config.verify_command,
             timeout_seconds=float(config.timeout_seconds or 0),
-            takt_bin=config.takt_bin,
+            executor_bin=config.executor_bin,
             provider=config.provider,
             model=config.model,
             base_ref=config.base_ref,
@@ -84,6 +85,45 @@ class WorkflowRunner:
         self._write_task_source(run_dir, config)
         self.save_state(state)
         return self._run_from(state, 0)
+
+    def enqueue(self, config: RunnerConfig) -> str:
+        config = self._normalize_config(config)
+        if config.repo_path is None:
+            raise ValueError("--repo is required")
+        if not config.verify_command:
+            raise ValueError("--verify-command is required; QC must be explicit")
+        job_id = new_run_id()
+        now = utc_now()
+        with self._db() as conn:
+            conn.execute(
+                """
+                insert into queue(job_id, status, config_json, run_id, summary_path, error, created_at, updated_at)
+                values(?, 'queued', ?, null, null, null, ?, ?)
+                """,
+                (job_id, json.dumps(config_to_dict(config), indent=2, sort_keys=True), now, now),
+            )
+        return job_id
+
+    def tick(self, max_runs: int = 1) -> list[dict[str, str]]:
+        results: list[dict[str, str]] = []
+        for _ in range(max_runs):
+            job = self._claim_next_job()
+            if job is None:
+                break
+            job_id, config = job
+            try:
+                state = self.run_new(config)
+                self._finish_queue_job(job_id, state.status, state.run_id, state.summary_path, "")
+                results.append({"job_id": job_id, "status": state.status, "run_id": state.run_id, "summary_path": state.summary_path})
+            except Exception as exc:
+                self._finish_queue_job(job_id, "failed", "", "", str(exc))
+                results.append({"job_id": job_id, "status": "failed", "run_id": "", "summary_path": "", "error": str(exc)})
+        return results
+
+    def worker(self, interval_seconds: float = 60, max_runs_per_tick: int = 1) -> None:
+        while True:
+            self.tick(max_runs=max_runs_per_tick)
+            time.sleep(interval_seconds)
 
     def resume(self, run_id: str, verify_command: str | None = None, timeout_seconds: float | None = None) -> RunState:
         state = self.load_state(run_id)
@@ -112,10 +152,18 @@ class WorkflowRunner:
             lines = [f"{state.run_id}\t{state.status}\t{state.current_step or '-'}\t{state.summary_path}"]
             lines.extend(f"  {s.name}\t{s.status}\tattempts={s.attempts}" for s in state.steps)
             return "\n".join(lines)
-        rows = self._db().execute(
-            "select run_id, status, coalesce(current_step, ''), summary_path from jobs order by created_at desc limit 20"
-        ).fetchall()
-        return "\n".join("\t".join(str(col) for col in row) for row in rows)
+        with self._db() as conn:
+            queue_rows = conn.execute(
+                "select job_id, status, coalesce(run_id, ''), coalesce(summary_path, '') from queue order by created_at desc limit 20"
+            ).fetchall()
+            run_rows = conn.execute(
+                "select run_id, status, coalesce(current_step, ''), summary_path from jobs order by created_at desc limit 20"
+            ).fetchall()
+        lines = ["queue:"]
+        lines.extend("\t".join(["job", *(str(col) for col in row)]) for row in queue_rows)
+        lines.append("runs:")
+        lines.extend("\t".join(["run", *(str(col) for col in row)]) for row in run_rows)
+        return "\n".join(lines)
 
     def cleanup(self, run_id: str) -> None:
         state = self.load_state(run_id)
@@ -217,21 +265,21 @@ class WorkflowRunner:
         state.worktree_path = str(worktree)
         span["attributes"] = {**span["attributes"], "worktree_path": state.worktree_path, "base_ref": state.base_ref}
 
-    def _step_run_takt(self, state: RunState, step: StepState, span: dict[str, object]) -> None:
+    def _step_run_executor(self, state: RunState, step: StepState, span: dict[str, object]) -> None:
         task_text = render_task_text(Path(state.task_dir))
-        args = [state.takt_bin, "--pipeline", "--skip-git", "--quiet", "--workflow", state.workflow, "--task", task_text]
+        args = [state.executor_bin, "--pipeline", "--skip-git", "--quiet", "--workflow", state.workflow, "--task", task_text]
         if state.provider:
             args.extend(["--provider", state.provider])
         if state.model:
             args.extend(["--model", state.model])
-        result = run_logged(args, Path(state.worktree_path or state.repo_path), Path(state.run_dir) / "logs", "run_takt", state.timeout_seconds)
+        result = run_logged(args, Path(state.worktree_path or state.repo_path), Path(state.run_dir) / "logs", "run_executor", state.timeout_seconds)
         step.exit_code = result.exit_code
         step.timed_out = result.timed_out
         span["attributes"] = {**span["attributes"], **result.attrs()}
         if result.timed_out:
-            raise StepFailure("timed_out", "timed_out", "takt command timed out", result.exit_code, True)
+            raise StepFailure("timed_out", "timed_out", "executor command timed out", result.exit_code, True)
         if result.exit_code != 0:
-            raise StepFailure("failed", "failed", f"takt command exited with {result.exit_code}", result.exit_code, False)
+            raise StepFailure("failed", "failed", f"executor command exited with {result.exit_code}", result.exit_code, False)
 
     def _step_run_qc(self, state: RunState, step: StepState, span: dict[str, object]) -> None:
         result = run_logged(["bash", "-lc", state.verify_command], Path(state.worktree_path or state.repo_path), Path(state.run_dir) / "logs", "run_qc", state.timeout_seconds)
@@ -323,6 +371,20 @@ class WorkflowRunner:
                 )
                 """
             )
+            conn.execute(
+                """
+                create table if not exists queue (
+                  job_id text primary key,
+                  status text not null,
+                  config_json text not null,
+                  run_id text,
+                  summary_path text,
+                  error text,
+                  created_at text not null,
+                  updated_at text not null
+                )
+                """
+            )
 
     def _upsert_job(self, state: RunState) -> None:
         with self._db() as conn:
@@ -355,6 +417,50 @@ class WorkflowRunner:
         else:
             raise ValueError("one of --task-dir, --task-file, or --task-text is required")
         (run_dir / "task_source.json").write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def _normalize_config(self, config: RunnerConfig) -> RunnerConfig:
+        return RunnerConfig(
+            state_dir=self.state_dir,
+            repo_path=config.repo_path.expanduser().resolve() if config.repo_path else None,
+            task_dir=config.task_dir.expanduser().resolve() if config.task_dir else None,
+            task_file=config.task_file.expanduser().resolve() if config.task_file else None,
+            task_text=config.task_text,
+            workflow=config.workflow,
+            verify_command=config.verify_command,
+            timeout_seconds=config.timeout_seconds,
+            executor_bin=config.executor_bin,
+            provider=config.provider,
+            model=config.model,
+            base_ref=config.base_ref,
+        )
+
+    def _claim_next_job(self) -> tuple[str, RunnerConfig] | None:
+        now = utc_now()
+        with self._db() as conn:
+            conn.execute("begin immediate")
+            row = conn.execute(
+                "select job_id, config_json from queue where status = 'queued' order by created_at limit 1"
+            ).fetchone()
+            if row is None:
+                conn.execute("commit")
+                return None
+            conn.execute(
+                "update queue set status = 'running', updated_at = ? where job_id = ?",
+                (now, row[0]),
+            )
+            conn.execute("commit")
+        return str(row[0]), config_from_dict(json.loads(row[1]), self.state_dir)
+
+    def _finish_queue_job(self, job_id: str, status: str, run_id: str, summary_path: str, error: str) -> None:
+        with self._db() as conn:
+            conn.execute(
+                """
+                update queue
+                set status = ?, run_id = ?, summary_path = ?, error = ?, updated_at = ?
+                where job_id = ?
+                """,
+                (status, run_id, summary_path, error, utc_now(), job_id),
+            )
 
 
 class StepFailure(Exception):
@@ -420,6 +526,39 @@ def render_task_text(task_dir: Path) -> str:
         if path.exists():
             parts.append(f"# {name}\n\n{path.read_text(encoding='utf-8').strip()}")
     return "\n\n".join(parts).strip()
+
+
+def config_to_dict(config: RunnerConfig) -> dict[str, object]:
+    return {
+        "repo_path": str(config.repo_path) if config.repo_path else None,
+        "task_dir": str(config.task_dir) if config.task_dir else None,
+        "task_file": str(config.task_file) if config.task_file else None,
+        "task_text": config.task_text,
+        "workflow": config.workflow,
+        "verify_command": config.verify_command,
+        "timeout_seconds": config.timeout_seconds,
+        "executor_bin": config.executor_bin,
+        "provider": config.provider,
+        "model": config.model,
+        "base_ref": config.base_ref,
+    }
+
+
+def config_from_dict(data: dict[str, object], state_dir: Path) -> RunnerConfig:
+    return RunnerConfig(
+        state_dir=state_dir,
+        repo_path=Path(str(data["repo_path"])) if data.get("repo_path") else None,
+        task_dir=Path(str(data["task_dir"])) if data.get("task_dir") else None,
+        task_file=Path(str(data["task_file"])) if data.get("task_file") else None,
+        task_text=str(data["task_text"]) if data.get("task_text") is not None else None,
+        workflow=str(data.get("workflow") or "default"),
+        verify_command=str(data["verify_command"]) if data.get("verify_command") else None,
+        timeout_seconds=float(data.get("timeout_seconds") or 0),
+        executor_bin=str(data.get("executor_bin") or "takt"),
+        provider=str(data["provider"]) if data.get("provider") else None,
+        model=str(data["model"]) if data.get("model") else None,
+        base_ref=str(data["base_ref"]) if data.get("base_ref") else None,
+    )
 
 
 def new_run_id() -> str:

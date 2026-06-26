@@ -31,7 +31,7 @@ class RunState:
     workflow: str
     verify_command: str
     timeout_seconds: float
-    takt_bin: str
+    executor_bin: str
     provider: str | None = None
     model: str | None = None
     base_ref: str | None = None
@@ -46,6 +46,8 @@ class RunState:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RunState":
         data = dict(data)
+        if "takt_bin" in data and "executor_bin" not in data:
+            data["executor_bin"] = data.pop("takt_bin")
         data["steps"] = [StepState.from_dict(item) for item in data.get("steps", [])]
         return cls(**data)
 
@@ -58,4 +60,3 @@ class RunState:
     @property
     def run_path(self) -> Path:
         return Path(self.run_dir)
-
