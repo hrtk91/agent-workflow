@@ -272,11 +272,12 @@ class WorkflowRunner:
             args.extend(["--provider", state.provider])
         if state.model:
             args.extend(["--model", state.model])
+        started_at = time.time()
         result = run_logged(args, Path(state.worktree_path or state.repo_path), Path(state.run_dir) / "logs", "run_executor", state.timeout_seconds)
         step.exit_code = result.exit_code
         step.timed_out = result.timed_out
         attrs = result.attrs()
-        snapshot = self._snapshot_executor_observability(state)
+        snapshot = self._snapshot_executor_observability(state, started_at - 2)
         if snapshot:
             attrs["executor_observability_path"] = str(snapshot)
         span["attributes"] = {**span["attributes"], **attrs}
@@ -330,10 +331,10 @@ class WorkflowRunner:
         lines.extend(["", "## task", "", "```text", task_preview, "```", ""])
         Path(state.summary_path).write_text("\n".join(lines), encoding="utf-8")
 
-    def _snapshot_executor_observability(self, state: RunState) -> Path | None:
+    def _snapshot_executor_observability(self, state: RunState, started_at: float) -> Path | None:
         if not state.worktree_path:
             return None
-        takt_run = self._latest_takt_run(Path(state.worktree_path) / ".takt" / "runs")
+        takt_run = self._latest_takt_run(Path(state.worktree_path) / ".takt" / "runs", min_mtime=started_at)
         if takt_run is None:
             return None
         dest = Path(state.run_dir) / "executor_observability" / "takt" / takt_run.name
@@ -386,10 +387,12 @@ class WorkflowRunner:
                 overview.append(f"  {line}")
         return overview
 
-    def _latest_takt_run(self, runs_dir: Path) -> Path | None:
+    def _latest_takt_run(self, runs_dir: Path, min_mtime: float | None = None) -> Path | None:
         if not runs_dir.exists():
             return None
         candidates = [path for path in runs_dir.iterdir() if path.is_dir()]
+        if min_mtime is not None:
+            candidates = [path for path in candidates if path.stat().st_mtime >= min_mtime]
         if not candidates:
             return None
         return max(candidates, key=lambda path: path.stat().st_mtime)
