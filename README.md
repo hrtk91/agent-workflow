@@ -92,6 +92,15 @@ aw tick --max-runs 1 \
   --notify-command 'scripts/notify-hermes-workflow-summary.bashx {discord_summary} "[eb-temp workflow]"'
 ```
 
+For cron dispatchers, keep job failures in `aw` state without failing the
+dispatcher process:
+
+```bash
+aw tick --max-runs 1 \
+  --isolate-job-failures \
+  --notify-command 'scripts/notify-hermes-workflow-summary.bashx {discord_summary} "[eb-temp workflow]"'
+```
+
 Run queued work continuously:
 
 ```bash

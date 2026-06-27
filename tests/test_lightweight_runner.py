@@ -197,6 +197,33 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertTrue(discord_summary.exists())
         self.assertIn("🔁 retry candidate", discord_summary.read_text())
 
+    def test_tick_can_isolate_job_failures_for_cron_dispatch(self) -> None:
+        enqueued = self._aw(
+            "enqueue",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Queue this fixture task and fail QC without failing the dispatcher.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+        )
+        job_id = enqueued.stdout.strip()
+
+        ticked = self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--isolate-job-failures",
+        )
+
+        self.assertEqual(0, ticked.returncode)
+        self.assertIn(f"{job_id}\tqc_failed", ticked.stdout)
+
+        status_after = self._aw("status")
+        self.assertIn(f"job\t{job_id}\tqc_failed", status_after.stdout)
+
     def test_watchdog_scan_and_repair_draft_validate_failed_run(self) -> None:
         failed = self._aw(
             "run",

@@ -23,6 +23,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     tick = sub.add_parser("tick", help="run queued jobs once and exit")
     tick.add_argument("--max-runs", type=int, default=1)
+    tick.add_argument(
+        "--isolate-job-failures",
+        action="store_true",
+        help="exit successfully when queued jobs fail but aw records the failure; notification or aw infrastructure errors still fail",
+    )
     add_notify_args(tick)
 
     worker = sub.add_parser("worker", help="run queued jobs in a loop")
@@ -161,6 +166,14 @@ def notify_result_if_requested(runner: WorkflowRunner, state, args: argparse.Nam
     return runner.notify_state(state, getattr(args, "notify_command", None), notify_statuses_from_args(args))
 
 
+def tick_exit_code(results: list[dict[str, str]], isolate_job_failures: bool) -> int:
+    if any(result.get("notify_error") for result in results):
+        return 1
+    if isolate_job_failures:
+        return 1 if any(result.get("error") and not result.get("run_id") for result in results) else 0
+    return 0 if all(result.get("status") == "succeeded" for result in results) else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     runner = WorkflowRunner(args.state_dir)
@@ -180,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
             results = runner.tick(max_runs=args.max_runs, notify_command=args.notify_command, notify_statuses=notify_statuses_from_args(args))
             for result in results:
                 print("\t".join(str(result.get(key, "")) for key in ["job_id", "status", "run_id", "summary_path", "error", "notify_error"]))
-            return 0 if all(result.get("status") == "succeeded" and not result.get("notify_error") for result in results) else 1
+            return tick_exit_code(results, args.isolate_job_failures)
         if args.command == "worker":
             runner.worker(
                 interval_seconds=args.interval_seconds,
