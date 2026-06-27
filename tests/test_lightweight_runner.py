@@ -316,6 +316,74 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertEqual(repair_job_id, repair_jobs[0][0])
         self.assertEqual("qc_failed", repair_jobs[0][1])
 
+    def test_auto_repair_requeues_failed_repair_once_without_draft(self) -> None:
+        enqueued = self._aw(
+            "enqueue",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Queue this fixture task and let repair draft fail once.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+        )
+        job_id = enqueued.stdout.strip()
+
+        first = self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--isolate-job-failures",
+        )
+        self.assertIn(f"{job_id}\tqc_failed", first.stdout)
+        first_repair_job_id = first.stdout.strip().split("\t")[6]
+
+        self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--isolate-job-failures",
+        )
+
+        second = self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--isolate-job-failures",
+        )
+        second_repair_job_id = second.stdout.strip().split("\t")[0]
+        self.assertNotEqual(first_repair_job_id, second_repair_job_id)
+
+        final = self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--isolate-job-failures",
+        )
+        self.assertEqual("", final.stdout)
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        repair_rows = [
+            row
+            for row in conn.execute("select job_id, status, config_json from queue").fetchall()
+            if json.loads(row[2]).get("purpose") == "repair"
+        ]
+        self.assertEqual(2, len(repair_rows))
+        self.assertEqual({first_repair_job_id, second_repair_job_id}, {row[0] for row in repair_rows})
+
     def test_tick_auto_repair_scans_existing_failed_runs(self) -> None:
         failed = self._aw(
             "run",
@@ -403,6 +471,16 @@ class LightweightRunnerTest(unittest.TestCase):
         )
         self.assertEqual(0, ticked.returncode)
 
+        self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--isolate-job-failures",
+        )
+
         conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
         queue_rows = conn.execute("select config_json from queue order by created_at").fetchall()
         repair_targets = [
@@ -475,9 +553,9 @@ class LightweightRunnerTest(unittest.TestCase):
         rows = conn.execute("select job_id, status, config_json, run_id from queue order by created_at").fetchall()
         self.assertEqual("qc_failed", rows[0][1])
         repair_rows = [row for row in rows if json.loads(row[2]).get("purpose") == "repair"]
-        self.assertEqual(1, len(repair_rows))
-        self.assertEqual("qc_failed", repair_rows[0][1])
-        self.assertNotEqual(job_id, repair_rows[0][0])
+        self.assertEqual(2, len(repair_rows))
+        self.assertEqual({"qc_failed"}, {row[1] for row in repair_rows})
+        self.assertNotIn(job_id, {row[0] for row in repair_rows})
 
     def test_worker_recovers_stale_running_queue_job_on_startup(self) -> None:
         enqueued = self._aw(

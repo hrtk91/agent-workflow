@@ -19,6 +19,7 @@ from agent_workflow.tracing import TraceRecorder, trace_enabled_hint
 
 STEPS = ["load_task", "create_worktree", "run_executor", "run_qc", "write_summary"]
 FAILURE_NOTIFY_STATUSES = {"blocked", "failed", "qc_failed", "timed_out"}
+AUTO_REPAIR_MAX_ATTEMPTS = 2
 
 
 @dataclass
@@ -626,9 +627,7 @@ class WorkflowRunner:
         )
 
     def _has_repair_or_repair_job(self, failed_run_id: str) -> bool:
-        marker = self.runs_dir / failed_run_id / "auto-repair-enqueued.json"
-        if marker.exists():
-            return True
+        repair_job_statuses: list[str] = []
         with self._db() as conn:
             table = conn.execute(
                 "select name from sqlite_master where type = 'table' and name = 'repair_drafts'"
@@ -641,16 +640,18 @@ class WorkflowRunner:
                 if draft is not None:
                     return True
             rows = conn.execute(
-                "select config_json from queue where status in ('queued', 'running')"
+                "select status, config_json from queue"
             ).fetchall()
-        for row in rows:
+        for status, config_json in rows:
             try:
-                data = json.loads(str(row[0]))
+                data = json.loads(str(config_json))
             except json.JSONDecodeError:
                 continue
             if data.get("purpose") == "repair" and data.get("repair_for_run_id") == failed_run_id:
-                return True
-        return False
+                repair_job_statuses.append(str(status))
+        if any(status in {"queued", "running"} for status in repair_job_statuses):
+            return True
+        return len(repair_job_statuses) >= AUTO_REPAIR_MAX_ATTEMPTS
 
     def _snapshot_executor_observability(self, state: RunState, started_at: float) -> Path | None:
         if not state.worktree_path:
