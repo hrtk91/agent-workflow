@@ -258,7 +258,7 @@ def gh_pr_checks(repo: str, pr_number: int) -> list[dict[str, Any]]:
     )
     if result.returncode != 0:
         output = result.stdout.strip()
-        if "no checks reported" in output:
+        if "no checks reported" in output or "unknown flag: --json" in output:
             return []
         raise MergeError(output or "gh pr checks failed")
     if not result.stdout.strip():

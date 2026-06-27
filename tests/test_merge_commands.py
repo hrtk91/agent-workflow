@@ -125,6 +125,27 @@ class MergeCommandsTest(unittest.TestCase):
         self.assertEqual(1, result.returncode)
         self.assertIn("no PR checks reported", result.stderr)
 
+    def test_merge_gate_allows_old_gh_checks_without_json_when_local_qc_passes(self) -> None:
+        self._write_gh_state(checks=None)
+        output_dir = self.root / "gate-old-gh"
+        result = self._aw(
+            "merge-gate",
+            "--repo",
+            "hrtk91/eb-temp",
+            "--pr",
+            "853",
+            "--repo-path",
+            str(self.repo),
+            "--verify-command",
+            "test -f feature.txt",
+            "--output-dir",
+            str(output_dir),
+        )
+
+        decision = json.loads(Path(result.stdout.strip()).read_text())
+        self.assertEqual("MERGE_APPROVED", decision["decision"])
+        self.assertEqual(0, decision["checks"]["count"])
+
     def _aw(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["PATH"] = f"{self.fake_bin}:{env['PATH']}"
@@ -199,7 +220,7 @@ if args[:2] == ["pr", "view"]:
 elif args[:2] == ["pr", "checks"]:
     checks = state.get("checks")
     if checks is None:
-        print("no checks reported on the branch")
+        print("unknown flag: --json")
         sys.exit(1)
     print(json.dumps(checks))
 elif args and args[0] == "api":
