@@ -162,6 +162,11 @@ def add_auto_repair_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repair-executor-bin", help="executor binary for auto-repair diagnosis jobs")
     parser.add_argument("--repair-provider", help="executor provider for auto-repair diagnosis jobs")
     parser.add_argument("--repair-model", help="executor model for auto-repair diagnosis jobs")
+    parser.add_argument(
+        "--repair-scan-existing",
+        action="store_true",
+        help="also backfill existing failed runs; disabled by default to avoid notification storms",
+    )
 
 
 def config_from_args(args: argparse.Namespace) -> RunnerConfig:
@@ -198,6 +203,7 @@ def auto_repair_from_args(args: argparse.Namespace) -> AutoRepairConfig | None:
         executor_bin=getattr(args, "repair_executor_bin", None),
         provider=getattr(args, "repair_provider", None),
         model=getattr(args, "repair_model", None),
+        scan_existing=getattr(args, "repair_scan_existing", False),
     )
 
 

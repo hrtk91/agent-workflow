@@ -48,6 +48,7 @@ class AutoRepairConfig:
     executor_bin: str | None = None
     provider: str | None = None
     model: str | None = None
+    scan_existing: bool = False
 
 
 def default_state_dir() -> Path:
@@ -129,7 +130,8 @@ class WorkflowRunner:
         notify_statuses: set[str] | None = FAILURE_NOTIFY_STATUSES,
         auto_repair: AutoRepairConfig | None = None,
     ) -> list[dict[str, str]]:
-        self.enqueue_auto_repairs_for_failures(auto_repair, limit=max_runs)
+        if auto_repair and auto_repair.scan_existing:
+            self.enqueue_auto_repairs_for_failures(auto_repair, limit=max_runs)
         results: list[dict[str, str]] = []
         for _ in range(max_runs):
             job = self._claim_next_job()
@@ -182,7 +184,7 @@ class WorkflowRunner:
                     self._fail_running_queue_job(job_id, f"worker child exited with {exit_code}")
                 del active[job_id]
 
-            if not active:
+            if auto_repair and auto_repair.scan_existing and not active:
                 for repair_job_id in self.enqueue_auto_repairs_for_failures(auto_repair, limit=max_runs_per_tick):
                     print(f"auto_repair_queued\t{repair_job_id}", flush=True)
 
@@ -227,7 +229,9 @@ class WorkflowRunner:
                     result["repair_job_id"] = repair_job_id
             except Exception as exc:
                 result["auto_repair_error"] = str(exc)
-            notify_error = self.notify_state(state, notify_command, notify_statuses, job_id=job_id)
+            notify_error = ""
+            if config.purpose != "repair":
+                notify_error = self.notify_state(state, notify_command, notify_statuses, job_id=job_id)
             if notify_error:
                 result["notify_error"] = notify_error
             return result
@@ -1217,6 +1221,8 @@ def append_auto_repair_args(args: list[str], auto_repair: AutoRepairConfig | Non
         return
     args.append("--auto-repair")
     args.extend(["--repair-workflow", auto_repair.workflow])
+    if auto_repair.scan_existing:
+        args.append("--repair-scan-existing")
     if auto_repair.verify_command:
         args.extend(["--repair-verify-command", auto_repair.verify_command])
     if auto_repair.timeout_seconds is not None:

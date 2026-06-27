@@ -197,6 +197,60 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertTrue(discord_summary.exists())
         self.assertIn("🔁 retry candidate", discord_summary.read_text())
 
+    def test_tick_does_not_notify_failed_repair_jobs(self) -> None:
+        enqueued = self._aw(
+            "enqueue",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Queue this fixture task, notify the original failure, but not repair failure.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+        )
+        job_id = enqueued.stdout.strip()
+        notify_log = self.root / "notify.log"
+        notify_script = self.root / "notify"
+        notify_script.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "printf '%s\\t%s\\t%s\\n' \"$1\" \"$2\" \"$3\" >> \"$FAKE_NOTIFY_LOG\"\n",
+            encoding="utf-8",
+        )
+        notify_script.chmod(0o755)
+
+        first = self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--notify-command",
+            f"{notify_script} {{status}} {{run_id}} {{discord_summary}}",
+            env={"FAKE_NOTIFY_LOG": str(notify_log)},
+            check=False,
+        )
+        self.assertIn(f"{job_id}\tqc_failed", first.stdout)
+
+        self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--notify-command",
+            f"{notify_script} {{status}} {{run_id}} {{discord_summary}}",
+            env={"FAKE_NOTIFY_LOG": str(notify_log)},
+            check=False,
+        )
+
+        notify_lines = notify_log.read_text().splitlines()
+        self.assertEqual(1, len(notify_lines))
+        self.assertTrue(notify_lines[0].startswith("qc_failed\t"))
+
     def test_tick_can_isolate_job_failures_for_cron_dispatch(self) -> None:
         enqueued = self._aw(
             "enqueue",
@@ -347,6 +401,7 @@ class LightweightRunnerTest(unittest.TestCase):
             "--max-runs",
             "1",
             "--auto-repair",
+            "--repair-scan-existing",
             "--repair-executor-bin",
             str(self.fake_takt),
             "--isolate-job-failures",
@@ -357,6 +412,7 @@ class LightweightRunnerTest(unittest.TestCase):
             "--max-runs",
             "1",
             "--auto-repair",
+            "--repair-scan-existing",
             "--repair-executor-bin",
             str(self.fake_takt),
             "--isolate-job-failures",
@@ -405,6 +461,7 @@ class LightweightRunnerTest(unittest.TestCase):
             "--max-runs",
             "1",
             "--auto-repair",
+            "--repair-scan-existing",
             "--repair-executor-bin",
             str(self.fake_takt),
             "--isolate-job-failures",
@@ -420,6 +477,42 @@ class LightweightRunnerTest(unittest.TestCase):
         ]
         self.assertEqual(1, len(repair_jobs))
         self.assertEqual("qc_failed", repair_jobs[0][0])
+
+    def test_tick_auto_repair_does_not_scan_existing_failed_runs_by_default(self) -> None:
+        failed = self._aw(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Create an existing failed run that should not be backfilled by default.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+            check=False,
+        )
+        failed_state = self._state(Path(failed.stdout.strip()))
+        self.assertEqual("qc_failed", failed_state["status"])
+
+        ticked = self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--isolate-job-failures",
+        )
+
+        self.assertEqual(0, ticked.returncode)
+        self.assertEqual("", ticked.stdout)
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        repair_jobs = [
+            row
+            for row in conn.execute("select config_json from queue").fetchall()
+            if json.loads(row[0]).get("repair_for_run_id") == failed_state["run_id"]
+        ]
+        self.assertEqual([], repair_jobs)
 
     def test_auto_repair_uses_current_repo_head_as_base_ref(self) -> None:
         failed = self._aw(
@@ -448,6 +541,7 @@ class LightweightRunnerTest(unittest.TestCase):
             "--max-runs",
             "1",
             "--auto-repair",
+            "--repair-scan-existing",
             "--repair-executor-bin",
             str(self.fake_takt),
             "--isolate-job-failures",
@@ -494,6 +588,7 @@ class LightweightRunnerTest(unittest.TestCase):
             "--max-runs",
             "1",
             "--auto-repair",
+            "--repair-scan-existing",
             "--repair-executor-bin",
             str(self.fake_takt),
             "--isolate-job-failures",
@@ -504,6 +599,7 @@ class LightweightRunnerTest(unittest.TestCase):
             "--max-runs",
             "1",
             "--auto-repair",
+            "--repair-scan-existing",
             "--repair-executor-bin",
             str(self.fake_takt),
             "--isolate-job-failures",
@@ -515,6 +611,7 @@ class LightweightRunnerTest(unittest.TestCase):
             "--max-runs",
             "1",
             "--auto-repair",
+            "--repair-scan-existing",
             "--repair-executor-bin",
             str(self.fake_takt),
             "--isolate-job-failures",
@@ -592,7 +689,7 @@ class LightweightRunnerTest(unittest.TestCase):
         rows = conn.execute("select job_id, status, config_json, run_id from queue order by created_at").fetchall()
         self.assertEqual("qc_failed", rows[0][1])
         repair_rows = [row for row in rows if json.loads(row[2]).get("purpose") == "repair"]
-        self.assertEqual(2, len(repair_rows))
+        self.assertEqual(1, len(repair_rows))
         self.assertEqual({"qc_failed"}, {row[1] for row in repair_rows})
         self.assertNotIn(job_id, {row[0] for row in repair_rows})
 
