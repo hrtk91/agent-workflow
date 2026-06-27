@@ -132,11 +132,16 @@ class WorkflowRunner:
         repo_parallelism: int = 1,
         spawn_children: bool = True,
         stop_when_idle: bool = False,
+        recover_stale_running: bool = True,
     ) -> None:
         if parallelism < 1:
             raise ValueError("parallelism must be positive")
         if max_runs_per_tick < 1:
             raise ValueError("max_runs_per_tick must be positive")
+        if recover_stale_running:
+            recovered = self.recover_stale_running("worker recovered stale running job on startup")
+            if recovered:
+                print(f"recovered_stale_running\t{recovered}", flush=True)
         if not spawn_children:
             while True:
                 results = self.tick(max_runs=max_runs_per_tick, notify_command=notify_command, notify_statuses=notify_statuses)
@@ -195,6 +200,38 @@ class WorkflowRunner:
         except Exception as exc:
             self._finish_queue_job(job_id, "failed", "", "", str(exc))
             return {"job_id": job_id, "status": "failed", "run_id": "", "summary_path": "", "error": str(exc)}
+
+    def recover_stale_running(self, error: str) -> int:
+        recovered = 0
+        with self._db() as conn:
+            rows = conn.execute("select run_id from jobs where status = 'running'").fetchall()
+        for row in rows:
+            run_id = str(row[0])
+            try:
+                state = self.load_state(run_id)
+            except (FileNotFoundError, json.JSONDecodeError):
+                continue
+            state.status = "failed"
+            if state.current_step:
+                for step in state.steps:
+                    if step.name == state.current_step and step.status == "running":
+                        step.status = "failed"
+                        step.error = error
+                        step.finished_at = utc_now()
+                        break
+            self._finalize_failed_summary(state)
+            recovered += 1
+        with self._db() as conn:
+            cursor = conn.execute(
+                """
+                update queue
+                set status = 'failed', error = ?, updated_at = ?
+                where status = 'running'
+                """,
+                (error, utc_now()),
+            )
+            recovered += int(cursor.rowcount or 0)
+        return recovered
 
     def resume(self, run_id: str, verify_command: str | None = None, timeout_seconds: float | None = None) -> RunState:
         state = self.load_state(run_id)

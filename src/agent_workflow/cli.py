@@ -36,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--parallelism", type=int, default=1, help="maximum claimed jobs to run concurrently")
     worker.add_argument("--repo-parallelism", type=int, default=1, help="maximum concurrent jobs per repo path; 0 disables this limit")
     worker.add_argument("--inline", action="store_true", help="run jobs inside the worker process instead of child processes")
+    worker.add_argument("--no-recover-stale-running", action="store_true", help="do not mark pre-existing running jobs as failed on worker startup")
     worker.add_argument("--stop-when-idle", action="store_true", help=argparse.SUPPRESS)
     add_notify_args(worker)
 
@@ -212,6 +213,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo_parallelism=args.repo_parallelism,
                 spawn_children=not args.inline,
                 stop_when_idle=args.stop_when_idle,
+                recover_stale_running=not args.no_recover_stale_running,
             )
             return 0
         if args.command == "run-claimed":

@@ -253,6 +253,35 @@ class LightweightRunnerTest(unittest.TestCase):
         status_after = self._aw("status")
         self.assertIn(f"job\t{job_id}\tsucceeded", status_after.stdout)
 
+    def test_worker_recovers_stale_running_queue_job_on_startup(self) -> None:
+        enqueued = self._aw(
+            "enqueue",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Queue this fixture task but leave it stale.",
+            "--verify-command",
+            "test -f implemented.txt",
+            "--executor-bin",
+            str(self.fake_takt),
+        )
+        job_id = enqueued.stdout.strip()
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        conn.execute("update queue set status = 'running' where job_id = ?", (job_id,))
+        conn.commit()
+        conn.close()
+
+        worker = self._aw(
+            "worker",
+            "--interval-seconds",
+            "0.01",
+            "--stop-when-idle",
+        )
+
+        self.assertIn("recovered_stale_running\t1", worker.stdout)
+        status_after = self._aw("status")
+        self.assertIn(f"job\t{job_id}\tfailed", status_after.stdout)
+
     def test_watchdog_scan_and_repair_draft_validate_failed_run(self) -> None:
         failed = self._aw(
             "run",
