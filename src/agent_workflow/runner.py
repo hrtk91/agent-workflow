@@ -35,6 +35,18 @@ class RunnerConfig:
     provider: str | None = None
     model: str | None = None
     base_ref: str | None = None
+    purpose: str = "workflow"
+    repair_for_run_id: str | None = None
+
+
+@dataclass
+class AutoRepairConfig:
+    workflow: str = "default"
+    verify_command: str | None = None
+    timeout_seconds: float | None = None
+    executor_bin: str | None = None
+    provider: str | None = None
+    model: str | None = None
 
 
 def default_state_dir() -> Path:
@@ -77,6 +89,8 @@ class WorkflowRunner:
             provider=config.provider,
             model=config.model,
             base_ref=config.base_ref,
+            purpose=config.purpose,
+            repair_for_run_id=config.repair_for_run_id,
             summary_path=str(summary_path),
             trace_path=str(trace_path),
             created_at=now,
@@ -112,6 +126,7 @@ class WorkflowRunner:
         max_runs: int = 1,
         notify_command: str | None = None,
         notify_statuses: set[str] | None = FAILURE_NOTIFY_STATUSES,
+        auto_repair: AutoRepairConfig | None = None,
     ) -> list[dict[str, str]]:
         results: list[dict[str, str]] = []
         for _ in range(max_runs):
@@ -119,7 +134,7 @@ class WorkflowRunner:
             if job is None:
                 break
             job_id, config = job
-            results.append(self.run_claimed_job(job_id, config, notify_command, notify_statuses))
+            results.append(self.run_claimed_job(job_id, config, notify_command, notify_statuses, auto_repair=auto_repair))
         return results
 
     def worker(
@@ -133,6 +148,7 @@ class WorkflowRunner:
         spawn_children: bool = True,
         stop_when_idle: bool = False,
         recover_stale_running: bool = True,
+        auto_repair: AutoRepairConfig | None = None,
     ) -> None:
         if parallelism < 1:
             raise ValueError("parallelism must be positive")
@@ -144,7 +160,12 @@ class WorkflowRunner:
                 print(f"recovered_stale_running\t{recovered}", flush=True)
         if not spawn_children:
             while True:
-                results = self.tick(max_runs=max_runs_per_tick, notify_command=notify_command, notify_statuses=notify_statuses)
+                results = self.tick(
+                    max_runs=max_runs_per_tick,
+                    notify_command=notify_command,
+                    notify_statuses=notify_statuses,
+                    auto_repair=auto_repair,
+                )
                 if stop_when_idle and not results:
                     return
                 time.sleep(interval_seconds)
@@ -168,7 +189,7 @@ class WorkflowRunner:
                 job_id, config = job
                 repo_key = self._repo_key(config)
                 try:
-                    process = self._spawn_claimed_job(job_id, notify_command, notify_statuses)
+                    process = self._spawn_claimed_job(job_id, notify_command, notify_statuses, auto_repair)
                 except Exception as exc:
                     self._finish_queue_job(job_id, "failed", "", "", str(exc))
                     continue
@@ -186,6 +207,7 @@ class WorkflowRunner:
         config: RunnerConfig | None = None,
         notify_command: str | None = None,
         notify_statuses: set[str] | None = FAILURE_NOTIFY_STATUSES,
+        auto_repair: AutoRepairConfig | None = None,
     ) -> dict[str, str]:
         if config is None:
             config = self._load_claimed_queue_config(job_id)
@@ -193,6 +215,12 @@ class WorkflowRunner:
             state = self.run_new(config)
             self._finish_queue_job(job_id, state.status, state.run_id, state.summary_path, "")
             result = {"job_id": job_id, "status": state.status, "run_id": state.run_id, "summary_path": state.summary_path}
+            try:
+                repair_job_id = self.maybe_enqueue_auto_repair(state, config, auto_repair)
+                if repair_job_id:
+                    result["repair_job_id"] = repair_job_id
+            except Exception as exc:
+                result["auto_repair_error"] = str(exc)
             notify_error = self.notify_state(state, notify_command, notify_statuses, job_id=job_id)
             if notify_error:
                 result["notify_error"] = notify_error
@@ -200,6 +228,28 @@ class WorkflowRunner:
         except Exception as exc:
             self._finish_queue_job(job_id, "failed", "", "", str(exc))
             return {"job_id": job_id, "status": "failed", "run_id": "", "summary_path": "", "error": str(exc)}
+
+    def maybe_enqueue_auto_repair(
+        self,
+        failed_state: RunState,
+        source_config: RunnerConfig,
+        auto_repair: AutoRepairConfig | None,
+    ) -> str:
+        if auto_repair is None:
+            return ""
+        if failed_state.status not in FAILURE_NOTIFY_STATUSES:
+            return ""
+        if source_config.purpose == "repair":
+            return ""
+        if self._has_repair_or_repair_job(failed_state.run_id):
+            return ""
+
+        repair_config = self._auto_repair_runner_config(failed_state, source_config, auto_repair)
+        repair_job_id = self.enqueue(repair_config)
+        self._write_auto_repair_marker(failed_state, repair_job_id, repair_config)
+        self._write_summary(failed_state)
+        self.save_state(failed_state)
+        return repair_job_id
 
     def recover_stale_running(self, error: str) -> int:
         recovered = 0
@@ -442,6 +492,8 @@ class WorkflowRunner:
             f"- repo: `{state.repo_path}`",
             f"- worktree: `{state.worktree_path or ''}`",
             f"- workflow: `{state.workflow}`",
+            f"- purpose: `{state.purpose}`",
+            f"- repair_for_run_id: `{state.repair_for_run_id or ''}`",
             f"- base_ref: `{state.base_ref or ''}`",
             f"- created_at: `{state.created_at}`",
             f"- updated_at: `{state.updated_at}`",
@@ -466,10 +518,92 @@ class WorkflowRunner:
             if step.error:
                 line += f" error={step.error}"
             lines.append(line)
+        lines.extend(self._auto_repair_summary(state))
         lines.extend(self._executor_observability_summary(state))
         lines.extend(["", "## task", "", "```text", task_preview, "```", ""])
         Path(state.summary_path).write_text("\n".join(lines), encoding="utf-8")
         discord_summary_path(state.summary_path).write_text(render_run_discord_summary(state, task_preview), encoding="utf-8")
+
+    def _auto_repair_summary(self, state: RunState) -> list[str]:
+        marker = auto_repair_marker_path(state)
+        if not marker.exists():
+            return []
+        try:
+            data = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        job_id = str(data.get("repair_job_id") or "")
+        if not job_id:
+            return []
+        created_at = str(data.get("created_at") or "")
+        return ["", "## auto repair", f"- repair_job_id: `{job_id}`", f"- created_at: `{created_at}`"]
+
+    def _auto_repair_runner_config(
+        self,
+        failed_state: RunState,
+        source_config: RunnerConfig,
+        auto_repair: AutoRepairConfig,
+    ) -> RunnerConfig:
+        return RunnerConfig(
+            state_dir=self.state_dir,
+            repo_path=Path(failed_state.repo_path),
+            task_text=render_auto_repair_task(failed_state, self.state_dir),
+            workflow=auto_repair.workflow or source_config.workflow,
+            verify_command=auto_repair.verify_command or render_auto_repair_verify_command(self.state_dir, failed_state.run_id),
+            timeout_seconds=auto_repair.timeout_seconds if auto_repair.timeout_seconds is not None else source_config.timeout_seconds,
+            executor_bin=auto_repair.executor_bin or source_config.executor_bin,
+            provider=auto_repair.provider if auto_repair.provider is not None else source_config.provider,
+            model=auto_repair.model if auto_repair.model is not None else source_config.model,
+            base_ref=source_config.base_ref,
+            purpose="repair",
+            repair_for_run_id=failed_state.run_id,
+        )
+
+    def _write_auto_repair_marker(self, failed_state: RunState, repair_job_id: str, repair_config: RunnerConfig) -> None:
+        marker = auto_repair_marker_path(failed_state)
+        marker.write_text(
+            json.dumps(
+                {
+                    "failed_run_id": failed_state.run_id,
+                    "repair_job_id": repair_job_id,
+                    "created_at": utc_now(),
+                    "workflow": repair_config.workflow,
+                    "executor_bin": repair_config.executor_bin,
+                    "model": repair_config.model,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def _has_repair_or_repair_job(self, failed_run_id: str) -> bool:
+        marker = self.runs_dir / failed_run_id / "auto-repair-enqueued.json"
+        if marker.exists():
+            return True
+        with self._db() as conn:
+            table = conn.execute(
+                "select name from sqlite_master where type = 'table' and name = 'repair_drafts'"
+            ).fetchone()
+            if table is not None:
+                draft = conn.execute(
+                    "select draft_id from repair_drafts where failed_run_id = ? limit 1",
+                    (failed_run_id,),
+                ).fetchone()
+                if draft is not None:
+                    return True
+            rows = conn.execute(
+                "select config_json from queue where status in ('queued', 'running')"
+            ).fetchall()
+        for row in rows:
+            try:
+                data = json.loads(str(row[0]))
+            except json.JSONDecodeError:
+                continue
+            if data.get("purpose") == "repair" and data.get("repair_for_run_id") == failed_run_id:
+                return True
+        return False
 
     def _snapshot_executor_observability(self, state: RunState, started_at: float) -> Path | None:
         if not state.worktree_path:
@@ -692,6 +826,8 @@ class WorkflowRunner:
             provider=config.provider,
             model=config.model,
             base_ref=config.base_ref,
+            purpose=config.purpose,
+            repair_for_run_id=config.repair_for_run_id,
         )
 
     def _claim_next_job(self, blocked_repo_paths: set[str] | None = None) -> tuple[str, RunnerConfig] | None:
@@ -736,6 +872,7 @@ class WorkflowRunner:
         job_id: str,
         notify_command: str | None,
         notify_statuses: set[str] | None,
+        auto_repair: AutoRepairConfig | None,
     ) -> subprocess.Popen[bytes]:
         args = [
             sys.executable,
@@ -753,6 +890,7 @@ class WorkflowRunner:
             args.extend(["--notify-statuses", "all"])
         elif notify_statuses:
             args.extend(["--notify-statuses", ",".join(sorted(notify_statuses))])
+        append_auto_repair_args(args, auto_repair)
         return subprocess.Popen(args)
 
     def _blocked_worker_repos(self, active: dict[str, tuple[subprocess.Popen[bytes], str]], repo_parallelism: int) -> set[str]:
@@ -863,6 +1001,10 @@ def discord_summary_path(summary_path: str | Path) -> Path:
     return Path(summary_path).with_name("hermes-discord-summary.md")
 
 
+def auto_repair_marker_path(state: RunState) -> Path:
+    return state.run_path / "auto-repair-enqueued.json"
+
+
 def render_run_discord_summary(state: RunState, task_preview: str) -> str:
     headline = {
         "succeeded": "✅ workflow succeeded",
@@ -896,6 +1038,15 @@ def render_run_discord_summary(state: RunState, task_preview: str) -> str:
     if actions:
         lines.extend(["", "🔁 next action"])
         lines.extend(f"- {action}" for action in actions)
+
+    marker = auto_repair_marker_path(state)
+    if marker.exists():
+        try:
+            repair_job_id = str(json.loads(marker.read_text(encoding="utf-8")).get("repair_job_id") or "")
+        except (OSError, json.JSONDecodeError):
+            repair_job_id = ""
+        if repair_job_id:
+            lines.extend(["", f"🩺 auto repair queued: `{repair_job_id}`"])
 
     lines.append("")
     return "\n".join(lines)
@@ -950,6 +1101,82 @@ def render_notification_command(template: str, values: dict[str, str]) -> str:
     for key, value in values.items():
         rendered = rendered.replace("{" + key + "}", shlex.quote(value))
     return rendered
+
+
+def render_auto_repair_verify_command(state_dir: Path, failed_run_id: str) -> str:
+    python = shlex.quote(sys.executable)
+    state = shlex.quote(str(state_dir))
+    return (
+        f"{python} -m agent_workflow --state-dir {state} watchdog scan --include-repaired --limit 200 "
+        f"| awk -F '\\t' '$1 == \"{failed_run_id}\" && $5 == \"\" {{ bad=1 }} END {{ exit bad }}'"
+    )
+
+
+def render_auto_repair_task(failed_state: RunState, state_dir: Path) -> str:
+    step = current_or_failed_step(failed_state)
+    step_line = f"{step.name} status={step.status} attempts={step.attempts}" if step else "unknown"
+    summary = failed_state.summary_path
+    trace = failed_state.trace_path
+    logs = str(Path(failed_state.run_dir) / "logs")
+    worktree = failed_state.worktree_path or ""
+    state_arg = shlex.quote(str(state_dir))
+    command_prefix = f"{shlex.quote(sys.executable)} -m agent_workflow --state-dir {state_arg}"
+    return f"""Diagnose and draft a repair for agent-workflow run {failed_state.run_id}.
+
+Failed run:
+- run_id: {failed_state.run_id}
+- status: {failed_state.status}
+- failed_step: {step_line}
+- repo: {failed_state.repo_path}
+- worktree: {worktree}
+- summary: {summary}
+- trace_jsonl: {trace}
+- logs_dir: {logs}
+
+Your job is to recover the workflow loop, not to manually finish the product task.
+
+Read the summary, trace, executor logs, QC logs, and any copied executor observability. Classify the failure using the repair CLI choices and create a validated repair draft. Use the typed CLI as the output tool; do not leave an unvalidated free-form answer.
+
+Create concise Markdown files for:
+- diagnosis.md: what failed, the likely cause, and the next repair action.
+- evidence.md: relevant file paths and short excerpts only.
+- notify-before.md: a brief Japanese notification with a friendly emoji explaining the planned repair.
+
+Then run:
+
+{command_prefix} repair draft \\
+  --failed-run-id {failed_state.run_id} \\
+  --title "<short title>" \\
+  --category <one of dependency_missing, deploy_config, deploy_runtime, implementation_failure, repo_config, runtime_env, test_infra_flake, timeout, transient_external, unknown> \\
+  --risk <low|medium|high> \\
+  --proposed-action <one of dependency_install_or_update, gateway_restart, human_needed, migration_with_healthcheck, redeploy_and_healthcheck, repo_config_patch, resume_original_run, retry_original_run, runtime_environment_patch, worktree_cleanup_and_retry> \\
+  --diagnosis-file diagnosis.md \\
+  --evidence-file evidence.md \\
+  --notify-before-file notify-before.md
+
+Rules:
+- If the failure is an incomplete implementation, classify it as implementation_failure and prefer resume_original_run or retry_original_run unless the evidence points to environment/config.
+- If the failure is missing packages, tools, writable cache, daemon state, or local service setup, choose the matching dependency/runtime/repo config action.
+- Deployment or migration repair must use risk=high and include the required deployment guardrails.
+- Do not create a draft that claims success. The draft is the handoff artifact for the next repair step.
+"""
+
+
+def append_auto_repair_args(args: list[str], auto_repair: AutoRepairConfig | None) -> None:
+    if auto_repair is None:
+        return
+    args.append("--auto-repair")
+    args.extend(["--repair-workflow", auto_repair.workflow])
+    if auto_repair.verify_command:
+        args.extend(["--repair-verify-command", auto_repair.verify_command])
+    if auto_repair.timeout_seconds is not None:
+        args.extend(["--repair-timeout-seconds", format_seconds(auto_repair.timeout_seconds)])
+    if auto_repair.executor_bin:
+        args.extend(["--repair-executor-bin", auto_repair.executor_bin])
+    if auto_repair.provider:
+        args.extend(["--repair-provider", auto_repair.provider])
+    if auto_repair.model:
+        args.extend(["--repair-model", auto_repair.model])
 
 
 def count_lines(path: Path) -> int:
@@ -1026,6 +1253,8 @@ def config_to_dict(config: RunnerConfig) -> dict[str, object]:
         "provider": config.provider,
         "model": config.model,
         "base_ref": config.base_ref,
+        "purpose": config.purpose,
+        "repair_for_run_id": config.repair_for_run_id,
     }
 
 
@@ -1043,6 +1272,8 @@ def config_from_dict(data: dict[str, object], state_dir: Path) -> RunnerConfig:
         provider=str(data["provider"]) if data.get("provider") else None,
         model=str(data["model"]) if data.get("model") else None,
         base_ref=str(data["base_ref"]) if data.get("base_ref") else None,
+        purpose=str(data.get("purpose") or "workflow"),
+        repair_for_run_id=str(data["repair_for_run_id"]) if data.get("repair_for_run_id") else None,
     )
 
 

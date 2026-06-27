@@ -224,6 +224,98 @@ class LightweightRunnerTest(unittest.TestCase):
         status_after = self._aw("status")
         self.assertIn(f"job\t{job_id}\tqc_failed", status_after.stdout)
 
+    def test_auto_repair_enqueue_after_failed_tick(self) -> None:
+        enqueued = self._aw(
+            "enqueue",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Queue this fixture task and auto-enqueue repair when QC fails.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+        )
+        job_id = enqueued.stdout.strip()
+
+        ticked = self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--isolate-job-failures",
+        )
+
+        self.assertEqual(0, ticked.returncode)
+        self.assertIn(f"{job_id}\tqc_failed", ticked.stdout)
+        fields = ticked.stdout.strip().split("\t")
+        repair_job_id = fields[6]
+        self.assertRegex(repair_job_id, r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
+
+        original_state = self._state(Path(fields[3]))
+        marker = Path(original_state["run_dir"]) / "auto-repair-enqueued.json"
+        self.assertEqual(repair_job_id, json.loads(marker.read_text())["repair_job_id"])
+        discord_text = Path(original_state["summary_path"]).with_name("hermes-discord-summary.md").read_text()
+        self.assertIn("🩺 auto repair queued", discord_text)
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        row = conn.execute("select status, config_json from queue where job_id = ?", (repair_job_id,)).fetchone()
+        self.assertEqual("queued", row[0])
+        repair_config = json.loads(row[1])
+        self.assertEqual("repair", repair_config["purpose"])
+        self.assertEqual(original_state["run_id"], repair_config["repair_for_run_id"])
+        self.assertIn(str(original_state["summary_path"]), repair_config["task_text"])
+
+    def test_auto_repair_does_not_recurse_when_repair_job_fails(self) -> None:
+        enqueued = self._aw(
+            "enqueue",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Queue this fixture task and create one repair job.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+        )
+        job_id = enqueued.stdout.strip()
+
+        first = self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--isolate-job-failures",
+        )
+        self.assertIn(f"{job_id}\tqc_failed", first.stdout)
+        repair_job_id = first.stdout.strip().split("\t")[6]
+
+        second = self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--isolate-job-failures",
+        )
+        self.assertIn(f"{repair_job_id}\tqc_failed", second.stdout)
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        queue_rows = conn.execute("select job_id, status, config_json from queue order by created_at").fetchall()
+        repair_jobs = [
+            row
+            for row in queue_rows
+            if json.loads(row[2]).get("purpose") == "repair"
+        ]
+        self.assertEqual(1, len(repair_jobs))
+        self.assertEqual(repair_job_id, repair_jobs[0][0])
+        self.assertEqual("qc_failed", repair_jobs[0][1])
+
     def test_worker_runs_queued_job_in_child_process(self) -> None:
         enqueued = self._aw(
             "enqueue",
@@ -252,6 +344,43 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertIn(f"started\t{job_id}\tpid=", worker.stdout)
         status_after = self._aw("status")
         self.assertIn(f"job\t{job_id}\tsucceeded", status_after.stdout)
+
+    def test_worker_child_enqueues_auto_repair(self) -> None:
+        enqueued = self._aw(
+            "enqueue",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Queue this fixture task for child auto-repair.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+        )
+        job_id = enqueued.stdout.strip()
+
+        worker = self._aw(
+            "worker",
+            "--interval-seconds",
+            "0.01",
+            "--max-runs-per-tick",
+            "1",
+            "--parallelism",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--stop-when-idle",
+        )
+
+        self.assertIn(f"started\t{job_id}\tpid=", worker.stdout)
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        rows = conn.execute("select job_id, status, config_json, run_id from queue order by created_at").fetchall()
+        self.assertEqual("qc_failed", rows[0][1])
+        repair_rows = [row for row in rows if json.loads(row[2]).get("purpose") == "repair"]
+        self.assertEqual(1, len(repair_rows))
+        self.assertEqual("qc_failed", repair_rows[0][1])
+        self.assertNotEqual(job_id, repair_rows[0][0])
 
     def test_worker_recovers_stale_running_queue_job_on_startup(self) -> None:
         enqueued = self._aw(

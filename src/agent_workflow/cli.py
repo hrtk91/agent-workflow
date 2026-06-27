@@ -7,7 +7,7 @@ from pathlib import Path
 
 from agent_workflow.merge import MergeBlocked, MergeGateConfig, run_merge_approved, run_merge_gate
 from agent_workflow.repair import REPAIR_ACTIONS, REPAIR_CATEGORIES, REPAIR_RISKS, RepairDraftInput, RepairManager
-from agent_workflow.runner import FAILURE_NOTIFY_STATUSES, RunnerConfig, WorkflowRunner, default_state_dir
+from agent_workflow.runner import AutoRepairConfig, FAILURE_NOTIFY_STATUSES, RunnerConfig, WorkflowRunner, default_state_dir
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="exit successfully when queued jobs fail but aw records the failure; notification or aw infrastructure errors still fail",
     )
     add_notify_args(tick)
+    add_auto_repair_args(tick)
 
     worker = sub.add_parser("worker", help="run queued jobs in a loop")
     worker.add_argument("--interval-seconds", type=float, default=60)
@@ -39,10 +40,12 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--no-recover-stale-running", action="store_true", help="do not mark pre-existing running jobs as failed on worker startup")
     worker.add_argument("--stop-when-idle", action="store_true", help=argparse.SUPPRESS)
     add_notify_args(worker)
+    add_auto_repair_args(worker)
 
     run_claimed = sub.add_parser("run-claimed", help=argparse.SUPPRESS)
     run_claimed.add_argument("--job-id", required=True)
     add_notify_args(run_claimed)
+    add_auto_repair_args(run_claimed)
 
     resume = sub.add_parser("resume", help="resume a failed or interrupted run")
     resume.add_argument("--run-id", required=True)
@@ -147,6 +150,20 @@ def add_notify_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_auto_repair_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--auto-repair",
+        action="store_true",
+        help="enqueue a repair-diagnosis job when a normal workflow run reaches a terminal failure",
+    )
+    parser.add_argument("--repair-workflow", default="default", help="workflow for auto-repair diagnosis jobs")
+    parser.add_argument("--repair-verify-command", help="verifier for auto-repair diagnosis jobs")
+    parser.add_argument("--repair-timeout-seconds", type=float, help="timeout for auto-repair diagnosis jobs")
+    parser.add_argument("--repair-executor-bin", help="executor binary for auto-repair diagnosis jobs")
+    parser.add_argument("--repair-provider", help="executor provider for auto-repair diagnosis jobs")
+    parser.add_argument("--repair-model", help="executor model for auto-repair diagnosis jobs")
+
+
 def config_from_args(args: argparse.Namespace) -> RunnerConfig:
     return RunnerConfig(
         state_dir=args.state_dir,
@@ -171,12 +188,25 @@ def notify_statuses_from_args(args: argparse.Namespace) -> set[str] | None:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
+def auto_repair_from_args(args: argparse.Namespace) -> AutoRepairConfig | None:
+    if not getattr(args, "auto_repair", False):
+        return None
+    return AutoRepairConfig(
+        workflow=getattr(args, "repair_workflow", "default"),
+        verify_command=getattr(args, "repair_verify_command", None),
+        timeout_seconds=getattr(args, "repair_timeout_seconds", None),
+        executor_bin=getattr(args, "repair_executor_bin", None),
+        provider=getattr(args, "repair_provider", None),
+        model=getattr(args, "repair_model", None),
+    )
+
+
 def notify_result_if_requested(runner: WorkflowRunner, state, args: argparse.Namespace) -> str:
     return runner.notify_state(state, getattr(args, "notify_command", None), notify_statuses_from_args(args))
 
 
 def tick_exit_code(results: list[dict[str, str]], isolate_job_failures: bool) -> int:
-    if any(result.get("notify_error") for result in results):
+    if any(result.get("notify_error") or result.get("auto_repair_error") for result in results):
         return 1
     if isolate_job_failures:
         return 1 if any(result.get("error") and not result.get("run_id") for result in results) else 0
@@ -199,9 +229,19 @@ def main(argv: list[str] | None = None) -> int:
             print(runner.enqueue(config_from_args(args)))
             return 0
         if args.command == "tick":
-            results = runner.tick(max_runs=args.max_runs, notify_command=args.notify_command, notify_statuses=notify_statuses_from_args(args))
+            results = runner.tick(
+                max_runs=args.max_runs,
+                notify_command=args.notify_command,
+                notify_statuses=notify_statuses_from_args(args),
+                auto_repair=auto_repair_from_args(args),
+            )
             for result in results:
-                print("\t".join(str(result.get(key, "")) for key in ["job_id", "status", "run_id", "summary_path", "error", "notify_error"]))
+                print(
+                    "\t".join(
+                        str(result.get(key, ""))
+                        for key in ["job_id", "status", "run_id", "summary_path", "error", "notify_error", "repair_job_id", "auto_repair_error"]
+                    )
+                )
             return tick_exit_code(results, args.isolate_job_failures)
         if args.command == "worker":
             runner.worker(
@@ -214,11 +254,22 @@ def main(argv: list[str] | None = None) -> int:
                 spawn_children=not args.inline,
                 stop_when_idle=args.stop_when_idle,
                 recover_stale_running=not args.no_recover_stale_running,
+                auto_repair=auto_repair_from_args(args),
             )
             return 0
         if args.command == "run-claimed":
-            result = runner.run_claimed_job(args.job_id, notify_command=args.notify_command, notify_statuses=notify_statuses_from_args(args))
-            print("\t".join(str(result.get(key, "")) for key in ["job_id", "status", "run_id", "summary_path", "error", "notify_error"]))
+            result = runner.run_claimed_job(
+                args.job_id,
+                notify_command=args.notify_command,
+                notify_statuses=notify_statuses_from_args(args),
+                auto_repair=auto_repair_from_args(args),
+            )
+            print(
+                "\t".join(
+                    str(result.get(key, ""))
+                    for key in ["job_id", "status", "run_id", "summary_path", "error", "notify_error", "repair_job_id", "auto_repair_error"]
+                )
+            )
             return tick_exit_code([result], isolate_job_failures=True)
         if args.command == "resume":
             state = runner.resume(args.run_id, verify_command=args.verify_command, timeout_seconds=args.timeout_seconds)

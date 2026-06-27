@@ -120,6 +120,21 @@ Notification commands support `{job_id}`, `{run_id}`, `{status}`,
 are sent only for `blocked`, `failed`, `qc_failed`, and `timed_out`; use
 `--notify-statuses all` when a worker should also report successful runs.
 
+Enable repair-loop dispatch when the worker should enqueue a diagnosis task
+after a normal workflow reaches a terminal failure:
+
+```bash
+aw worker --interval-seconds 60 --parallelism 1 --repo-parallelism 1 \
+  --auto-repair \
+  --repair-model gpt-5.5
+```
+
+The repair job is a normal queued `aw` run with `purpose=repair`. It reads the
+failed run summary, logs, trace, and worktree, then must call `aw repair draft`
+to create a validated handoff artifact. Repair jobs do not recursively create
+more repair jobs, and a failed run is not queued twice once a repair job or
+repair draft exists.
+
 Direct synchronous execution is available for smoke tests and manual use:
 
 ```bash
