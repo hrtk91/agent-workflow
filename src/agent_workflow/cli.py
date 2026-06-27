@@ -33,7 +33,15 @@ def build_parser() -> argparse.ArgumentParser:
     worker = sub.add_parser("worker", help="run queued jobs in a loop")
     worker.add_argument("--interval-seconds", type=float, default=60)
     worker.add_argument("--max-runs-per-tick", type=int, default=1)
+    worker.add_argument("--parallelism", type=int, default=1, help="maximum claimed jobs to run concurrently")
+    worker.add_argument("--repo-parallelism", type=int, default=1, help="maximum concurrent jobs per repo path; 0 disables this limit")
+    worker.add_argument("--inline", action="store_true", help="run jobs inside the worker process instead of child processes")
+    worker.add_argument("--stop-when-idle", action="store_true", help=argparse.SUPPRESS)
     add_notify_args(worker)
+
+    run_claimed = sub.add_parser("run-claimed", help=argparse.SUPPRESS)
+    run_claimed.add_argument("--job-id", required=True)
+    add_notify_args(run_claimed)
 
     resume = sub.add_parser("resume", help="resume a failed or interrupted run")
     resume.add_argument("--run-id", required=True)
@@ -200,8 +208,16 @@ def main(argv: list[str] | None = None) -> int:
                 max_runs_per_tick=args.max_runs_per_tick,
                 notify_command=args.notify_command,
                 notify_statuses=notify_statuses_from_args(args),
+                parallelism=args.parallelism,
+                repo_parallelism=args.repo_parallelism,
+                spawn_children=not args.inline,
+                stop_when_idle=args.stop_when_idle,
             )
             return 0
+        if args.command == "run-claimed":
+            result = runner.run_claimed_job(args.job_id, notify_command=args.notify_command, notify_statuses=notify_statuses_from_args(args))
+            print("\t".join(str(result.get(key, "")) for key in ["job_id", "status", "run_id", "summary_path", "error", "notify_error"]))
+            return tick_exit_code([result], isolate_job_failures=True)
         if args.command == "resume":
             state = runner.resume(args.run_id, verify_command=args.verify_command, timeout_seconds=args.timeout_seconds)
             notify_error = notify_result_if_requested(runner, state, args)

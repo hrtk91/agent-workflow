@@ -7,6 +7,7 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -118,17 +119,7 @@ class WorkflowRunner:
             if job is None:
                 break
             job_id, config = job
-            try:
-                state = self.run_new(config)
-                self._finish_queue_job(job_id, state.status, state.run_id, state.summary_path, "")
-                result = {"job_id": job_id, "status": state.status, "run_id": state.run_id, "summary_path": state.summary_path}
-                notify_error = self.notify_state(state, notify_command, notify_statuses, job_id=job_id)
-                if notify_error:
-                    result["notify_error"] = notify_error
-                results.append(result)
-            except Exception as exc:
-                self._finish_queue_job(job_id, "failed", "", "", str(exc))
-                results.append({"job_id": job_id, "status": "failed", "run_id": "", "summary_path": "", "error": str(exc)})
+            results.append(self.run_claimed_job(job_id, config, notify_command, notify_statuses))
         return results
 
     def worker(
@@ -137,10 +128,73 @@ class WorkflowRunner:
         max_runs_per_tick: int = 1,
         notify_command: str | None = None,
         notify_statuses: set[str] | None = FAILURE_NOTIFY_STATUSES,
+        parallelism: int = 1,
+        repo_parallelism: int = 1,
+        spawn_children: bool = True,
+        stop_when_idle: bool = False,
     ) -> None:
+        if parallelism < 1:
+            raise ValueError("parallelism must be positive")
+        if max_runs_per_tick < 1:
+            raise ValueError("max_runs_per_tick must be positive")
+        if not spawn_children:
+            while True:
+                results = self.tick(max_runs=max_runs_per_tick, notify_command=notify_command, notify_statuses=notify_statuses)
+                if stop_when_idle and not results:
+                    return
+                time.sleep(interval_seconds)
+
+        active: dict[str, tuple[subprocess.Popen[bytes], str]] = {}
         while True:
-            self.tick(max_runs=max_runs_per_tick, notify_command=notify_command, notify_statuses=notify_statuses)
+            for job_id, (process, repo_key) in list(active.items()):
+                exit_code = process.poll()
+                if exit_code is None:
+                    continue
+                if exit_code != 0:
+                    self._fail_running_queue_job(job_id, f"worker child exited with {exit_code}")
+                del active[job_id]
+
+            claimed = 0
+            while len(active) < parallelism and claimed < max_runs_per_tick:
+                blocked_repos = self._blocked_worker_repos(active, repo_parallelism)
+                job = self._claim_next_job(blocked_repo_paths=blocked_repos)
+                if job is None:
+                    break
+                job_id, config = job
+                repo_key = self._repo_key(config)
+                try:
+                    process = self._spawn_claimed_job(job_id, notify_command, notify_statuses)
+                except Exception as exc:
+                    self._finish_queue_job(job_id, "failed", "", "", str(exc))
+                    continue
+                active[job_id] = (process, repo_key)
+                print(f"started\t{job_id}\tpid={process.pid}\trepo={repo_key}", flush=True)
+                claimed += 1
+
+            if stop_when_idle and not active and claimed == 0:
+                return
             time.sleep(interval_seconds)
+
+    def run_claimed_job(
+        self,
+        job_id: str,
+        config: RunnerConfig | None = None,
+        notify_command: str | None = None,
+        notify_statuses: set[str] | None = FAILURE_NOTIFY_STATUSES,
+    ) -> dict[str, str]:
+        if config is None:
+            config = self._load_claimed_queue_config(job_id)
+        try:
+            state = self.run_new(config)
+            self._finish_queue_job(job_id, state.status, state.run_id, state.summary_path, "")
+            result = {"job_id": job_id, "status": state.status, "run_id": state.run_id, "summary_path": state.summary_path}
+            notify_error = self.notify_state(state, notify_command, notify_statuses, job_id=job_id)
+            if notify_error:
+                result["notify_error"] = notify_error
+            return result
+        except Exception as exc:
+            self._finish_queue_job(job_id, "failed", "", "", str(exc))
+            return {"job_id": job_id, "status": "failed", "run_id": "", "summary_path": "", "error": str(exc)}
 
     def resume(self, run_id: str, verify_command: str | None = None, timeout_seconds: float | None = None) -> RunState:
         state = self.load_state(run_id)
@@ -603,22 +657,82 @@ class WorkflowRunner:
             base_ref=config.base_ref,
         )
 
-    def _claim_next_job(self) -> tuple[str, RunnerConfig] | None:
+    def _claim_next_job(self, blocked_repo_paths: set[str] | None = None) -> tuple[str, RunnerConfig] | None:
         now = utc_now()
+        blocked_repo_paths = blocked_repo_paths or set()
         with self._db() as conn:
             conn.execute("begin immediate")
-            row = conn.execute(
-                "select job_id, config_json from queue where status = 'queued' order by created_at limit 1"
-            ).fetchone()
-            if row is None:
+            rows = conn.execute(
+                "select job_id, config_json from queue where status = 'queued' order by created_at limit 100"
+            ).fetchall()
+            selected: tuple[str, str] | None = None
+            for row in rows:
+                config = config_from_dict(json.loads(row[1]), self.state_dir)
+                if self._repo_key(config) in blocked_repo_paths:
+                    continue
+                selected = (str(row[0]), str(row[1]))
+                break
+            if selected is None:
                 conn.execute("commit")
                 return None
             conn.execute(
                 "update queue set status = 'running', updated_at = ? where job_id = ?",
-                (now, row[0]),
+                (now, selected[0]),
             )
             conn.execute("commit")
-        return str(row[0]), config_from_dict(json.loads(row[1]), self.state_dir)
+        return selected[0], config_from_dict(json.loads(selected[1]), self.state_dir)
+
+    def _load_claimed_queue_config(self, job_id: str) -> RunnerConfig:
+        with self._db() as conn:
+            row = conn.execute(
+                "select status, config_json from queue where job_id = ?",
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"queued job not found: {job_id}")
+        if row[0] != "running":
+            raise ValueError(f"queued job is not claimed/running: {job_id} status={row[0]}")
+        return config_from_dict(json.loads(row[1]), self.state_dir)
+
+    def _spawn_claimed_job(
+        self,
+        job_id: str,
+        notify_command: str | None,
+        notify_statuses: set[str] | None,
+    ) -> subprocess.Popen[bytes]:
+        args = [
+            sys.executable,
+            "-m",
+            "agent_workflow",
+            "--state-dir",
+            str(self.state_dir),
+            "run-claimed",
+            "--job-id",
+            job_id,
+        ]
+        if notify_command:
+            args.extend(["--notify-command", notify_command])
+        if notify_statuses is None:
+            args.extend(["--notify-statuses", "all"])
+        elif notify_statuses:
+            args.extend(["--notify-statuses", ",".join(sorted(notify_statuses))])
+        return subprocess.Popen(args)
+
+    def _blocked_worker_repos(self, active: dict[str, tuple[subprocess.Popen[bytes], str]], repo_parallelism: int) -> set[str]:
+        if repo_parallelism < 1:
+            return set()
+        counts: dict[str, int] = {}
+        for _job_id, (_process, repo_key) in active.items():
+            counts[repo_key] = counts.get(repo_key, 0) + 1
+        return {repo_key for repo_key, count in counts.items() if count >= repo_parallelism}
+
+    def _repo_key(self, config: RunnerConfig) -> str:
+        if config.repo_path is None:
+            return ""
+        try:
+            return str(config.repo_path.expanduser().resolve())
+        except OSError:
+            return str(config.repo_path.expanduser())
 
     def _finish_queue_job(self, job_id: str, status: str, run_id: str, summary_path: str, error: str) -> None:
         with self._db() as conn:
@@ -629,6 +743,17 @@ class WorkflowRunner:
                 where job_id = ?
                 """,
                 (status, run_id, summary_path, error, utc_now(), job_id),
+            )
+
+    def _fail_running_queue_job(self, job_id: str, error: str) -> None:
+        with self._db() as conn:
+            conn.execute(
+                """
+                update queue
+                set status = 'failed', error = ?, updated_at = ?
+                where job_id = ? and status = 'running'
+                """,
+                (error, utc_now(), job_id),
             )
 
 

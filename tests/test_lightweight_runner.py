@@ -224,6 +224,35 @@ class LightweightRunnerTest(unittest.TestCase):
         status_after = self._aw("status")
         self.assertIn(f"job\t{job_id}\tqc_failed", status_after.stdout)
 
+    def test_worker_runs_queued_job_in_child_process(self) -> None:
+        enqueued = self._aw(
+            "enqueue",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Queue this fixture task for the child worker.",
+            "--verify-command",
+            "test -f implemented.txt",
+            "--executor-bin",
+            str(self.fake_takt),
+        )
+        job_id = enqueued.stdout.strip()
+
+        worker = self._aw(
+            "worker",
+            "--interval-seconds",
+            "0.01",
+            "--max-runs-per-tick",
+            "1",
+            "--parallelism",
+            "1",
+            "--stop-when-idle",
+        )
+
+        self.assertIn(f"started\t{job_id}\tpid=", worker.stdout)
+        status_after = self._aw("status")
+        self.assertIn(f"job\t{job_id}\tsucceeded", status_after.stdout)
+
     def test_watchdog_scan_and_repair_draft_validate_failed_run(self) -> None:
         failed = self._aw(
             "run",

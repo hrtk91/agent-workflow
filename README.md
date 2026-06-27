@@ -104,8 +104,14 @@ aw tick --max-runs 1 \
 Run queued work continuously:
 
 ```bash
-aw worker --interval-seconds 60 --max-runs-per-tick 1
+aw worker --interval-seconds 60 --parallelism 1 --repo-parallelism 1
 ```
+
+`aw worker` is the daemon-style entrypoint. It claims queued jobs in the
+parent process, runs each claimed job in a child process, and records the child
+exit back into `jobs.sqlite`. Keep `--repo-parallelism 1` for implementation
+work unless the repo-specific workflow has been designed for concurrent
+worktrees, ports, caches, Docker resources, and PR creation.
 
 Notification commands support `{job_id}`, `{run_id}`, `{status}`,
 `{summary}`, and `{discord_summary}` placeholders. By default, notifications
