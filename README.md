@@ -137,6 +137,47 @@ Remove a run worktree:
 aw cleanup --run-id <run-id>
 ```
 
+## Watchdog and Repair Drafts
+
+`aw watchdog scan` lists failed runs that do not yet have a repair draft:
+
+```bash
+aw watchdog scan --limit 10
+```
+
+Repair diagnosis stays outside the core runner. A human or LLM writes plain
+Markdown evidence, then calls the typed CLI. The CLI generates `repair.ini`,
+copies the evidence, validates the guardrails, and records the draft in
+SQLite.
+
+```bash
+aw repair draft \
+  --failed-run-id <run-id> \
+  --title "QC fails because mise state is not writable" \
+  --category runtime_env \
+  --risk low \
+  --proposed-action runtime_environment_patch \
+  --diagnosis-file diagnosis.md \
+  --evidence-file evidence.md \
+  --notify-before-file notify-before.md \
+  --verify-command 'bashx scripts/agent-workflow-qc.bashx'
+```
+
+Drafts are stored under:
+
+```text
+~/.local/state/agent-workflow/
+  repairs/<draft-id>/repair.ini
+  repairs/<draft-id>/diagnosis.md
+  repairs/<draft-id>/evidence.md
+  repairs/<draft-id>/notify-before.md
+```
+
+The draft command validates before returning. `aw repair validate --draft-id
+<draft-id>` can be used to re-check an existing artifact. Deploy and migration
+actions require `--risk high`, `--environment`, `--healthcheck-command`, and a
+non-empty `--rollback-plan-file`.
+
 ## Merge Gates
 
 `aw merge-gate` evaluates a GitHub PR and writes three files:

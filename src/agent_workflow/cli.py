@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from agent_workflow.merge import MergeBlocked, MergeGateConfig, run_merge_approved, run_merge_gate
+from agent_workflow.repair import REPAIR_ACTIONS, REPAIR_CATEGORIES, REPAIR_RISKS, RepairDraftInput, RepairManager
 from agent_workflow.runner import FAILURE_NOTIFY_STATUSES, RunnerConfig, WorkflowRunner, default_state_dir
 
 
@@ -51,6 +52,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     cleanup = sub.add_parser("cleanup", help="remove a run worktree")
     cleanup.add_argument("--run-id", required=True)
+
+    repair = sub.add_parser("repair", help="create and validate workflow repair drafts")
+    repair_sub = repair.add_subparsers(dest="repair_command", required=True)
+    repair_draft = repair_sub.add_parser("draft", help="write a validated repair draft artifact")
+    repair_draft.add_argument("--failed-run-id", required=True)
+    repair_draft.add_argument("--title", required=True)
+    repair_draft.add_argument("--category", choices=sorted(REPAIR_CATEGORIES), required=True)
+    repair_draft.add_argument("--risk", choices=sorted(REPAIR_RISKS), required=True)
+    repair_draft.add_argument("--proposed-action", choices=sorted(REPAIR_ACTIONS), required=True)
+    repair_draft.add_argument("--diagnosis-file", type=Path, required=True)
+    repair_draft.add_argument("--evidence-file", type=Path, required=True)
+    repair_draft.add_argument("--notify-before-file", type=Path, required=True)
+    repair_draft.add_argument("--verify-command")
+    repair_draft.add_argument("--retry-original", action="store_true")
+    repair_draft.add_argument("--environment")
+    repair_draft.add_argument("--healthcheck-command")
+    repair_draft.add_argument("--rollback-plan-file", type=Path)
+    repair_draft.add_argument("--allow-duplicate", action="store_true")
+
+    repair_validate = repair_sub.add_parser("validate", help="validate an existing repair draft")
+    target = repair_validate.add_mutually_exclusive_group(required=True)
+    target.add_argument("--draft-id")
+    target.add_argument("--draft-dir", type=Path)
+
+    watchdog = sub.add_parser("watchdog", help="inspect workflow failures that need repair triage")
+    watchdog_sub = watchdog.add_subparsers(dest="watchdog_command", required=True)
+    watchdog_scan = watchdog_sub.add_parser("scan", help="list failed runs without a repair draft")
+    watchdog_scan.add_argument("--limit", type=int, default=20)
+    watchdog_scan.add_argument("--include-repaired", action="store_true")
 
     merge_gate = sub.add_parser("merge-gate", help="evaluate whether a GitHub PR can be merged")
     merge_gate.add_argument("--repo", required=True, help="GitHub repository slug, for example owner/name")
@@ -183,6 +213,40 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "cleanup":
             runner.cleanup(args.run_id)
             return 0
+        if args.command == "repair":
+            manager = RepairManager(args.state_dir)
+            if args.repair_command == "draft":
+                draft = manager.draft(
+                    RepairDraftInput(
+                        failed_run_id=args.failed_run_id,
+                        title=args.title,
+                        category=args.category,
+                        risk=args.risk,
+                        proposed_action=args.proposed_action,
+                        diagnosis_file=args.diagnosis_file,
+                        evidence_file=args.evidence_file,
+                        notify_before_file=args.notify_before_file,
+                        verify_command=args.verify_command,
+                        retry_original=args.retry_original,
+                        environment=args.environment,
+                        healthcheck_command=args.healthcheck_command,
+                        rollback_plan_file=args.rollback_plan_file,
+                    ),
+                    allow_duplicate=args.allow_duplicate,
+                )
+                print(draft.draft_dir)
+                return 0
+            if args.repair_command == "validate":
+                draft = manager.validate(draft_id=args.draft_id, draft_dir=args.draft_dir)
+                print(draft.draft_dir)
+                return 0
+        if args.command == "watchdog":
+            manager = RepairManager(args.state_dir)
+            if args.watchdog_command == "scan":
+                rows = manager.scan_failures(limit=args.limit, include_repaired=args.include_repaired)
+                for row in rows:
+                    print("\t".join(row[key] for key in ["run_id", "status", "current_step", "summary_path", "repair_status"]))
+                return 0
         if args.command == "merge-gate":
             result = run_merge_gate(
                 MergeGateConfig(

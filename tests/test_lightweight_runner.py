@@ -197,6 +197,170 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertTrue(discord_summary.exists())
         self.assertIn("🔁 retry candidate", discord_summary.read_text())
 
+    def test_watchdog_scan_and_repair_draft_validate_failed_run(self) -> None:
+        failed = self._aw(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Implement but fail QC for repair triage.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+            check=False,
+        )
+        state = self._state(Path(failed.stdout.strip()))
+        self.assertEqual("qc_failed", state["status"])
+
+        scan = self._aw("watchdog", "scan")
+        self.assertIn(f"{state['run_id']}\tqc_failed\trun_qc", scan.stdout)
+
+        diagnosis = self.root / "diagnosis.md"
+        evidence = self.root / "evidence.md"
+        notify_before = self.root / "notify-before.md"
+        diagnosis.write_text("QC expects qc-pass, but the worktree lacks the marker.\n", encoding="utf-8")
+        evidence.write_text(f"- summary: {state['summary_path']}\n", encoding="utf-8")
+        notify_before.write_text("🩺 repair draft: retry after adding the missing marker.\n", encoding="utf-8")
+
+        drafted = self._aw(
+            "repair",
+            "draft",
+            "--failed-run-id",
+            str(state["run_id"]),
+            "--title",
+            "QC marker missing",
+            "--category",
+            "implementation_failure",
+            "--risk",
+            "low",
+            "--proposed-action",
+            "repo_config_patch",
+            "--diagnosis-file",
+            str(diagnosis),
+            "--evidence-file",
+            str(evidence),
+            "--notify-before-file",
+            str(notify_before),
+            "--verify-command",
+            "test -f qc-pass",
+        )
+        draft_dir = Path(drafted.stdout.strip())
+        repair_ini = draft_dir / "repair.ini"
+        self.assertTrue(repair_ini.exists())
+        self.assertEqual("QC expects qc-pass, but the worktree lacks the marker.\n", (draft_dir / "diagnosis.md").read_text())
+        self.assertIn("status = validated", repair_ini.read_text())
+        self.assertIn("proposed_action = repo_config_patch", repair_ini.read_text())
+
+        validated = self._aw("repair", "validate", "--draft-id", draft_dir.name)
+        self.assertEqual(str(draft_dir), validated.stdout.strip())
+
+        duplicate = self._aw(
+            "repair",
+            "draft",
+            "--failed-run-id",
+            str(state["run_id"]),
+            "--title",
+            "QC marker missing again",
+            "--category",
+            "implementation_failure",
+            "--risk",
+            "low",
+            "--proposed-action",
+            "repo_config_patch",
+            "--diagnosis-file",
+            str(diagnosis),
+            "--evidence-file",
+            str(evidence),
+            "--notify-before-file",
+            str(notify_before),
+            "--verify-command",
+            "test -f qc-pass",
+            check=False,
+        )
+        self.assertEqual(2, duplicate.returncode)
+        self.assertIn("repair draft already exists", duplicate.stderr)
+
+        scan_after = self._aw("watchdog", "scan")
+        self.assertEqual("", scan_after.stdout)
+
+    def test_repair_draft_requires_deploy_guardrails(self) -> None:
+        failed = self._aw(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Implement but fail QC before deploy repair draft.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+            check=False,
+        )
+        state = self._state(Path(failed.stdout.strip()))
+        diagnosis = self.root / "deploy-diagnosis.md"
+        evidence = self.root / "deploy-evidence.md"
+        notify_before = self.root / "deploy-notify-before.md"
+        rollback = self.root / "rollback.md"
+        diagnosis.write_text("Production deploy failed after config drift.\n", encoding="utf-8")
+        evidence.write_text("deploy log excerpt\n", encoding="utf-8")
+        notify_before.write_text("🚦 repair draft: deploy needs healthcheck and rollback.\n", encoding="utf-8")
+        rollback.write_text("Revert to previous deployment and re-run healthcheck.\n", encoding="utf-8")
+
+        missing_guardrails = self._aw(
+            "repair",
+            "draft",
+            "--failed-run-id",
+            str(state["run_id"]),
+            "--title",
+            "Deploy config drift",
+            "--category",
+            "deploy_config",
+            "--risk",
+            "medium",
+            "--proposed-action",
+            "redeploy_and_healthcheck",
+            "--diagnosis-file",
+            str(diagnosis),
+            "--evidence-file",
+            str(evidence),
+            "--notify-before-file",
+            str(notify_before),
+            check=False,
+        )
+        self.assertEqual(2, missing_guardrails.returncode)
+        self.assertIn("requires --risk high", missing_guardrails.stderr)
+
+        drafted = self._aw(
+            "repair",
+            "draft",
+            "--failed-run-id",
+            str(state["run_id"]),
+            "--title",
+            "Deploy config drift",
+            "--category",
+            "deploy_config",
+            "--risk",
+            "high",
+            "--proposed-action",
+            "redeploy_and_healthcheck",
+            "--diagnosis-file",
+            str(diagnosis),
+            "--evidence-file",
+            str(evidence),
+            "--notify-before-file",
+            str(notify_before),
+            "--environment",
+            "production",
+            "--healthcheck-command",
+            "curl -fsS https://example.invalid/health",
+            "--rollback-plan-file",
+            str(rollback),
+        )
+        draft_dir = Path(drafted.stdout.strip())
+        self.assertTrue((draft_dir / "rollback-plan.md").exists())
+        self.assertIn("environment = production", (draft_dir / "repair.ini").read_text())
+
     def _aw(self, *args: str, env: dict[str, str] | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
         merged_env = os.environ.copy()
         if env:
