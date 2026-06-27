@@ -316,6 +316,43 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertEqual(repair_job_id, repair_jobs[0][0])
         self.assertEqual("qc_failed", repair_jobs[0][1])
 
+    def test_tick_auto_repair_scans_existing_failed_runs(self) -> None:
+        failed = self._aw(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Create an existing failed run before auto-repair is enabled.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+            check=False,
+        )
+        failed_state = self._state(Path(failed.stdout.strip()))
+        self.assertEqual("qc_failed", failed_state["status"])
+
+        ticked = self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--isolate-job-failures",
+        )
+
+        self.assertEqual(0, ticked.returncode)
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        queue_rows = conn.execute("select status, config_json from queue order by created_at").fetchall()
+        repair_jobs = [
+            row
+            for row in queue_rows
+            if json.loads(row[1]).get("repair_for_run_id") == failed_state["run_id"]
+        ]
+        self.assertEqual(1, len(repair_jobs))
+        self.assertEqual("qc_failed", repair_jobs[0][0])
+
     def test_worker_runs_queued_job_in_child_process(self) -> None:
         enqueued = self._aw(
             "enqueue",

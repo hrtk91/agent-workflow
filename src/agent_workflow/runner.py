@@ -128,6 +128,7 @@ class WorkflowRunner:
         notify_statuses: set[str] | None = FAILURE_NOTIFY_STATUSES,
         auto_repair: AutoRepairConfig | None = None,
     ) -> list[dict[str, str]]:
+        self.enqueue_auto_repairs_for_failures(auto_repair, limit=max_runs)
         results: list[dict[str, str]] = []
         for _ in range(max_runs):
             job = self._claim_next_job()
@@ -180,6 +181,10 @@ class WorkflowRunner:
                     self._fail_running_queue_job(job_id, f"worker child exited with {exit_code}")
                 del active[job_id]
 
+            if not active:
+                for repair_job_id in self.enqueue_auto_repairs_for_failures(auto_repair, limit=max_runs_per_tick):
+                    print(f"auto_repair_queued\t{repair_job_id}", flush=True)
+
             claimed = 0
             while len(active) < parallelism and claimed < max_runs_per_tick:
                 blocked_repos = self._blocked_worker_repos(active, repo_parallelism)
@@ -229,6 +234,17 @@ class WorkflowRunner:
             self._finish_queue_job(job_id, "failed", "", "", str(exc))
             return {"job_id": job_id, "status": "failed", "run_id": "", "summary_path": "", "error": str(exc)}
 
+    def enqueue_auto_repairs_for_failures(self, auto_repair: AutoRepairConfig | None, limit: int = 20) -> list[str]:
+        if auto_repair is None:
+            return []
+        job_ids: list[str] = []
+        for state in self._failed_states_without_repair(limit):
+            source_config = runner_config_from_state(state, self.state_dir)
+            repair_job_id = self.maybe_enqueue_auto_repair(state, source_config, auto_repair)
+            if repair_job_id:
+                job_ids.append(repair_job_id)
+        return job_ids
+
     def maybe_enqueue_auto_repair(
         self,
         failed_state: RunState,
@@ -250,6 +266,34 @@ class WorkflowRunner:
         self._write_summary(failed_state)
         self.save_state(failed_state)
         return repair_job_id
+
+    def _failed_states_without_repair(self, limit: int) -> list[RunState]:
+        if limit < 1:
+            return []
+        with self._db() as conn:
+            rows = conn.execute(
+                f"""
+                select run_id
+                from jobs
+                where status in ({','.join('?' for _ in FAILURE_NOTIFY_STATUSES)})
+                order by updated_at desc
+                limit ?
+                """,
+                (*sorted(FAILURE_NOTIFY_STATUSES), limit),
+            ).fetchall()
+        states: list[RunState] = []
+        for row in rows:
+            run_id = str(row[0])
+            if self._has_repair_or_repair_job(run_id):
+                continue
+            try:
+                state = self.load_state(run_id)
+            except (FileNotFoundError, json.JSONDecodeError):
+                continue
+            if state.purpose == "repair":
+                continue
+            states.append(state)
+        return states
 
     def recover_stale_running(self, error: str) -> int:
         recovered = 0
@@ -1274,6 +1318,23 @@ def config_from_dict(data: dict[str, object], state_dir: Path) -> RunnerConfig:
         base_ref=str(data["base_ref"]) if data.get("base_ref") else None,
         purpose=str(data.get("purpose") or "workflow"),
         repair_for_run_id=str(data["repair_for_run_id"]) if data.get("repair_for_run_id") else None,
+    )
+
+
+def runner_config_from_state(state: RunState, state_dir: Path) -> RunnerConfig:
+    return RunnerConfig(
+        state_dir=state_dir,
+        repo_path=Path(state.repo_path),
+        task_text=render_task_text(Path(state.task_dir)),
+        workflow=state.workflow,
+        verify_command=state.verify_command,
+        timeout_seconds=state.timeout_seconds,
+        executor_bin=state.executor_bin,
+        provider=state.provider,
+        model=state.model,
+        base_ref=state.base_ref,
+        purpose=state.purpose,
+        repair_for_run_id=state.repair_for_run_id,
     )
 
 
