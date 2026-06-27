@@ -125,6 +125,36 @@ Remove a run worktree:
 aw cleanup --run-id <run-id>
 ```
 
+## Merge Gates
+
+`aw merge-gate` evaluates a GitHub PR and writes three files:
+
+```text
+merge-decision.json
+merge-gate.md
+hermes-discord-summary.md
+```
+
+The gate can use GitHub checks, local QC in a detached PR-head worktree, or
+both. With no GitHub checks and no local QC, it blocks by default.
+
+```bash
+aw merge-gate \
+  --repo hrtk91/eb-temp \
+  --pr 853 \
+  --repo-path /home/h-taminato/repos/eb-temp-hermes-runtime \
+  --verify-command 'bashx scripts/agent-workflow-qc.bashx'
+```
+
+`aw merge` consumes a fresh `MERGE_APPROVED` decision. It re-checks the PR head
+SHA, base SHA, draft state, merge state, and live checks before doing anything.
+The default is dry-run; pass `--execute` to merge.
+
+```bash
+aw merge --decision /path/to/merge-decision.json
+aw merge --decision /path/to/merge-decision.json --execute
+```
+
 ## OpenTelemetry
 
 Every step writes one OpenTelemetry-shaped span record to `trace.jsonl`. This is
@@ -145,7 +175,7 @@ can be added without changing the runner state model.
 ## Tests
 
 ```bash
-shx scripts/test.shx
+bashx scripts/test.bashx
 ```
 
 The Python tests use a fake git repo and fake executor binary, so they do not

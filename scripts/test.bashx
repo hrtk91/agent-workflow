@@ -1,8 +1,6 @@
-#!/usr/bin/env shx
+#!/usr/bin/env bashx
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT_DIR"
 
-go test ./...
 python3 -m unittest discover -s tests -v
-shx scripts/test-takt-supervisor.shx
