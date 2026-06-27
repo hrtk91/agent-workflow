@@ -429,14 +429,24 @@ def render_discord_summary(decision: dict[str, Any]) -> str:
     title = str(decision.get("title") or "")
     url = str(decision.get("prUrl") or "")
     if status == "MERGE_APPROVED":
-        headline = f"merge approved: PR #{decision['prNumber']}"
+        headline = f"✅ merge approved: PR #{decision['prNumber']}"
     else:
-        headline = f"merge blocked: PR #{decision['prNumber']} ({status})"
-    lines = [headline, title, url, ""]
-    for reason in decision.get("blockingReasons") or []:
-        lines.append(f"- {reason}")
-    if not decision.get("blockingReasons"):
-        lines.append("- all configured merge gates passed")
+        headline = f"🛑 merge blocked: PR #{decision['prNumber']} ({status})"
+    lines = [headline]
+    if title:
+        lines.append(f"📝 {title}")
+    if url:
+        lines.append(f"🔗 {url}")
+    lines.append("")
+
+    blocking_reasons = decision.get("blockingReasons") or []
+    if blocking_reasons:
+        lines.append("🔎 needs attention")
+        for reason in blocking_reasons:
+            lines.append(f"- {reason}")
+    else:
+        lines.append("🎉 all configured merge gates passed")
+        lines.append("🚀 ready for a safe merge")
     lines.append("")
     return "\n".join(lines)
 

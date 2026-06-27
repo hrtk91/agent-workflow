@@ -53,6 +53,11 @@ class MergeCommandsTest(unittest.TestCase):
         self.assertFalse((output_dir / "worktree").exists())
         self.assertTrue((output_dir / "merge-gate.md").exists())
         self.assertTrue((output_dir / "hermes-discord-summary.md").exists())
+        summary = (output_dir / "hermes-discord-summary.md").read_text(encoding="utf-8")
+        self.assertIn("✅ merge approved: PR #853", summary)
+        self.assertIn("📝 fixture PR", summary)
+        self.assertIn("🎉 all configured merge gates passed", summary)
+        self.assertIn("🚀 ready for a safe merge", summary)
 
     def test_merge_gate_blocks_when_no_checks_and_no_local_qc(self) -> None:
         output_dir = self.root / "gate-blocked"
@@ -71,6 +76,10 @@ class MergeCommandsTest(unittest.TestCase):
         decision = json.loads((output_dir / "merge-decision.json").read_text())
         self.assertEqual("MERGE_BLOCKED_NEEDS_HUMAN", decision["decision"])
         self.assertIn("no PR checks reported", "\n".join(decision["blockingReasons"]))
+        summary = (output_dir / "hermes-discord-summary.md").read_text(encoding="utf-8")
+        self.assertIn("🛑 merge blocked: PR #853 (MERGE_BLOCKED_NEEDS_HUMAN)", summary)
+        self.assertIn("🔎 needs attention", summary)
+        self.assertIn("- no PR checks reported", summary)
 
     def test_merge_dry_run_and_execute_use_head_lock(self) -> None:
         decision_path = self.root / "approved.json"
