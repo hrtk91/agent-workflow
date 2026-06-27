@@ -62,6 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="show run status")
     status.add_argument("--run-id")
+    status.add_argument("--include-repair", action="store_true", help="include internal repair-diagnosis jobs in recent status output")
 
     summary = sub.add_parser("summary", help="print summary path")
     summary.add_argument("--run-id", required=True)
@@ -292,7 +293,7 @@ def main(argv: list[str] | None = None) -> int:
             print(state.summary_path)
             return 0 if state.status == "succeeded" and not notify_error else 1
         if args.command == "status":
-            print(runner.status(args.run_id))
+            print(runner.status(args.run_id, include_repair=args.include_repair))
             return 0
         if args.command == "summary":
             summary_path = Path(runner.load_state(args.run_id).summary_path)

@@ -370,6 +370,50 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertEqual(repair_job_id, repair_jobs[0][0])
         self.assertEqual("qc_failed", repair_jobs[0][1])
 
+        status_default = self._aw("status")
+        self.assertNotIn(repair_job_id, status_default.stdout)
+        status_with_repair = self._aw("status", "--include-repair")
+        self.assertIn(repair_job_id, status_with_repair.stdout)
+
+    def test_watchdog_scan_ignores_failed_repair_jobs(self) -> None:
+        enqueued = self._aw(
+            "enqueue",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Queue this fixture task and leave a failed repair job for watchdog scan.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+        )
+        job_id = enqueued.stdout.strip()
+
+        first = self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--isolate-job-failures",
+        )
+        self.assertIn(f"{job_id}\tqc_failed", first.stdout)
+
+        second = self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--isolate-job-failures",
+        )
+        repair_run_id = second.stdout.strip().split("\t")[2]
+
+        scan = self._aw("watchdog", "scan", "--include-repaired")
+        self.assertNotIn(repair_run_id, scan.stdout)
+
     def test_auto_repair_requeues_failed_repair_once_without_draft(self) -> None:
         enqueued = self._aw(
             "enqueue",

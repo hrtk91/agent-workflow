@@ -180,7 +180,8 @@ class RepairManager:
         repair_filter = ""
         if not include_repaired:
             repair_filter = "and repairs.repair_status is null"
-        params.append(limit)
+        scan_limit = max(limit * 10, 50)
+        params.append(scan_limit)
         with self._db() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
@@ -204,16 +205,23 @@ class RepairManager:
                 """,
                 params,
             ).fetchall()
-        return [
-            {
-                "run_id": str(row["run_id"]),
-                "status": str(row["status"]),
-                "current_step": str(row["current_step"]),
-                "summary_path": str(row["summary_path"]),
-                "repair_status": str(row["repair_status"]),
-            }
-            for row in rows
-        ]
+        results: list[dict[str, str]] = []
+        for row in rows:
+            run_id = str(row["run_id"])
+            if self._run_purpose(run_id) == "repair":
+                continue
+            results.append(
+                {
+                    "run_id": run_id,
+                    "status": str(row["status"]),
+                    "current_step": str(row["current_step"]),
+                    "summary_path": str(row["summary_path"]),
+                    "repair_status": str(row["repair_status"]),
+                }
+            )
+            if len(results) >= limit:
+                break
+        return results
 
     def _validate_input(self, draft_input: RepairDraftInput) -> None:
         if not draft_input.title.strip():
@@ -319,6 +327,13 @@ class RepairManager:
 
     def _state_path(self, run_id: str) -> Path:
         return self.runs_dir / run_id / "state.json"
+
+    def _run_purpose(self, run_id: str) -> str:
+        try:
+            data = json.loads(self._state_path(run_id).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "workflow"
+        return str(data.get("purpose") or "workflow")
 
     def _write_config(self, draft_dir: Path, config: configparser.ConfigParser) -> None:
         with (draft_dir / "repair.ini").open("w", encoding="utf-8") as f:

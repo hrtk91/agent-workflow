@@ -356,7 +356,7 @@ class WorkflowRunner:
         self.save_state(state)
         return self._run_from(state, index)
 
-    def status(self, run_id: str | None = None) -> str:
+    def status(self, run_id: str | None = None, include_repair: bool = False) -> str:
         if run_id:
             state = self.load_state(run_id)
             lines = [f"{state.run_id}\t{state.status}\t{state.current_step or '-'}\t{state.summary_path}"]
@@ -364,15 +364,27 @@ class WorkflowRunner:
             return "\n".join(lines)
         with self._db() as conn:
             queue_rows = conn.execute(
-                "select job_id, status, coalesce(run_id, ''), coalesce(summary_path, '') from queue order by created_at desc limit 20"
+                "select job_id, status, coalesce(run_id, ''), coalesce(summary_path, ''), config_json from queue order by created_at desc limit 100"
             ).fetchall()
             run_rows = conn.execute(
-                "select run_id, status, coalesce(current_step, ''), summary_path from jobs order by created_at desc limit 20"
+                "select run_id, status, coalesce(current_step, ''), summary_path from jobs order by created_at desc limit 100"
             ).fetchall()
+        visible_queue_rows = []
+        for row in queue_rows:
+            if include_repair or queue_config_purpose(str(row[4])) != "repair":
+                visible_queue_rows.append(row[:4])
+            if len(visible_queue_rows) >= 20:
+                break
+        visible_run_rows = []
+        for row in run_rows:
+            if include_repair or self._run_purpose(str(row[0])) != "repair":
+                visible_run_rows.append(row)
+            if len(visible_run_rows) >= 20:
+                break
         lines = ["queue:"]
-        lines.extend("\t".join(["job", *(str(col) for col in row)]) for row in queue_rows)
+        lines.extend("\t".join(["job", *(str(col) for col in row)]) for row in visible_queue_rows)
         lines.append("runs:")
-        lines.extend("\t".join(["run", *(str(col) for col in row)]) for row in run_rows)
+        lines.extend("\t".join(["run", *(str(col) for col in row)]) for row in visible_run_rows)
         return "\n".join(lines)
 
     def cleanup(self, run_id: str) -> None:
@@ -963,6 +975,12 @@ class WorkflowRunner:
         except OSError:
             return str(config.repo_path.expanduser())
 
+    def _run_purpose(self, run_id: str) -> str:
+        try:
+            return self.load_state(run_id).purpose
+        except (FileNotFoundError, json.JSONDecodeError, TypeError):
+            return "workflow"
+
     def _finish_queue_job(self, job_id: str, status: str, run_id: str, summary_path: str, error: str) -> None:
         with self._db() as conn:
             conn.execute(
@@ -1155,6 +1173,14 @@ def render_notification_command(template: str, values: dict[str, str]) -> str:
     for key, value in values.items():
         rendered = rendered.replace("{" + key + "}", shlex.quote(value))
     return rendered
+
+
+def queue_config_purpose(config_json: str) -> str:
+    try:
+        data = json.loads(config_json)
+    except json.JSONDecodeError:
+        return "workflow"
+    return str(data.get("purpose") or "workflow")
 
 
 def render_auto_repair_verify_command(state_dir: Path, failed_run_id: str) -> str:
