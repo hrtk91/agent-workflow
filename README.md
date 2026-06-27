@@ -85,11 +85,23 @@ Run queued work once:
 aw tick --max-runs 1
 ```
 
+Run queued work once and notify Hermes on failed/blocked/timed-out runs:
+
+```bash
+aw tick --max-runs 1 \
+  --notify-command 'scripts/notify-hermes-workflow-summary.bashx {discord_summary} "[eb-temp workflow]"'
+```
+
 Run queued work continuously:
 
 ```bash
 aw worker --interval-seconds 60 --max-runs-per-tick 1
 ```
+
+Notification commands support `{job_id}`, `{run_id}`, `{status}`,
+`{summary}`, and `{discord_summary}` placeholders. By default, notifications
+are sent only for `blocked`, `failed`, `qc_failed`, and `timed_out`; use
+`--notify-statuses all` when a worker should also report successful runs.
 
 Direct synchronous execution is available for smoke tests and manual use:
 

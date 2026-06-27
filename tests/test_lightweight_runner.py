@@ -43,6 +43,10 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertTrue(summary.exists())
         summary_text = summary.read_text()
         self.assertIn("status: `succeeded`", summary_text)
+        discord_summary = summary.with_name("hermes-discord-summary.md")
+        discord_text = discord_summary.read_text()
+        self.assertIn("✅ workflow succeeded", discord_text)
+        self.assertIn("No retry needed.", discord_text)
         self.assertIn("## executor observability", summary_text)
         self.assertIn("- takt_trace: `", summary_text)
         self.assertIn("- takt_monitor: `", summary_text)
@@ -83,6 +87,10 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertEqual(1, first.returncode)
         state = self._state(Path(first.stdout.strip()))
         self.assertEqual("qc_failed", state["status"])
+        discord_text = Path(state["summary_path"]).with_name("hermes-discord-summary.md").read_text()
+        self.assertIn("🧪 workflow QC failed", discord_text)
+        self.assertIn(f"aw resume --run-id {state['run_id']}", discord_text)
+        self.assertIn(f"aw retry --run-id {state['run_id']} --step run_qc", discord_text)
         Path(state["worktree_path"], "qc-pass").write_text("ok\n")
 
         resumed = self._aw("resume", "--run-id", state["run_id"])
@@ -113,8 +121,11 @@ class LightweightRunnerTest(unittest.TestCase):
         state = self._state(Path(result.stdout.strip()))
         self.assertEqual("timed_out", state["status"])
         summary_text = Path(state["summary_path"]).read_text()
+        discord_text = Path(state["summary_path"]).with_name("hermes-discord-summary.md").read_text()
         self.assertIn("- timeout_seconds: `0.2`", summary_text)
         self.assertIn("timed_out=true", summary_text)
+        self.assertIn("⏳ workflow timed out", discord_text)
+        self.assertIn("--timeout-seconds 600", discord_text)
         run_executor = next(step for step in state["steps"] if step["name"] == "run_executor")
         self.assertTrue(run_executor["timed_out"])
         trace_rows = [json.loads(line) for line in Path(state["trace_path"]).read_text().splitlines()]
@@ -143,6 +154,48 @@ class LightweightRunnerTest(unittest.TestCase):
 
         status_after = self._aw("status")
         self.assertIn(f"job\t{job_id}\tsucceeded", status_after.stdout)
+
+    def test_tick_can_notify_failed_runs_with_discord_summary(self) -> None:
+        enqueued = self._aw(
+            "enqueue",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Queue this fixture task and fail QC.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+        )
+        job_id = enqueued.stdout.strip()
+        notify_log = self.root / "notify.log"
+        notify_script = self.root / "notify"
+        notify_script.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "printf '%s\\n' \"$@\" > \"$FAKE_NOTIFY_LOG\"\n",
+            encoding="utf-8",
+        )
+        notify_script.chmod(0o755)
+
+        ticked = self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--notify-command",
+            f"{notify_script} {{status}} {{run_id}} {{discord_summary}}",
+            env={"FAKE_NOTIFY_LOG": str(notify_log)},
+            check=False,
+        )
+
+        self.assertEqual(1, ticked.returncode)
+        self.assertIn(f"{job_id}\tqc_failed", ticked.stdout)
+        notify_args = notify_log.read_text().splitlines()
+        self.assertEqual("qc_failed", notify_args[0])
+        self.assertRegex(notify_args[1], r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
+        discord_summary = Path(notify_args[2])
+        self.assertTrue(discord_summary.exists())
+        self.assertIn("🔁 retry candidate", discord_summary.read_text())
 
     def _aw(self, *args: str, env: dict[str, str] | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
         merged_env = os.environ.copy()

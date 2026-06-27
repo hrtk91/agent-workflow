@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -16,6 +17,7 @@ from agent_workflow.state import RunState, StepState
 from agent_workflow.tracing import TraceRecorder, trace_enabled_hint
 
 STEPS = ["load_task", "create_worktree", "run_executor", "run_qc", "write_summary"]
+FAILURE_NOTIFY_STATUSES = {"blocked", "failed", "qc_failed", "timed_out"}
 
 
 @dataclass
@@ -104,7 +106,12 @@ class WorkflowRunner:
             )
         return job_id
 
-    def tick(self, max_runs: int = 1) -> list[dict[str, str]]:
+    def tick(
+        self,
+        max_runs: int = 1,
+        notify_command: str | None = None,
+        notify_statuses: set[str] | None = FAILURE_NOTIFY_STATUSES,
+    ) -> list[dict[str, str]]:
         results: list[dict[str, str]] = []
         for _ in range(max_runs):
             job = self._claim_next_job()
@@ -114,15 +121,25 @@ class WorkflowRunner:
             try:
                 state = self.run_new(config)
                 self._finish_queue_job(job_id, state.status, state.run_id, state.summary_path, "")
-                results.append({"job_id": job_id, "status": state.status, "run_id": state.run_id, "summary_path": state.summary_path})
+                result = {"job_id": job_id, "status": state.status, "run_id": state.run_id, "summary_path": state.summary_path}
+                notify_error = self.notify_state(state, notify_command, notify_statuses, job_id=job_id)
+                if notify_error:
+                    result["notify_error"] = notify_error
+                results.append(result)
             except Exception as exc:
                 self._finish_queue_job(job_id, "failed", "", "", str(exc))
                 results.append({"job_id": job_id, "status": "failed", "run_id": "", "summary_path": "", "error": str(exc)})
         return results
 
-    def worker(self, interval_seconds: float = 60, max_runs_per_tick: int = 1) -> None:
+    def worker(
+        self,
+        interval_seconds: float = 60,
+        max_runs_per_tick: int = 1,
+        notify_command: str | None = None,
+        notify_statuses: set[str] | None = FAILURE_NOTIFY_STATUSES,
+    ) -> None:
         while True:
-            self.tick(max_runs=max_runs_per_tick)
+            self.tick(max_runs=max_runs_per_tick, notify_command=notify_command, notify_statuses=notify_statuses)
             time.sleep(interval_seconds)
 
     def resume(self, run_id: str, verify_command: str | None = None, timeout_seconds: float | None = None) -> RunState:
@@ -174,6 +191,26 @@ class WorkflowRunner:
             state.worktree_path = None
             self._write_summary(state)
             self.save_state(state)
+
+    def notify_state(self, state: RunState, command_template: str | None, statuses: set[str] | None, job_id: str = "") -> str:
+        if not command_template:
+            return ""
+        if statuses is not None and state.status not in statuses:
+            return ""
+        command = render_notification_command(
+            command_template,
+            {
+                "job_id": job_id,
+                "run_id": state.run_id,
+                "status": state.status,
+                "summary": state.summary_path,
+                "discord_summary": str(discord_summary_path(state.summary_path)),
+            },
+        )
+        result = subprocess.run(["bash", "-lc", command], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if result.returncode != 0:
+            return result.stdout.strip() or f"notification command exited with {result.returncode}"
+        return ""
 
     def load_state(self, run_id: str) -> RunState:
         path = self.runs_dir / run_id / "state.json"
@@ -341,6 +378,7 @@ class WorkflowRunner:
         lines.extend(self._executor_observability_summary(state))
         lines.extend(["", "## task", "", "```text", task_preview, "```", ""])
         Path(state.summary_path).write_text("\n".join(lines), encoding="utf-8")
+        discord_summary_path(state.summary_path).write_text(render_run_discord_summary(state, task_preview), encoding="utf-8")
 
     def _snapshot_executor_observability(self, state: RunState, started_at: float) -> Path | None:
         if not state.worktree_path:
@@ -657,6 +695,99 @@ def render_task_text(task_dir: Path) -> str:
         if path.exists():
             parts.append(f"# {name}\n\n{path.read_text(encoding='utf-8').strip()}")
     return "\n\n".join(parts).strip()
+
+
+def discord_summary_path(summary_path: str | Path) -> Path:
+    return Path(summary_path).with_name("hermes-discord-summary.md")
+
+
+def render_run_discord_summary(state: RunState, task_preview: str) -> str:
+    headline = {
+        "succeeded": "✅ workflow succeeded",
+        "qc_failed": "🧪 workflow QC failed",
+        "timed_out": "⏳ workflow timed out",
+        "blocked": "🧱 workflow blocked",
+        "failed": "🛑 workflow failed",
+        "running": "🏃 workflow running",
+        "queued": "📥 workflow queued",
+    }.get(state.status, f"🧭 workflow {state.status}")
+    step = current_or_failed_step(state)
+    lines = [
+        f"{headline}: {state.run_id}",
+        f"📌 status: `{state.status}`",
+        f"📦 repo: `{state.repo_path}`",
+        f"🧭 workflow: `{state.workflow}`",
+        f"🔗 summary: `{state.summary_path}`",
+    ]
+    if step:
+        lines.append(f"🔎 step: `{step.name}` status=`{step.status}` attempts=`{step.attempts}`")
+        if step.error:
+            lines.append(f"💬 reason: {step.error}")
+        if step.timed_out:
+            lines.append("⏱️ timed_out: `true`")
+
+    title = first_task_line(task_preview)
+    if title:
+        lines.extend(["", f"📝 task: {title}"])
+
+    actions = notification_actions(state, step)
+    if actions:
+        lines.extend(["", "🔁 next action"])
+        lines.extend(f"- {action}" for action in actions)
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def current_or_failed_step(state: RunState) -> StepState | None:
+    if state.current_step:
+        try:
+            return state.step(state.current_step)
+        except KeyError:
+            pass
+    for step in state.steps:
+        if step.status not in {"succeeded", "pending"}:
+            return step
+    for step in state.steps:
+        if step.status != "succeeded":
+            return step
+    return None
+
+
+def notification_actions(state: RunState, step: StepState | None) -> list[str]:
+    if state.status == "succeeded":
+        return ["No retry needed."]
+    if step is None:
+        return [f"▶️ resume candidate: `aw resume --run-id {state.run_id}`"]
+    actions: list[str] = []
+    if state.status == "timed_out":
+        next_timeout = max(int(state.timeout_seconds * 2), int(state.timeout_seconds) + 600, 600)
+        actions.append(f"▶️ resume with a larger timeout: `aw resume --run-id {state.run_id} --timeout-seconds {next_timeout}`")
+    else:
+        actions.append(f"▶️ resume candidate: `aw resume --run-id {state.run_id}`")
+    actions.append(f"🔁 retry candidate: `aw retry --run-id {state.run_id} --step {step.name}`")
+    if state.status == "qc_failed":
+        actions.append("🧪 inspect QC logs, fix the worktree, then retry `run_qc`.")
+    elif state.status == "blocked":
+        actions.append("✋ human input is needed before retrying the blocked step.")
+    elif state.status == "failed":
+        actions.append("🧯 inspect executor logs before retrying.")
+    return actions
+
+
+def first_task_line(task_preview: str) -> str:
+    for line in task_preview.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return stripped[:160]
+    return ""
+
+
+def render_notification_command(template: str, values: dict[str, str]) -> str:
+    rendered = template
+    for key, value in values.items():
+        rendered = rendered.replace("{" + key + "}", shlex.quote(value))
+    return rendered
 
 
 def count_lines(path: Path) -> int:

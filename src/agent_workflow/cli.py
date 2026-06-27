@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from agent_workflow.merge import MergeBlocked, MergeGateConfig, run_merge_approved, run_merge_gate
-from agent_workflow.runner import RunnerConfig, WorkflowRunner, default_state_dir
+from agent_workflow.runner import FAILURE_NOTIFY_STATUSES, RunnerConfig, WorkflowRunner, default_state_dir
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -22,27 +22,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     tick = sub.add_parser("tick", help="run queued jobs once and exit")
     tick.add_argument("--max-runs", type=int, default=1)
+    add_notify_args(tick)
 
     worker = sub.add_parser("worker", help="run queued jobs in a loop")
     worker.add_argument("--interval-seconds", type=float, default=60)
     worker.add_argument("--max-runs-per-tick", type=int, default=1)
+    add_notify_args(worker)
 
     resume = sub.add_parser("resume", help="resume a failed or interrupted run")
     resume.add_argument("--run-id", required=True)
     resume.add_argument("--verify-command")
     resume.add_argument("--timeout-seconds", type=float)
+    add_notify_args(resume)
 
     retry = sub.add_parser("retry", help="retry one step and all downstream steps")
     retry.add_argument("--run-id", required=True)
     retry.add_argument("--step", required=True)
     retry.add_argument("--verify-command")
     retry.add_argument("--timeout-seconds", type=float)
+    add_notify_args(retry)
 
     status = sub.add_parser("status", help="show run status")
     status.add_argument("--run-id")
 
     summary = sub.add_parser("summary", help="print summary path")
     summary.add_argument("--run-id", required=True)
+    summary.add_argument("--discord", action="store_true", help="print Hermes Discord summary path")
 
     cleanup = sub.add_parser("cleanup", help="remove a run worktree")
     cleanup.add_argument("--run-id", required=True)
@@ -83,6 +88,19 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model")
     parser.add_argument("--base-ref")
     parser.add_argument("--keep-worktree", action="store_true", default=True)
+    add_notify_args(parser)
+
+
+def add_notify_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--notify-command",
+        help="shell command template after a terminal run; placeholders: {job_id} {run_id} {status} {summary} {discord_summary}",
+    )
+    parser.add_argument(
+        "--notify-statuses",
+        default=",".join(sorted(FAILURE_NOTIFY_STATUSES)),
+        help="comma-separated statuses to notify, or 'all'; default: failure statuses only",
+    )
 
 
 def config_from_args(args: argparse.Namespace) -> RunnerConfig:
@@ -102,6 +120,17 @@ def config_from_args(args: argparse.Namespace) -> RunnerConfig:
     )
 
 
+def notify_statuses_from_args(args: argparse.Namespace) -> set[str] | None:
+    raw = getattr(args, "notify_statuses", "")
+    if raw == "all":
+        return None
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def notify_result_if_requested(runner: WorkflowRunner, state, args: argparse.Namespace) -> str:
+    return runner.notify_state(state, getattr(args, "notify_command", None), notify_statuses_from_args(args))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     runner = WorkflowRunner(args.state_dir)
@@ -109,32 +138,47 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "run":
             state = runner.run_new(config_from_args(args))
+            notify_error = notify_result_if_requested(runner, state, args)
+            if notify_error:
+                print(f"agent-workflow: notification failed: {notify_error}", file=sys.stderr)
             print(state.summary_path)
-            return 0 if state.status == "succeeded" else 1
+            return 0 if state.status == "succeeded" and not notify_error else 1
         if args.command == "enqueue":
             print(runner.enqueue(config_from_args(args)))
             return 0
         if args.command == "tick":
-            results = runner.tick(max_runs=args.max_runs)
+            results = runner.tick(max_runs=args.max_runs, notify_command=args.notify_command, notify_statuses=notify_statuses_from_args(args))
             for result in results:
-                print("\t".join(str(result.get(key, "")) for key in ["job_id", "status", "run_id", "summary_path", "error"]))
-            return 0 if all(result.get("status") == "succeeded" for result in results) else 1
+                print("\t".join(str(result.get(key, "")) for key in ["job_id", "status", "run_id", "summary_path", "error", "notify_error"]))
+            return 0 if all(result.get("status") == "succeeded" and not result.get("notify_error") for result in results) else 1
         if args.command == "worker":
-            runner.worker(interval_seconds=args.interval_seconds, max_runs_per_tick=args.max_runs_per_tick)
+            runner.worker(
+                interval_seconds=args.interval_seconds,
+                max_runs_per_tick=args.max_runs_per_tick,
+                notify_command=args.notify_command,
+                notify_statuses=notify_statuses_from_args(args),
+            )
             return 0
         if args.command == "resume":
             state = runner.resume(args.run_id, verify_command=args.verify_command, timeout_seconds=args.timeout_seconds)
+            notify_error = notify_result_if_requested(runner, state, args)
+            if notify_error:
+                print(f"agent-workflow: notification failed: {notify_error}", file=sys.stderr)
             print(state.summary_path)
-            return 0 if state.status == "succeeded" else 1
+            return 0 if state.status == "succeeded" and not notify_error else 1
         if args.command == "retry":
             state = runner.retry(args.run_id, args.step, verify_command=args.verify_command, timeout_seconds=args.timeout_seconds)
+            notify_error = notify_result_if_requested(runner, state, args)
+            if notify_error:
+                print(f"agent-workflow: notification failed: {notify_error}", file=sys.stderr)
             print(state.summary_path)
-            return 0 if state.status == "succeeded" else 1
+            return 0 if state.status == "succeeded" and not notify_error else 1
         if args.command == "status":
             print(runner.status(args.run_id))
             return 0
         if args.command == "summary":
-            print(runner.load_state(args.run_id).summary_path)
+            summary_path = Path(runner.load_state(args.run_id).summary_path)
+            print(summary_path.with_name("hermes-discord-summary.md") if args.discord else summary_path)
             return 0
         if args.command == "cleanup":
             runner.cleanup(args.run_id)
