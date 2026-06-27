@@ -592,9 +592,11 @@ class WorkflowRunner:
         source_config: RunnerConfig,
         auto_repair: AutoRepairConfig,
     ) -> RunnerConfig:
+        repair_repo = Path(failed_state.repo_path)
+        repair_base_ref = git_output(repair_repo, ["rev-parse", "--verify", "HEAD"], allow_fail=True) or source_config.base_ref
         return RunnerConfig(
             state_dir=self.state_dir,
-            repo_path=Path(failed_state.repo_path),
+            repo_path=repair_repo,
             task_text=render_auto_repair_task(failed_state, self.state_dir),
             workflow=auto_repair.workflow or source_config.workflow,
             verify_command=auto_repair.verify_command or render_auto_repair_verify_command(self.state_dir, failed_state.run_id),
@@ -602,7 +604,7 @@ class WorkflowRunner:
             executor_bin=auto_repair.executor_bin or source_config.executor_bin,
             provider=auto_repair.provider if auto_repair.provider is not None else source_config.provider,
             model=auto_repair.model if auto_repair.model is not None else source_config.model,
-            base_ref=source_config.base_ref,
+            base_ref=repair_base_ref,
             purpose="repair",
             repair_for_run_id=failed_state.run_id,
         )

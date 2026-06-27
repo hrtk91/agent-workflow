@@ -421,6 +421,45 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertEqual(1, len(repair_jobs))
         self.assertEqual("qc_failed", repair_jobs[0][0])
 
+    def test_auto_repair_uses_current_repo_head_as_base_ref(self) -> None:
+        failed = self._aw(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Create an existing failed run before the workflow repo changes.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+            check=False,
+        )
+        failed_state = self._state(Path(failed.stdout.strip()))
+        old_base_ref = str(failed_state["base_ref"])
+
+        (self.repo / "README.md").write_text("fixture\nupdated workflow files\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "update workflow files"], cwd=self.repo, check=True, stdout=subprocess.PIPE)
+        current_head = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
+        self.assertNotEqual(old_base_ref, current_head)
+
+        self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--isolate-job-failures",
+        )
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        repair_config_json = conn.execute(
+            "select config_json from queue where status = 'qc_failed' order by created_at desc limit 1"
+        ).fetchone()[0]
+        repair_config = json.loads(repair_config_json)
+        self.assertEqual(current_head, repair_config["base_ref"])
+
     def test_tick_auto_repair_skips_failed_repair_job_and_scans_next_failure(self) -> None:
         first = self._aw(
             "run",
