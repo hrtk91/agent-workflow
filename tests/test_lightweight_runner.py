@@ -353,6 +353,66 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertEqual(1, len(repair_jobs))
         self.assertEqual("qc_failed", repair_jobs[0][0])
 
+    def test_tick_auto_repair_skips_failed_repair_job_and_scans_next_failure(self) -> None:
+        first = self._aw(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Create the first existing failed run.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+            check=False,
+        )
+        first_state = self._state(Path(first.stdout.strip()))
+
+        second = self._aw(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Create a later normal failed run that must not be starved by the failed repair job.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+            check=False,
+        )
+        second_state = self._state(Path(second.stdout.strip()))
+
+        self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--isolate-job-failures",
+        )
+
+        ticked = self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--isolate-job-failures",
+        )
+        self.assertEqual(0, ticked.returncode)
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        queue_rows = conn.execute("select config_json from queue order by created_at").fetchall()
+        repair_targets = [
+            json.loads(row[0]).get("repair_for_run_id")
+            for row in queue_rows
+            if json.loads(row[0]).get("purpose") == "repair"
+        ]
+        self.assertIn(first_state["run_id"], repair_targets)
+        self.assertIn(second_state["run_id"], repair_targets)
+
     def test_worker_runs_queued_job_in_child_process(self) -> None:
         enqueued = self._aw(
             "enqueue",

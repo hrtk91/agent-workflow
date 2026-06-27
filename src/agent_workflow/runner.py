@@ -270,6 +270,7 @@ class WorkflowRunner:
     def _failed_states_without_repair(self, limit: int) -> list[RunState]:
         if limit < 1:
             return []
+        scan_limit = max(limit * 10, 50)
         with self._db() as conn:
             rows = conn.execute(
                 f"""
@@ -279,7 +280,7 @@ class WorkflowRunner:
                 order by updated_at desc
                 limit ?
                 """,
-                (*sorted(FAILURE_NOTIFY_STATUSES), limit),
+                (*sorted(FAILURE_NOTIFY_STATUSES), scan_limit),
             ).fetchall()
         states: list[RunState] = []
         for row in rows:
@@ -293,6 +294,8 @@ class WorkflowRunner:
             if state.purpose == "repair":
                 continue
             states.append(state)
+            if len(states) >= limit:
+                break
         return states
 
     def recover_stale_running(self, error: str) -> int:
