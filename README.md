@@ -132,8 +132,13 @@ aw worker --interval-seconds 60 --parallelism 1 --repo-parallelism 1 \
 The repair job is a normal queued `aw` run with `purpose=repair`. It reads the
 failed run summary, logs, trace, and worktree, then must call `aw repair draft`
 to create a validated handoff artifact. Repair jobs do not recursively create
-more repair jobs, and a failed run is not queued twice once a repair job or
-repair draft exists.
+more repair jobs, and repair-job failures are not sent through the normal
+workflow notification command.
+
+By default, auto-repair only reacts to failures produced by the current
+worker/tick execution. It does not backfill old failed runs on startup. Use
+`--repair-scan-existing` only for deliberate manual backfill, because it may
+enqueue many historical failures.
 
 Direct synchronous execution is available for smoke tests and manual use:
 
