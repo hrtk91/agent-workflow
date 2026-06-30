@@ -97,8 +97,54 @@ class LightweightRunnerTest(unittest.TestCase):
         resumed_state = self._state(Path(resumed.stdout.strip()))
         attempts = {step["name"]: step["attempts"] for step in resumed_state["steps"]}
         self.assertEqual("succeeded", resumed_state["status"])
-        self.assertEqual(1, attempts["run_executor"])
-        self.assertEqual(2, attempts["run_qc"])
+        self.assertEqual(6, attempts["run_executor"])
+        self.assertEqual(7, attempts["run_qc"])
+
+    def test_qc_failure_loops_back_to_executor_until_green(self) -> None:
+        result = self._aw(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Implement and keep fixing until QC passes.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+            env={"FAKE_TAKT_QC_PASS_ON_ATTEMPT": "3"},
+        )
+
+        state = self._state(Path(result.stdout.strip()))
+        attempts = {step["name"]: step["attempts"] for step in state["steps"]}
+        self.assertEqual("succeeded", state["status"])
+        self.assertEqual(3, attempts["run_executor"])
+        self.assertEqual(3, attempts["run_qc"])
+        context = Path(state["task_dir"], "context.md").read_text()
+        self.assertIn("QC repair loop 1/5", context)
+        self.assertIn("QC repair loop 2/5", context)
+
+    def test_qc_failure_stops_after_repair_loop_limit(self) -> None:
+        result = self._aw(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Implement but never create the QC marker.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+            check=False,
+        )
+
+        self.assertEqual(1, result.returncode)
+        state = self._state(Path(result.stdout.strip()))
+        attempts = {step["name"]: step["attempts"] for step in state["steps"]}
+        self.assertEqual("qc_failed", state["status"])
+        self.assertEqual(6, attempts["run_executor"])
+        self.assertEqual(6, attempts["run_qc"])
+        context = Path(state["task_dir"], "context.md").read_text()
+        self.assertIn("QC repair loop 5/5", context)
 
     def test_timeout_marks_takt_step_and_trace_error(self) -> None:
         result = self._aw(
@@ -970,6 +1016,12 @@ class LightweightRunnerTest(unittest.TestCase):
             "if [[ \"${FAKE_TAKT_EXIT:-0}\" != \"0\" ]]; then\n"
             "  exit \"$FAKE_TAKT_EXIT\"\n"
             "fi\n"
+            "count_file=.fake-takt-attempt\n"
+            "attempt=1\n"
+            "if [[ -f \"$count_file\" ]]; then\n"
+            "  attempt=$(( $(cat \"$count_file\") + 1 ))\n"
+            "fi\n"
+            "printf '%s\\n' \"$attempt\" > \"$count_file\"\n"
             "mkdir -p .takt/runs/fake-run/logs\n"
             "cat > .takt/runs/fake-run/trace.md <<'TRACE'\n"
             "# Execution Trace: default\n"
@@ -1016,7 +1068,10 @@ class LightweightRunnerTest(unittest.TestCase):
             "MONITOR\n"
             "printf '{\"type\":\"workflow_start\"}\\n' > .takt/runs/fake-run/logs/session-otel-session-shadow.jsonl\n"
             "printf '{\"type\":\"phase_usage\"}\\n' > .takt/runs/fake-run/logs/session-usage-events.phase.jsonl\n"
-            "echo ok > implemented.txt\n",
+            "echo ok > implemented.txt\n"
+            "if [[ \"${FAKE_TAKT_QC_PASS_ON_ATTEMPT:-}\" != \"\" && \"$attempt\" -ge \"$FAKE_TAKT_QC_PASS_ON_ATTEMPT\" ]]; then\n"
+            "  echo ok > qc-pass\n"
+            "fi\n",
             encoding="utf-8",
         )
         path.chmod(0o755)

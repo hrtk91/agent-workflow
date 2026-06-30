@@ -63,8 +63,10 @@ Step state is stored in:
 ```
 
 Executor success is not workflow success. The run is only `succeeded` after the
-explicit QC command passes. Test failures become `qc_failed`; timeouts become
-`timed_out`; missing task text or policy stops become `blocked`.
+explicit QC command passes. If QC fails, the runner returns to the executor and
+adds the QC failure context to the task up to five times; the workflow is still
+`qc_failed` if QC is not green after that loop. Timeouts become `timed_out`;
+missing task text or policy stops become `blocked`.
 
 ## Queue
 

@@ -20,6 +20,7 @@ from agent_workflow.tracing import TraceRecorder, trace_enabled_hint
 STEPS = ["load_task", "create_worktree", "run_executor", "run_qc", "write_summary"]
 FAILURE_NOTIFY_STATUSES = {"blocked", "failed", "qc_failed", "timed_out"}
 AUTO_REPAIR_MAX_ATTEMPTS = 2
+QC_REPAIR_MAX_ATTEMPTS = 5
 
 
 @dataclass
@@ -431,19 +432,62 @@ class WorkflowRunner:
         tracer = TraceRecorder(Path(state.trace_path))
         state.status = "running"
         self.save_state(state)
-        for index in range(start_index, len(state.steps)):
+        index = start_index
+        qc_repair_attempts = 0
+        while index < len(state.steps):
             step = state.steps[index]
             if step.status == "succeeded":
+                index += 1
                 continue
             ok = self._run_step(state, step, tracer)
             if not ok:
+                if step.name == "run_qc" and qc_repair_attempts < QC_REPAIR_MAX_ATTEMPTS:
+                    qc_repair_attempts += 1
+                    self._prepare_qc_repair_loop(state, qc_repair_attempts)
+                    index = STEPS.index("run_executor")
+                    continue
                 self._finalize_failed_summary(state)
                 return state
+            index += 1
         state.status = "succeeded"
         state.current_step = None
         self._write_summary(state)
         self.save_state(state)
         return state
+
+    def _prepare_qc_repair_loop(self, state: RunState, attempt: int) -> None:
+        qc_step = state.step("run_qc")
+        executor_step = state.step("run_executor")
+        self._append_qc_repair_context(state, attempt, qc_step.error or "")
+        executor_step.status = "pending"
+        executor_step.error = None
+        executor_step.exit_code = None
+        executor_step.timed_out = False
+        qc_step.status = "pending"
+        state.status = "running"
+        state.current_step = "run_executor"
+        self.save_state(state)
+
+    def _append_qc_repair_context(self, state: RunState, attempt: int, error: str) -> None:
+        task_dir = Path(state.task_dir)
+        log_path = Path(state.run_dir) / "logs" / "run_qc.log"
+        excerpt = ""
+        if log_path.is_file():
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            excerpt = "\n".join(lines[-80:])
+        context_path = task_dir / "context.md"
+        with context_path.open("a", encoding="utf-8") as f:
+            f.write(
+                "\n\n"
+                f"## QC repair loop {attempt}/{QC_REPAIR_MAX_ATTEMPTS}\n\n"
+                "The previous implementation attempt did not satisfy QC. Continue fixing in this same run worktree until the configured QC command is green. Do not report completion until QC passes.\n\n"
+            )
+            if error:
+                f.write(f"QC error: {error}\n\n")
+            if excerpt:
+                f.write("Recent QC log excerpt:\n\n```text\n")
+                f.write(excerpt)
+                f.write("\n```\n")
 
     def _run_step(self, state: RunState, step: StepState, tracer: TraceRecorder) -> bool:
         step.status = "running"
