@@ -358,7 +358,7 @@ class LightweightRunnerTest(unittest.TestCase):
         marker = Path(original_state["run_dir"]) / "auto-repair-enqueued.json"
         self.assertEqual(repair_job_id, json.loads(marker.read_text())["repair_job_id"])
         discord_text = Path(original_state["summary_path"]).with_name("hermes-discord-summary.md").read_text()
-        self.assertIn("🩺 auto repair queued", discord_text)
+        self.assertIn("🩺 auto diagnosis queued", discord_text)
 
         conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
         row = conn.execute("select status, config_json from queue where job_id = ?", (repair_job_id,)).fetchone()
@@ -898,6 +898,86 @@ class LightweightRunnerTest(unittest.TestCase):
 
         scan_after = self._aw("watchdog", "scan")
         self.assertEqual("", scan_after.stdout)
+
+    def test_successful_diagnosis_job_enqueues_repair_action(self) -> None:
+        failed = self._aw(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Implement but fail QC before repair action.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+            check=False,
+        )
+        failed_state = self._state(Path(failed.stdout.strip()))
+
+        diagnosis = self.root / "diagnosis.md"
+        evidence = self.root / "evidence.md"
+        notify_before = self.root / "notify-before.md"
+        diagnosis.write_text("Repair the repo config before retrying.\n", encoding="utf-8")
+        evidence.write_text(f"- summary: {failed_state['summary_path']}\n", encoding="utf-8")
+        notify_before.write_text("repair config repair queued.\n", encoding="utf-8")
+        self._aw(
+            "repair",
+            "draft",
+            "--failed-run-id",
+            str(failed_state["run_id"]),
+            "--title",
+            "Repo config repair",
+            "--category",
+            "repo_config",
+            "--risk",
+            "medium",
+            "--proposed-action",
+            "repo_config_patch",
+            "--diagnosis-file",
+            str(diagnosis),
+            "--evidence-file",
+            str(evidence),
+            "--notify-before-file",
+            str(notify_before),
+            "--verify-command",
+            "test -f implemented.txt",
+        )
+
+        repair_job = self._aw(
+            "enqueue",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Diagnosis job creates a validated draft.",
+            "--verify-command",
+            "test -f implemented.txt",
+            "--executor-bin",
+            str(self.fake_takt),
+        ).stdout.strip()
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        raw_config = conn.execute("select config_json from queue where job_id = ?", (repair_job,)).fetchone()[0]
+        config = json.loads(raw_config)
+        config["purpose"] = "repair"
+        config["repair_for_run_id"] = failed_state["run_id"]
+        conn.execute(
+            "update queue set config_json = ? where job_id = ?",
+            (json.dumps(config, indent=2, sort_keys=True), repair_job),
+        )
+        conn.commit()
+        conn.close()
+
+        tick = self._aw("tick", "--max-runs", "1", "--isolate-job-failures")
+        self.assertIn(f"{repair_job}\tsucceeded", tick.stdout)
+        repair_action_job_id = tick.stdout.strip().split("\t")[8]
+        self.assertTrue(repair_action_job_id)
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        row = conn.execute("select status, config_json from queue where job_id = ?", (repair_action_job_id,)).fetchone()
+        self.assertEqual("queued", row[0])
+        action_config = json.loads(row[1])
+        self.assertEqual("repair_action", action_config["purpose"])
+        self.assertEqual(failed_state["run_id"], action_config["repair_for_run_id"])
+        self.assertIn("Execute the validated repair action", action_config["task_text"])
 
     def test_repair_draft_requires_deploy_guardrails(self) -> None:
         failed = self._aw(

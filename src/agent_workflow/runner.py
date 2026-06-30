@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import configparser
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -230,6 +231,12 @@ class WorkflowRunner:
                     result["repair_job_id"] = repair_job_id
             except Exception as exc:
                 result["auto_repair_error"] = str(exc)
+            try:
+                repair_action_job_id = self.maybe_enqueue_repair_action(state, config)
+                if repair_action_job_id:
+                    result["repair_action_job_id"] = repair_action_job_id
+            except Exception as exc:
+                result["repair_action_error"] = str(exc)
             notify_error = ""
             if config.purpose != "repair":
                 notify_error = self.notify_state(state, notify_command, notify_statuses, job_id=job_id)
@@ -251,6 +258,44 @@ class WorkflowRunner:
                 job_ids.append(repair_job_id)
         return job_ids
 
+    def maybe_enqueue_repair_action(self, state: RunState, config: RunnerConfig) -> str:
+        if config.purpose != "repair" or state.status != "succeeded" or not config.repair_for_run_id:
+            return ""
+        draft = self._latest_validated_repair_draft(config.repair_for_run_id)
+        if not draft:
+            return ""
+        draft_dir = Path(draft["draft_dir"])
+        marker = draft_dir / "action-enqueued.json"
+        if marker.exists():
+            return ""
+        proposed_action = draft["proposed_action"]
+        if proposed_action == "human_needed":
+            marker.write_text(
+                json.dumps({"skipped": "human_needed", "created_at": utc_now()}, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            return ""
+        failed_state = self.load_state(config.repair_for_run_id)
+        action_config = self._repair_action_runner_config(failed_state, draft, config)
+        action_job_id = self.enqueue(action_config)
+        marker.write_text(
+            json.dumps(
+                {
+                    "failed_run_id": failed_state.run_id,
+                    "diagnosis_run_id": state.run_id,
+                    "repair_draft_id": draft["draft_id"],
+                    "repair_action_job_id": action_job_id,
+                    "proposed_action": proposed_action,
+                    "created_at": utc_now(),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return action_job_id
+
     def maybe_enqueue_auto_repair(
         self,
         failed_state: RunState,
@@ -261,7 +306,7 @@ class WorkflowRunner:
             return ""
         if failed_state.status not in FAILURE_NOTIFY_STATUSES:
             return ""
-        if source_config.purpose == "repair":
+        if source_config.purpose in {"repair", "repair_action"}:
             return ""
         if self._has_repair_or_repair_job(failed_state.run_id):
             return ""
@@ -644,7 +689,7 @@ class WorkflowRunner:
         if not job_id:
             return []
         created_at = str(data.get("created_at") or "")
-        return ["", "## auto repair", f"- repair_job_id: `{job_id}`", f"- created_at: `{created_at}`"]
+        return ["", "## auto diagnosis", f"- diagnosis_job_id: `{job_id}`", f"- created_at: `{created_at}`"]
 
     def _auto_repair_runner_config(
         self,
@@ -668,6 +713,64 @@ class WorkflowRunner:
             purpose="repair",
             repair_for_run_id=failed_state.run_id,
         )
+
+    def _repair_action_runner_config(
+        self,
+        failed_state: RunState,
+        draft: dict[str, str],
+        diagnosis_config: RunnerConfig,
+    ) -> RunnerConfig:
+        repo = Path(failed_state.repo_path)
+        base_ref = git_output(repo, ["rev-parse", "--verify", "HEAD"], allow_fail=True) or failed_state.base_ref
+        verify_command = draft.get("verify_command") or failed_state.verify_command
+        return RunnerConfig(
+            state_dir=self.state_dir,
+            repo_path=repo,
+            task_text=render_repair_action_task(failed_state, draft),
+            workflow=failed_state.workflow,
+            verify_command=verify_command,
+            timeout_seconds=failed_state.timeout_seconds,
+            executor_bin=diagnosis_config.executor_bin or failed_state.executor_bin,
+            provider=diagnosis_config.provider if diagnosis_config.provider is not None else failed_state.provider,
+            model=diagnosis_config.model if diagnosis_config.model is not None else failed_state.model,
+            base_ref=base_ref,
+            purpose="repair_action",
+            repair_for_run_id=failed_state.run_id,
+        )
+
+    def _latest_validated_repair_draft(self, failed_run_id: str) -> dict[str, str]:
+        with self._db() as conn:
+            row = conn.execute(
+                """
+                select draft_id, failed_run_id, category, risk, proposed_action, status, draft_dir
+                from repair_drafts
+                where failed_run_id = ? and status = 'validated'
+                order by updated_at desc
+                limit 1
+                """,
+                (failed_run_id,),
+            ).fetchone()
+        if not row:
+            return {}
+        data = {
+            "draft_id": str(row[0]),
+            "failed_run_id": str(row[1]),
+            "category": str(row[2]),
+            "risk": str(row[3]),
+            "proposed_action": str(row[4]),
+            "status": str(row[5]),
+            "draft_dir": str(row[6]),
+            "verify_command": "",
+            "title": "",
+        }
+        config_path = Path(data["draft_dir"]) / "repair.ini"
+        if config_path.exists():
+            parser = configparser.ConfigParser()
+            parser.read(config_path, encoding="utf-8")
+            if "repair" in parser:
+                data["verify_command"] = parser["repair"].get("verify_command", "").strip()
+                data["title"] = parser["repair"].get("title", "").strip()
+        return data
 
     def _write_auto_repair_marker(self, failed_state: RunState, repair_job_id: str, repair_config: RunnerConfig) -> None:
         marker = auto_repair_marker_path(failed_state)
@@ -1162,7 +1265,7 @@ def render_run_discord_summary(state: RunState, task_preview: str) -> str:
         except (OSError, json.JSONDecodeError):
             repair_job_id = ""
         if repair_job_id:
-            lines.extend(["", f"🩺 auto repair queued: `{repair_job_id}`"])
+            lines.extend(["", f"🩺 auto diagnosis queued: `{repair_job_id}`"])
 
     lines.append("")
     return "\n".join(lines)
@@ -1283,6 +1386,44 @@ Rules:
 - If the failure is missing packages, tools, writable cache, daemon state, or local service setup, choose the matching dependency/runtime/repo config action.
 - Deployment or migration repair must use risk=high and include the required deployment guardrails.
 - Do not create a draft that claims success. The draft is the handoff artifact for the next repair step.
+"""
+
+
+def render_repair_action_task(failed_state: RunState, draft: dict[str, str]) -> str:
+    draft_dir = draft.get("draft_dir", "")
+    title = draft.get("title") or "validated repair action"
+    category = draft.get("category", "")
+    risk = draft.get("risk", "")
+    proposed_action = draft.get("proposed_action", "")
+    verify_command = draft.get("verify_command") or failed_state.verify_command
+    return f"""Execute the validated repair action for agent-workflow run {failed_state.run_id}.
+
+Repair draft:
+- draft_id: {draft.get("draft_id", "")}
+- title: {title}
+- category: {category}
+- risk: {risk}
+- proposed_action: {proposed_action}
+- draft_dir: {draft_dir}
+- diagnosis: {Path(draft_dir) / "diagnosis.md" if draft_dir else ""}
+- evidence: {Path(draft_dir) / "evidence.md" if draft_dir else ""}
+
+Failed run:
+- run_id: {failed_state.run_id}
+- status: {failed_state.status}
+- worktree: {failed_state.worktree_path or ""}
+- summary: {failed_state.summary_path}
+- trace_jsonl: {failed_state.trace_path}
+
+Your job is to perform the repair, not just describe it.
+
+Read the repair draft diagnosis/evidence and the failed run summary/logs. Apply the proposed repair in this fresh AW worktree. If the draft proposes retry_original_run or resume_original_run, inspect the failed run evidence and complete the original task here instead of merely issuing a retry command.
+
+Completion condition:
+- The repair is implemented or the original task is completed in this worktree.
+- The configured QC command is all green: {verify_command}
+- Do not mark complete just because QC was rerun.
+- Do not merge, push, deploy, edit GitHub Issues, or notify Discord from this workflow.
 """
 
 

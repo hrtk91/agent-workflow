@@ -122,7 +122,7 @@ Notification commands support `{job_id}`, `{run_id}`, `{status}`,
 are sent only for `blocked`, `failed`, `qc_failed`, and `timed_out`; use
 `--notify-statuses all` when a worker should also report successful runs.
 
-Enable repair-loop dispatch when the worker should enqueue a diagnosis task
+Enable diagnosis-loop dispatch when the worker should enqueue a diagnosis task
 after a normal workflow reaches a terminal failure:
 
 ```bash
@@ -131,11 +131,14 @@ aw worker --interval-seconds 60 --parallelism 1 --repo-parallelism 1 \
   --repair-model gpt-5.5
 ```
 
-The repair job is a normal queued `aw` run with `purpose=repair`. It reads the
-failed run summary, logs, trace, and worktree, then must call `aw repair draft`
-to create a validated handoff artifact. Repair jobs do not recursively create
-more repair jobs, and repair-job failures are not sent through the normal
-workflow notification command.
+The diagnosis job is a normal queued `aw` run with `purpose=repair`. It reads
+the failed run summary, logs, trace, and worktree, then must call
+`aw repair draft` to create a validated handoff artifact. Diagnosis jobs do not
+recursively create more diagnosis jobs, and diagnosis-job failures are not sent
+through the normal workflow notification command. When a diagnosis job succeeds
+and leaves a validated draft, `aw` immediately enqueues one `purpose=repair_action`
+job for non-`human_needed` actions. That action job is where the actual repo or
+runtime repair is implemented and QC must turn green.
 
 By default, auto-repair only reacts to failures produced by the current
 worker/tick execution. It does not backfill old failed runs on startup. Use

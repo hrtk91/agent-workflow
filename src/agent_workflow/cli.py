@@ -246,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(
                     "\t".join(
                         str(result.get(key, ""))
-                        for key in ["job_id", "status", "run_id", "summary_path", "error", "notify_error", "repair_job_id", "auto_repair_error"]
+                        for key in ["job_id", "status", "run_id", "summary_path", "error", "notify_error", "repair_job_id", "auto_repair_error", "repair_action_job_id", "repair_action_error"]
                     )
                 )
             return tick_exit_code(results, args.isolate_job_failures)
@@ -274,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "\t".join(
                     str(result.get(key, ""))
-                    for key in ["job_id", "status", "run_id", "summary_path", "error", "notify_error", "repair_job_id", "auto_repair_error"]
+                    for key in ["job_id", "status", "run_id", "summary_path", "error", "notify_error", "repair_job_id", "auto_repair_error", "repair_action_job_id", "repair_action_error"]
                 )
             )
             return tick_exit_code([result], isolate_job_failures=True)
