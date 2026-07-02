@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +14,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 AW = ROOT / "scripts" / "aw"
+sys.path.insert(0, str(ROOT / "src"))
+
+from agent_workflow.state import RunState, StepState
+from agent_workflow.runner import ActiveWorkerJob, AutoRepairConfig, RunnerConfig, WorkflowRunner
 
 
 class LightweightRunnerTest(unittest.TestCase):
@@ -811,6 +818,159 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertIn("recovered_stale_running\t1", worker.stdout)
         status_after = self._aw("status")
         self.assertIn(f"job\t{job_id}\tfailed", status_after.stdout)
+
+    def test_worker_active_child_timeout_predicate(self) -> None:
+        runner = WorkflowRunner(self.state_dir)
+        process = subprocess.Popen(["sleep", "0.1"], start_new_session=True)
+        self.addCleanup(process.wait)
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+
+        old_child = ActiveWorkerJob(
+            process=process,
+            repo_key=str(self.repo),
+            started_at=0,
+            started_at_utc="1970-01-01T00:00:00+00:00",
+            timeout_seconds=1,
+        )
+        fresh_child = ActiveWorkerJob(
+            process=process,
+            repo_key=str(self.repo),
+            started_at=10**12,
+            started_at_utc="1970-01-01T00:00:00+00:00",
+            timeout_seconds=1,
+        )
+        disabled_child = ActiveWorkerJob(
+            process=process,
+            repo_key=str(self.repo),
+            started_at=0,
+            started_at_utc="1970-01-01T00:00:00+00:00",
+            timeout_seconds=0,
+        )
+
+        self.assertTrue(runner._active_worker_job_timed_out(old_child))
+        self.assertFalse(runner._active_worker_job_timed_out(fresh_child))
+        self.assertFalse(runner._active_worker_job_timed_out(disabled_child))
+
+    def test_worker_times_out_active_child_and_marks_queue_failed(self) -> None:
+        runner = WorkflowRunner(self.state_dir)
+        job_id = runner.enqueue(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.repo,
+                task_text="Queue this fixture task but let the worker child exceed timeout.",
+                verify_command="test -f implemented.txt",
+                executor_bin=str(self.fake_takt),
+                timeout_seconds=0.1,
+            )
+        )
+
+        def spawn_hung_child(*_args: object, **_kwargs: object) -> subprocess.Popen[bytes]:
+            return subprocess.Popen(["sleep", "10"], start_new_session=True)
+
+        runner._spawn_claimed_job = spawn_hung_child  # type: ignore[method-assign]
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            runner.worker(interval_seconds=0.01, max_runs_per_tick=1, stop_when_idle=True)
+
+        output = stdout.getvalue()
+        self.assertIn(f"started\t{job_id}\tpid=", output)
+        self.assertIn(f"child_timed_out\t{job_id}\tpid=", output)
+        status_after = self._aw("status", "--include-repair")
+        self.assertIn(f"job\t{job_id}\tfailed", status_after.stdout)
+        self.assertNotIn(f"job\t{job_id}\trunning", status_after.stdout)
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        row = conn.execute("select status, error from queue where job_id = ?", (job_id,)).fetchone()
+        self.assertEqual("failed", row[0])
+        self.assertIn("worker child exceeded timeout_seconds=0.1", row[1])
+
+    def test_worker_child_timeout_marks_existing_run_failed(self) -> None:
+        runner = WorkflowRunner(self.state_dir)
+        job_id = runner.enqueue(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.repo,
+                task_text="Queue this fixture task with an existing running run.",
+                verify_command="test -f implemented.txt",
+                executor_bin=str(self.fake_takt),
+                timeout_seconds=0.1,
+            )
+        )
+        started_at_utc = "2026-01-01T00:00:00+00:00"
+        state = RunState(
+            run_id="running-child-run",
+            status="running",
+            repo_path=str(self.repo.resolve()),
+            run_dir=str(self.state_dir / "runs" / "running-child-run"),
+            task_dir=str(self.state_dir / "runs" / "running-child-run" / "task"),
+            workflow="default",
+            verify_command="test -f implemented.txt",
+            timeout_seconds=0.1,
+            executor_bin=str(self.fake_takt),
+            summary_path=str(self.state_dir / "runs" / "running-child-run" / "summary.md"),
+            trace_path=str(self.state_dir / "runs" / "running-child-run" / "trace.jsonl"),
+            current_step="run_executor",
+            created_at="2026-01-01T00:00:01+00:00",
+            updated_at="2026-01-01T00:00:01+00:00",
+            steps=[
+                StepState(name=name, status=("running" if name == "run_executor" else "pending"))
+                for name in ["load_task", "create_worktree", "run_executor", "run_qc", "write_summary"]
+            ],
+        )
+        Path(state.task_dir).mkdir(parents=True)
+        Path(state.task_dir, "task.md").write_text("task\n", encoding="utf-8")
+        runner.save_state(state)
+        process = subprocess.Popen(["sleep", "0.1"], start_new_session=True)
+        self.addCleanup(process.wait)
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+
+        child = ActiveWorkerJob(
+            process=process,
+            repo_key=str(self.repo.resolve()),
+            started_at=0,
+            started_at_utc=started_at_utc,
+            timeout_seconds=0.1,
+        )
+        error = "worker child exceeded timeout_seconds=0.1"
+
+        runner._fail_running_worker_child(job_id, child, error)
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        queue_row = conn.execute(
+            "select status, run_id, summary_path, error from queue where job_id = ?",
+            (job_id,),
+        ).fetchone()
+        self.assertEqual(("failed", state.run_id, state.summary_path, error), queue_row)
+        run_row = conn.execute(
+            "select status, current_step from jobs where run_id = ?",
+            (state.run_id,),
+        ).fetchone()
+        self.assertEqual(("failed", "run_executor"), run_row)
+        updated = self._state(Path(state.summary_path))
+        run_executor = next(step for step in updated["steps"] if step["name"] == "run_executor")
+        self.assertEqual("timed_out", run_executor["status"])
+        self.assertTrue(run_executor["timed_out"])
+        self.assertEqual(error, run_executor["error"])
+
+    def test_auto_repair_scan_skips_repair_action_failures(self) -> None:
+        runner = WorkflowRunner(self.state_dir)
+        state = runner.run_new(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.repo,
+                task_text="Repair action fails QC and must not enqueue repair-of-repair.",
+                verify_command="test -f qc-pass",
+                executor_bin=str(self.fake_takt),
+                purpose="repair_action",
+            )
+        )
+        self.assertEqual("qc_failed", state.status)
+
+        job_ids = runner.enqueue_auto_repairs_for_failures(
+            AutoRepairConfig(executor_bin=str(self.fake_takt), scan_existing=True),
+        )
+
+        self.assertEqual([], job_ids)
 
     def test_watchdog_scan_and_repair_draft_validate_failed_run(self) -> None:
         failed = self._aw(

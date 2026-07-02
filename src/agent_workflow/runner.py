@@ -53,6 +53,15 @@ class AutoRepairConfig:
     scan_existing: bool = False
 
 
+@dataclass
+class ActiveWorkerJob:
+    process: subprocess.Popen[bytes]
+    repo_key: str
+    started_at: float
+    started_at_utc: str
+    timeout_seconds: float
+
+
 def default_state_dir() -> Path:
     return Path(os.environ.get("AGENT_WORKFLOW_STATE_DIR", Path.home() / ".local/state/agent-workflow"))
 
@@ -176,11 +185,18 @@ class WorkflowRunner:
                     return
                 time.sleep(interval_seconds)
 
-        active: dict[str, tuple[subprocess.Popen[bytes], str]] = {}
+        active: dict[str, ActiveWorkerJob] = {}
         while True:
-            for job_id, (process, repo_key) in list(active.items()):
+            for job_id, child in list(active.items()):
+                process = child.process
                 exit_code = process.poll()
                 if exit_code is None:
+                    if self._active_worker_job_timed_out(child):
+                        error = f"worker child exceeded timeout_seconds={format_seconds(child.timeout_seconds)}"
+                        self._terminate_worker_child(process)
+                        self._fail_running_worker_child(job_id, child, error)
+                        del active[job_id]
+                        print(f"child_timed_out\t{job_id}\tpid={process.pid}\t{error}", flush=True)
                     continue
                 if exit_code != 0:
                     self._fail_running_queue_job(job_id, f"worker child exited with {exit_code}")
@@ -199,11 +215,19 @@ class WorkflowRunner:
                 job_id, config = job
                 repo_key = self._repo_key(config)
                 try:
+                    started_at = time.time()
+                    started_at_utc = utc_now()
                     process = self._spawn_claimed_job(job_id, notify_command, notify_statuses, auto_repair)
                 except Exception as exc:
                     self._finish_queue_job(job_id, "failed", "", "", str(exc))
                     continue
-                active[job_id] = (process, repo_key)
+                active[job_id] = ActiveWorkerJob(
+                    process=process,
+                    repo_key=repo_key,
+                    started_at=started_at,
+                    started_at_utc=started_at_utc,
+                    timeout_seconds=float(config.timeout_seconds or 0),
+                )
                 print(f"started\t{job_id}\tpid={process.pid}\trepo={repo_key}", flush=True)
                 claimed += 1
 
@@ -342,7 +366,7 @@ class WorkflowRunner:
                 state = self.load_state(run_id)
             except (FileNotFoundError, json.JSONDecodeError):
                 continue
-            if state.purpose == "repair":
+            if state.purpose in {"repair", "repair_action"}:
                 continue
             states.append(state)
             if len(states) >= limit:
@@ -1104,14 +1128,33 @@ class WorkflowRunner:
         elif notify_statuses:
             args.extend(["--notify-statuses", ",".join(sorted(notify_statuses))])
         append_auto_repair_args(args, auto_repair)
-        return subprocess.Popen(args)
+        return subprocess.Popen(args, start_new_session=True)
 
-    def _blocked_worker_repos(self, active: dict[str, tuple[subprocess.Popen[bytes], str]], repo_parallelism: int) -> set[str]:
+    def _active_worker_job_timed_out(self, child: ActiveWorkerJob) -> bool:
+        return child.timeout_seconds > 0 and time.time() - child.started_at > child.timeout_seconds
+
+    def _terminate_worker_child(self, process: subprocess.Popen[bytes]) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        process.wait()
+
+    def _blocked_worker_repos(self, active: dict[str, ActiveWorkerJob], repo_parallelism: int) -> set[str]:
         if repo_parallelism < 1:
             return set()
         counts: dict[str, int] = {}
-        for _job_id, (_process, repo_key) in active.items():
-            counts[repo_key] = counts.get(repo_key, 0) + 1
+        for child in active.values():
+            counts[child.repo_key] = counts.get(child.repo_key, 0) + 1
         return {repo_key for repo_key, count in counts.items() if count >= repo_parallelism}
 
     def _repo_key(self, config: RunnerConfig) -> str:
@@ -1149,6 +1192,39 @@ class WorkflowRunner:
                 """,
                 (error, utc_now(), job_id),
             )
+
+    def _fail_running_worker_child(self, job_id: str, child: ActiveWorkerJob, error: str) -> None:
+        self._fail_running_queue_job(job_id, error)
+        with self._db() as conn:
+            row = conn.execute(
+                """
+                select run_id
+                from jobs
+                where status = 'running'
+                  and repo_path = ?
+                  and created_at >= ?
+                order by created_at
+                limit 1
+                """,
+                (child.repo_key, child.started_at_utc),
+            ).fetchone()
+        if row is None:
+            return
+        try:
+            state = self.load_state(str(row[0]))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return
+        state.status = "failed"
+        if state.current_step:
+            for step in state.steps:
+                if step.name == state.current_step and step.status == "running":
+                    step.status = "timed_out"
+                    step.timed_out = True
+                    step.error = error
+                    step.finished_at = utc_now()
+                    break
+        self._finalize_failed_summary(state)
+        self._finish_queue_job(job_id, "failed", state.run_id, state.summary_path, error)
 
 
 class StepFailure(Exception):
