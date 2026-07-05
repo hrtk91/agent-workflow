@@ -7,7 +7,14 @@ from pathlib import Path
 
 from agent_workflow.merge import MergeBlocked, MergeGateConfig, run_merge_approved, run_merge_gate
 from agent_workflow.repair import REPAIR_ACTIONS, REPAIR_CATEGORIES, REPAIR_RISKS, RepairDraftInput, RepairManager
-from agent_workflow.runner import AutoRepairConfig, FAILURE_NOTIFY_STATUSES, RunnerConfig, WorkflowRunner, default_state_dir
+from agent_workflow.runner import (
+    AUTO_REPAIR_SCAN_EXISTING_MAX_AGE_SECONDS,
+    AutoRepairConfig,
+    FAILURE_NOTIFY_STATUSES,
+    RunnerConfig,
+    WorkflowRunner,
+    default_state_dir,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -168,6 +175,12 @@ def add_auto_repair_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="also backfill existing failed runs; disabled by default to avoid notification storms",
     )
+    parser.add_argument(
+        "--repair-scan-existing-max-age-seconds",
+        type=float,
+        default=AUTO_REPAIR_SCAN_EXISTING_MAX_AGE_SECONDS,
+        help=f"only backfill failed runs updated within this many seconds; default: {AUTO_REPAIR_SCAN_EXISTING_MAX_AGE_SECONDS}",
+    )
 
 
 def config_from_args(args: argparse.Namespace) -> RunnerConfig:
@@ -205,6 +218,11 @@ def auto_repair_from_args(args: argparse.Namespace) -> AutoRepairConfig | None:
         provider=getattr(args, "repair_provider", None),
         model=getattr(args, "repair_model", None),
         scan_existing=getattr(args, "repair_scan_existing", False),
+        scan_existing_max_age_seconds=getattr(
+            args,
+            "repair_scan_existing_max_age_seconds",
+            AUTO_REPAIR_SCAN_EXISTING_MAX_AGE_SECONDS,
+        ),
     )
 
 

@@ -575,6 +575,53 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertEqual(1, len(repair_jobs))
         self.assertEqual("qc_failed", repair_jobs[0][0])
 
+    def test_tick_auto_repair_scan_existing_skips_old_failed_runs(self) -> None:
+        failed = self._aw(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Create an old failed run that should not be backfilled.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+            check=False,
+        )
+        failed_state = self._state(Path(failed.stdout.strip()))
+        self.assertEqual("qc_failed", failed_state["status"])
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        conn.execute(
+            "update jobs set updated_at = ? where run_id = ?",
+            ("2026-01-01T00:00:00+00:00", failed_state["run_id"]),
+        )
+        conn.commit()
+        conn.close()
+
+        ticked = self._aw(
+            "tick",
+            "--max-runs",
+            "1",
+            "--auto-repair",
+            "--repair-scan-existing",
+            "--repair-scan-existing-max-age-seconds",
+            "60",
+            "--repair-executor-bin",
+            str(self.fake_takt),
+            "--isolate-job-failures",
+        )
+
+        self.assertEqual(0, ticked.returncode)
+        self.assertEqual("", ticked.stdout)
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        repair_jobs = [
+            row
+            for row in conn.execute("select config_json from queue").fetchall()
+            if json.loads(row[0]).get("repair_for_run_id") == failed_state["run_id"]
+        ]
+        self.assertEqual([], repair_jobs)
+
     def test_tick_auto_repair_does_not_scan_existing_failed_runs_by_default(self) -> None:
         failed = self._aw(
             "run",

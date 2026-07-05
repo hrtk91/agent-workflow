@@ -22,6 +22,7 @@ STEPS = ["load_task", "create_worktree", "run_executor", "run_qc", "write_summar
 FAILURE_NOTIFY_STATUSES = {"blocked", "failed", "qc_failed", "timed_out"}
 AUTO_REPAIR_MAX_ATTEMPTS = 2
 QC_REPAIR_MAX_ATTEMPTS = 5
+AUTO_REPAIR_SCAN_EXISTING_MAX_AGE_SECONDS = 21600
 
 
 @dataclass
@@ -51,6 +52,7 @@ class AutoRepairConfig:
     provider: str | None = None
     model: str | None = None
     scan_existing: bool = False
+    scan_existing_max_age_seconds: float = AUTO_REPAIR_SCAN_EXISTING_MAX_AGE_SECONDS
 
 
 @dataclass
@@ -275,7 +277,7 @@ class WorkflowRunner:
         if auto_repair is None:
             return []
         job_ids: list[str] = []
-        for state in self._failed_states_without_repair(limit):
+        for state in self._failed_states_without_repair(limit, auto_repair.scan_existing_max_age_seconds):
             source_config = runner_config_from_state(state, self.state_dir)
             repair_job_id = self.maybe_enqueue_auto_repair(state, source_config, auto_repair)
             if repair_job_id:
@@ -342,21 +344,37 @@ class WorkflowRunner:
         self.save_state(failed_state)
         return repair_job_id
 
-    def _failed_states_without_repair(self, limit: int) -> list[RunState]:
+    def _failed_states_without_repair(self, limit: int, max_age_seconds: float | None = None) -> list[RunState]:
         if limit < 1:
             return []
+        min_updated_at = None
+        if max_age_seconds is not None and max_age_seconds > 0:
+            min_updated_at = datetime.fromtimestamp(time.time() - max_age_seconds, timezone.utc).isoformat()
         scan_limit = max(limit * 10, 50)
         with self._db() as conn:
-            rows = conn.execute(
-                f"""
-                select run_id
-                from jobs
-                where status in ({','.join('?' for _ in FAILURE_NOTIFY_STATUSES)})
-                order by updated_at desc
-                limit ?
-                """,
-                (*sorted(FAILURE_NOTIFY_STATUSES), scan_limit),
-            ).fetchall()
+            if min_updated_at:
+                rows = conn.execute(
+                    f"""
+                    select run_id
+                    from jobs
+                    where status in ({','.join('?' for _ in FAILURE_NOTIFY_STATUSES)})
+                      and updated_at >= ?
+                    order by updated_at desc
+                    limit ?
+                    """,
+                    (*sorted(FAILURE_NOTIFY_STATUSES), min_updated_at, scan_limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"""
+                    select run_id
+                    from jobs
+                    where status in ({','.join('?' for _ in FAILURE_NOTIFY_STATUSES)})
+                    order by updated_at desc
+                    limit ?
+                    """,
+                    (*sorted(FAILURE_NOTIFY_STATUSES), scan_limit),
+                ).fetchall()
         states: list[RunState] = []
         for row in rows:
             run_id = str(row[0])
@@ -1510,6 +1528,12 @@ def append_auto_repair_args(args: list[str], auto_repair: AutoRepairConfig | Non
     args.extend(["--repair-workflow", auto_repair.workflow])
     if auto_repair.scan_existing:
         args.append("--repair-scan-existing")
+        args.extend(
+            [
+                "--repair-scan-existing-max-age-seconds",
+                format_seconds(auto_repair.scan_existing_max_age_seconds),
+            ]
+        )
     if auto_repair.verify_command:
         args.extend(["--repair-verify-command", auto_repair.verify_command])
     if auto_repair.timeout_seconds is not None:
