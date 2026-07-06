@@ -19,7 +19,7 @@ from agent_workflow.state import RunState, StepState
 from agent_workflow.tracing import TraceRecorder, trace_enabled_hint
 
 STEPS = ["load_task", "create_worktree", "run_executor", "run_qc", "write_summary"]
-FAILURE_NOTIFY_STATUSES = {"blocked", "failed", "qc_failed", "timed_out"}
+FAILURE_NOTIFY_STATUSES = {"blocked", "failed", "interrupted", "qc_failed", "timed_out"}
 AUTO_REPAIR_MAX_ATTEMPTS = 2
 QC_REPAIR_MAX_ATTEMPTS = 5
 AUTO_REPAIR_SCAN_EXISTING_MAX_AGE_SECONDS = 21600
@@ -584,31 +584,54 @@ class WorkflowRunner:
         step.error = None
         state.current_step = step.name
         self.save_state(state)
-        with tracer.span(
-            f"agent_workflow.step.{step.name}",
-            run_id=state.run_id,
-            repo_path=state.repo_path,
-            workflow=state.workflow,
-            attempt=step.attempts,
-            otel_hint=trace_enabled_hint(),
-        ) as span:
-            try:
-                getattr(self, f"_step_{step.name}")(state, step, span)
-                step.status = "succeeded"
-                return True
-            except StepFailure as exc:
-                step.status = exc.status
-                step.exit_code = exc.exit_code
-                step.timed_out = exc.timed_out
-                step.error = str(exc)
-                state.status = exc.run_status
-                span["attributes"] = {**span["attributes"], "error": str(exc), "exit_code": exc.exit_code, "timed_out": exc.timed_out}
-                span["status_code"] = "ERROR"
-                span["status_message"] = str(exc)
-                return False
-            finally:
-                step.finished_at = utc_now()
-                self.save_state(state)
+        previous_sigint = signal.getsignal(signal.SIGINT)
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+        def interrupt_handler(signum: int, _frame: object) -> None:
+            raise WorkflowInterrupted(signum)
+
+        signal.signal(signal.SIGINT, interrupt_handler)
+        signal.signal(signal.SIGTERM, interrupt_handler)
+        try:
+            with tracer.span(
+                f"agent_workflow.step.{step.name}",
+                run_id=state.run_id,
+                repo_path=state.repo_path,
+                workflow=state.workflow,
+                attempt=step.attempts,
+                otel_hint=trace_enabled_hint(),
+            ) as span:
+                try:
+                    getattr(self, f"_step_{step.name}")(state, step, span)
+                    step.status = "succeeded"
+                    return True
+                except StepFailure as exc:
+                    step.status = exc.status
+                    step.exit_code = exc.exit_code
+                    step.timed_out = exc.timed_out
+                    step.error = str(exc)
+                    state.status = exc.run_status
+                    span["attributes"] = {**span["attributes"], "error": str(exc), "exit_code": exc.exit_code, "timed_out": exc.timed_out}
+                    span["status_code"] = "ERROR"
+                    span["status_message"] = str(exc)
+                    return False
+                except (KeyboardInterrupt, WorkflowInterrupted) as exc:
+                    message = "interrupted by Ctrl-C" if isinstance(exc, KeyboardInterrupt) else str(exc)
+                    step.status = "interrupted"
+                    step.exit_code = 130
+                    step.timed_out = False
+                    step.error = message
+                    state.status = "interrupted"
+                    span["attributes"] = {**span["attributes"], "error": message, "exit_code": 130, "timed_out": False}
+                    span["status_code"] = "ERROR"
+                    span["status_message"] = message
+                    return False
+                finally:
+                    step.finished_at = utc_now()
+                    self.save_state(state)
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
     def _step_load_task(self, state: RunState, _step: StepState, span: dict[str, object]) -> None:
         task_dir = Path(state.task_dir)
@@ -1152,20 +1175,7 @@ class WorkflowRunner:
         return child.timeout_seconds > 0 and time.time() - child.started_at > child.timeout_seconds
 
     def _terminate_worker_child(self, process: subprocess.Popen[bytes]) -> None:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        try:
-            process.wait(timeout=5)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        process.wait()
+        terminate_process_group(process)
 
     def _blocked_worker_repos(self, active: dict[str, ActiveWorkerJob], repo_parallelism: int) -> set[str]:
         if repo_parallelism < 1:
@@ -1254,6 +1264,17 @@ class StepFailure(Exception):
         self.timed_out = timed_out
 
 
+class WorkflowInterrupted(Exception):
+    def __init__(self, signum: int | None = None) -> None:
+        if signum == signal.SIGTERM:
+            message = "interrupted by SIGTERM"
+        elif signum == signal.SIGINT:
+            message = "interrupted by Ctrl-C"
+        else:
+            message = "interrupted by signal"
+        super().__init__(message)
+
+
 @dataclass
 class CommandResult:
     exit_code: int
@@ -1281,9 +1302,31 @@ def run_logged(args: Sequence[str], cwd: Path, log_dir: Path, name: str, timeout
             proc.wait(timeout=timeout if timeout > 0 else None)
         except subprocess.TimeoutExpired:
             timed_out = True
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
+            terminate_process_group(proc, graceful=False)
+        except (KeyboardInterrupt, WorkflowInterrupted):
+            terminate_process_group(proc)
+            raise
     return CommandResult(proc.returncode if proc.returncode is not None else -1, timed_out, str(stdout_path), str(stderr_path))
+
+
+def terminate_process_group(process: subprocess.Popen[bytes], graceful: bool = True) -> None:
+    if process.poll() is not None:
+        return
+    if graceful:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    process.wait()
 
 
 def run_checked(args: Sequence[str], cwd: Path) -> None:
@@ -1323,6 +1366,7 @@ def render_run_discord_summary(state: RunState, task_preview: str) -> str:
         "succeeded": "✅ workflow succeeded",
         "qc_failed": "🧪 workflow QC failed",
         "timed_out": "⏳ workflow timed out",
+        "interrupted": "🛑 workflow interrupted",
         "blocked": "🧱 workflow blocked",
         "failed": "🛑 workflow failed",
         "running": "🏃 workflow running",
@@ -1389,6 +1433,8 @@ def notification_actions(state: RunState, step: StepState | None) -> list[str]:
     if state.status == "timed_out":
         next_timeout = max(int(state.timeout_seconds * 2), int(state.timeout_seconds) + 600, 600)
         actions.append(f"▶️ resume with a larger timeout: `aw resume --run-id {state.run_id} --timeout-seconds {next_timeout}`")
+    elif state.status == "interrupted":
+        actions.append(f"▶️ resume after interruption: `aw resume --run-id {state.run_id}`")
     else:
         actions.append(f"▶️ resume candidate: `aw resume --run-id {state.run_id}`")
     actions.append(f"🔁 retry candidate: `aw retry --run-id {state.run_id} --step {step.name}`")
@@ -1398,6 +1444,8 @@ def notification_actions(state: RunState, step: StepState | None) -> list[str]:
         actions.append("✋ human input is needed before retrying the blocked step.")
     elif state.status == "failed":
         actions.append("🧯 inspect executor logs before retrying.")
+    elif state.status == "interrupted":
+        actions.append("⏸️ interrupted by operator; resume or retry when ready.")
     return actions
 
 

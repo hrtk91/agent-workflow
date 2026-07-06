@@ -238,6 +238,16 @@ def tick_exit_code(results: list[dict[str, str]], isolate_job_failures: bool) ->
     return 0 if all(result.get("status") == "succeeded" for result in results) else 1
 
 
+def run_exit_code(status: str, notify_error: str = "") -> int:
+    if notify_error:
+        return 1
+    if status == "succeeded":
+        return 0
+    if status == "interrupted":
+        return 130
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     runner = WorkflowRunner(args.state_dir)
@@ -249,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
             if notify_error:
                 print(f"agent-workflow: notification failed: {notify_error}", file=sys.stderr)
             print(state.summary_path)
-            return 0 if state.status == "succeeded" and not notify_error else 1
+            return run_exit_code(state.status, notify_error)
         if args.command == "enqueue":
             print(runner.enqueue(config_from_args(args)))
             return 0
@@ -302,14 +312,14 @@ def main(argv: list[str] | None = None) -> int:
             if notify_error:
                 print(f"agent-workflow: notification failed: {notify_error}", file=sys.stderr)
             print(state.summary_path)
-            return 0 if state.status == "succeeded" and not notify_error else 1
+            return run_exit_code(state.status, notify_error)
         if args.command == "retry":
             state = runner.retry(args.run_id, args.step, verify_command=args.verify_command, timeout_seconds=args.timeout_seconds)
             notify_error = notify_result_if_requested(runner, state, args)
             if notify_error:
                 print(f"agent-workflow: notification failed: {notify_error}", file=sys.stderr)
             print(state.summary_path)
-            return 0 if state.status == "succeeded" and not notify_error else 1
+            return run_exit_code(state.status, notify_error)
         if args.command == "status":
             print(runner.status(args.run_id, include_repair=args.include_repair))
             return 0

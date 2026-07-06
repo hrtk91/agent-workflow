@@ -4,11 +4,14 @@ import contextlib
 import io
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -17,7 +20,7 @@ AW = ROOT / "scripts" / "aw"
 sys.path.insert(0, str(ROOT / "src"))
 
 from agent_workflow.state import RunState, StepState
-from agent_workflow.runner import ActiveWorkerJob, AutoRepairConfig, RunnerConfig, WorkflowRunner
+from agent_workflow.runner import ActiveWorkerJob, AutoRepairConfig, RunnerConfig, WorkflowRunner, run_logged
 
 
 class LightweightRunnerTest(unittest.TestCase):
@@ -106,6 +109,106 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertEqual("succeeded", resumed_state["status"])
         self.assertEqual(6, attempts["run_executor"])
         self.assertEqual(7, attempts["run_qc"])
+
+    def test_keyboard_interrupt_marks_run_interrupted_and_writes_summary(self) -> None:
+        def interrupt_executor(self: WorkflowRunner, state: RunState, step: StepState, span: dict[str, object]) -> None:
+            raise KeyboardInterrupt()
+
+        runner = WorkflowRunner(self.state_dir)
+        with mock.patch.object(WorkflowRunner, "_step_run_executor", interrupt_executor):
+            state = runner.run_new(
+                RunnerConfig(
+                    state_dir=self.state_dir,
+                    repo_path=self.repo,
+                    task_text="Interrupt during executor.",
+                    verify_command="test -f implemented.txt",
+                    executor_bin=str(self.fake_takt),
+                )
+            )
+
+        self.assertEqual("interrupted", state.status)
+        self.assertEqual("run_executor", state.current_step)
+        run_executor = state.step("run_executor")
+        self.assertEqual("interrupted", run_executor.status)
+        self.assertEqual(130, run_executor.exit_code)
+        self.assertFalse(run_executor.timed_out)
+        self.assertEqual("interrupted by Ctrl-C", run_executor.error)
+        summary = Path(state.summary_path)
+        self.assertIn("status: `interrupted`", summary.read_text(encoding="utf-8"))
+        discord_text = summary.with_name("hermes-discord-summary.md").read_text(encoding="utf-8")
+        self.assertIn("workflow interrupted", discord_text)
+        self.assertIn("resume after interruption", discord_text)
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        row = conn.execute("select status, current_step from jobs where run_id = ?", (state.run_id,)).fetchone()
+        self.assertEqual(("interrupted", "run_executor"), row)
+
+    def test_cli_sigint_marks_run_interrupted_and_prints_summary(self) -> None:
+        executor = self.root / "sleep-executor.sh"
+        executor.write_text("#!/usr/bin/env bash\nsleep 30\n", encoding="utf-8")
+        executor.chmod(0o755)
+        state_dir = self.root / "interrupt-state"
+
+        process = subprocess.Popen(
+            [
+                str(AW),
+                "--state-dir",
+                str(state_dir),
+                "run",
+                "--repo",
+                str(self.repo),
+                "--task-text",
+                "Interrupt smoke test.",
+                "--verify-command",
+                "true",
+                "--executor-bin",
+                str(executor),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+        state_path = self._wait_for_running_step(state_dir, "run_executor")
+
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=10)
+
+        self.assertEqual(130, process.returncode, stderr)
+        summary = Path(stdout.strip())
+        self.assertEqual(state_path.with_name("summary.md"), summary)
+        state = self._state(summary)
+        self.assertEqual("interrupted", state["status"])
+        self.assertEqual("run_executor", state["current_step"])
+        run_executor = next(step for step in state["steps"] if step["name"] == "run_executor")
+        self.assertEqual("interrupted", run_executor["status"])
+        self.assertEqual(130, run_executor["exit_code"])
+        self.assertEqual("interrupted by Ctrl-C", run_executor["error"])
+        self.assertIn("status: `interrupted`", summary.read_text(encoding="utf-8"))
+
+    def test_run_logged_terminates_child_process_group_on_keyboard_interrupt(self) -> None:
+        class InterruptingProcess:
+            pid = 4242
+            returncode: int | None = None
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def wait(self, timeout: float | None = None) -> int:
+                if timeout == 5:
+                    self.returncode = -signal.SIGTERM
+                    return self.returncode
+                raise KeyboardInterrupt()
+
+        process = InterruptingProcess()
+        with (
+            mock.patch("subprocess.Popen", return_value=process),
+            mock.patch("os.killpg") as killpg,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                run_logged(["fake"], self.repo, self.root / "logs", "interrupt", 0)
+
+        killpg.assert_called_once_with(process.pid, signal.SIGTERM)
 
     def test_qc_failure_loops_back_to_executor_until_green(self) -> None:
         result = self._aw(
@@ -1366,6 +1469,16 @@ class LightweightRunnerTest(unittest.TestCase):
 
     def _state(self, summary: Path) -> dict[str, object]:
         return json.loads((summary.parent / "state.json").read_text())
+
+    def _wait_for_running_step(self, state_dir: Path, step_name: str) -> Path:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            for state_path in state_dir.glob("runs/*/state.json"):
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                if state.get("current_step") == step_name:
+                    return state_path
+            time.sleep(0.05)
+        self.fail(f"run did not reach {step_name}")
 
 
 if __name__ == "__main__":
