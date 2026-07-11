@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
+from agent_workflow.notify.discord import render_llm_notification
 from agent_workflow.state import RunState, StepState
 from agent_workflow.tracing import TraceRecorder, trace_enabled_hint
 
@@ -1361,7 +1362,7 @@ def auto_repair_marker_path(state: RunState) -> Path:
     return state.run_path / "auto-repair-enqueued.json"
 
 
-def render_run_discord_summary(state: RunState, task_preview: str) -> str:
+def _render_mechanical_summary(state: RunState, task_preview: str) -> str:
     headline = {
         "succeeded": "✅ workflow succeeded",
         "qc_failed": "🧪 workflow QC failed",
@@ -1407,6 +1408,14 @@ def render_run_discord_summary(state: RunState, task_preview: str) -> str:
 
     lines.append("")
     return "\n".join(lines)
+
+
+def render_run_discord_summary(state: RunState, task_preview: str) -> str:
+    """LLM 通知を優先し、生成できなければ機械的 summary を返す。"""
+    llm = render_llm_notification(state)
+    if llm:
+        return llm
+    return _render_mechanical_summary(state, task_preview)
 
 
 def current_or_failed_step(state: RunState) -> StepState | None:
