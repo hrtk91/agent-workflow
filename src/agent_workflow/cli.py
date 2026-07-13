@@ -367,8 +367,14 @@ def main(argv: list[str] | None = None) -> int:
             print(runner.status(args.run_id, include_repair=args.include_repair))
             return 0
         if args.command == "report":
-            # Rebuild only missing or stale analytics rows before querying SQLite.
+            # report 処理フロー:
+            # [1] run artifactから不足・更新分だけをanalytics DBへ復元する。
+            # [2] group/filter引数を正規化し、SQLiteの集計payloadを作る。
+            # [3] 指定時だけ同じpayloadをOTLP metricsへ送信する。
+            # [4] JSONまたはterminal tableとして標準出力へ表示する。
+            # [1] 古いrunを含め、report対象となるanalytics rowを先に最新化する。
             runner.analytics.refresh_from_runs(runner.runs_dir)
+            # [2] CLI表記をAnalyticsStoreが受け取るdimension/pathへ変換する。
             group_by = [field.strip() for field in args.group_by.split(",") if field.strip()]
             repo_path = str(args.repo.expanduser().resolve()) if args.repo else None
             report_data = runner.analytics.report(
@@ -377,8 +383,10 @@ def main(argv: list[str] | None = None) -> int:
                 since=args.since,
                 include_repair=args.include_repair,
             )
+            # [3] SQLiteを正本にした集計結果を、明示指定された場合だけ外部へ投影する。
             if args.export_otel:
                 export_report_to_otel(report_data)
+            # [4] textとJSONのどちらでも同じreport payloadを表示する。
             if args.format == "json":
                 print(json.dumps(report_data, indent=2, sort_keys=True))
             else:

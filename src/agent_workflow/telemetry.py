@@ -57,20 +57,28 @@ class OtelReportExporter:
         self.observation_type = observation_type
 
     def export(self, report: dict[str, Any]) -> int:
-        """Register snapshot gauges, force a collection, then close the provider."""
+        """集計snapshotをGaugeとして登録し、1回送信してproviderを閉じる。
+
+        処理フロー:
+        - [1] analytics用meterを取得する。
+        - [2] 値が存在するreport fieldごとにObservableGaugeを登録する。
+        - [3] 短命CLIの終了前に明示的に収集・送信する。
+        - [4] 成否にかかわらずproviderをshutdownする。
+        """
 
         instruments: list[Any] = []
         observation_count = 0
         try:
+            # [1] report snapshot専用のinstrumentation scopeを使う。
             meter = self.provider.get_meter("agent-workflow.analytics", "0.1.0")
+            # [2] nullだけのfieldはinstrumentを作らず、実値のあるGaugeだけ登録する。
             for spec in GAUGES:
                 observations = self._observations(report, spec.field)
                 if not observations:
                     continue
                 observation_count += len(observations)
 
-                # Bind the immutable tuple at definition time; OTel invokes the
-                # callback later during the explicit force_flush below.
+                # callback実行時に別fieldの値へ入れ替わらないよう、この時点のtupleを固定する。
                 def callback(_options: object, values: tuple[Any, ...] = tuple(observations)) -> tuple[Any, ...]:
                     return values
 
@@ -82,10 +90,12 @@ class OtelReportExporter:
                         description=spec.description,
                     )
                 )
+            # [3] periodic collectionを待たず、今回登録したsnapshotを同期的に送る。
             if instruments and self.provider.force_flush(timeout_millis=10_000) is False:
                 raise RuntimeError("OpenTelemetry metric force_flush failed")
             return observation_count
         finally:
+            # [4] exporter threadやnetwork resourceを短命processに残さない。
             self.provider.shutdown(timeout_millis=10_000)
 
     def _observations(self, report: dict[str, Any], field: str) -> list[Any]:
@@ -108,14 +118,25 @@ class OtelTraceSession:
     """Own one remote run span and its child step-attempt spans."""
 
     def __init__(self, provider: Any, tracer: Any, trace_api: Any, run_attributes: dict[str, object]) -> None:
+        """run親spanと、子span生成に使うcontextを初期化する。
+
+        処理フロー:
+        - [1] provider・tracer・trace APIをsessionへ保持する。
+        - [2] 正規化したrun属性で親spanを開始する。
+        - [3] 後続step spanが同じtraceへ連結されるparent contextを作る。
+        """
+
+        # [1] lifecycleをこのsessionだけで完結できるよう依存objectを保持する。
         self.provider = provider
         self.tracer = tracer
         self.trace_api = trace_api
         self.closed = False
+        # [2] workflow呼び出し全体を表す親spanを1つだけ開始する。
         self.root_span = tracer.start_span(
             "agent_workflow.run",
             attributes=normalize_telemetry_attributes(run_attributes),
         )
+        # [3] 各step attemptを親spanへ接続するcontextを固定する。
         self.root_context = trace_api.set_span_in_context(self.root_span)
 
     @property
@@ -146,26 +167,46 @@ class OtelTraceSession:
         status_message: str,
         attributes: Mapping[str, object],
     ) -> None:
-        """Apply final attempt attributes and end the remote child span."""
+        """step attemptの最終属性・statusを反映して子spanを終了する。
 
+        処理フロー:
+        - [1] command結果を含む最終属性を反映する。
+        - [2] local JSONLと同じstatusを設定する。
+        - [3] 子spanを終了してexport待ちqueueへ渡す。
+        """
+
+        # [1] span開始後に判明したexit codeやtimeoutも含めて上書きする。
         span.set_attributes(normalize_telemetry_attributes(attributes))
+        # [2] local recordとremote spanの成否を同じ判定に揃える。
         span.set_status(self._status(status_code, status_message))
+        # [3] BatchSpanProcessorが送信できる完了spanにする。
         span.end()
 
     def close(self, run_status: str) -> None:
-        """End the run span, flush queued spans, and close the provider once."""
+        """run親spanを終了し、未送信spanをflushしてproviderを閉じる。
 
+        処理フロー:
+        - [1] 重複closeを抑止する。
+        - [2] 最終run statusを親spanへ反映して終了する。
+        - [3] queue済みspanを明示的に送信する。
+        - [4] flush失敗時もproviderをshutdownする。
+        """
+
+        # [1] finally経路が重なってもspan終了とshutdownを1回に限定する。
         if self.closed:
             return
         self.closed = True
         try:
+            # [2] workflowのterminal statusを親spanの属性とOTel statusへ反映する。
             self.root_span.set_attribute(ATTRIBUTE_NAMES["status"], run_status)
             root_status = "OK" if run_status == "succeeded" else "ERROR"
             self.root_span.set_status(self._status(root_status, "" if root_status == "OK" else run_status))
             self.root_span.end()
+            # [3] CLI process終了前に全step spanと親spanをcollectorへ渡す。
             if self.provider.force_flush(timeout_millis=10_000) is False:
                 raise RuntimeError("OpenTelemetry trace force_flush failed")
         finally:
+            # [4] exporterのbackground resourceを必ず解放する。
             self.provider.shutdown()
 
     def _status(self, status_code: str, status_message: str) -> Any:
@@ -177,17 +218,34 @@ def export_report_to_otel(
     report: dict[str, Any],
     runtime_factory: Callable[[], tuple[Any, Callable[..., Any]]] | None = None,
 ) -> int:
-    """Export an `aw report` snapshot through OTLP/HTTP when rows exist."""
+    """aw reportの集計結果がある場合だけOTLP/HTTPへ送信する。
 
+    処理フロー:
+    - [1] 空reportならOTel runtimeを初期化せず終了する。
+    - [2] optional dependencyからmetric providerを構築する。
+    - [3] report snapshotのGauge登録・送信をexporterへ委譲する。
+    """
+
+    # [1] 送信値がない場合はendpointやoptional dependencyを要求しない。
     if not report.get("rows"):
         return 0
+    # [2] testではfactoryを注入し、本番ではOTLP runtimeを遅延生成する。
     provider, observation_type = (runtime_factory or load_otlp_runtime)()
+    # [3] provider lifecycleを含む1回のsnapshot exportを実行する。
     return OtelReportExporter(provider, observation_type).export(report)
 
 
 def load_otlp_runtime() -> tuple[Any, Callable[..., Any]]:
-    """Load optional OTel packages and build a short-lived OTLP/HTTP provider."""
+    """metric用の短命OTLP/HTTP runtimeを遅延構築する。
 
+    処理フロー:
+    - [1] endpoint・protocol・exporter有効状態を検証する。
+    - [2] optional OTel packageを必要時だけimportする。
+    - [3] periodic送信を無効化したreaderと共通Resourceを作る。
+    - [4] 明示flush/shutdown前提のMeterProviderを返す。
+    """
+
+    # [1] signal固有設定を優先し、未設定・未対応protocolを早期に通知する。
     endpoint = os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
     if not endpoint:
         raise RuntimeError("set OTEL_EXPORTER_OTLP_METRICS_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -197,6 +255,7 @@ def load_otlp_runtime() -> tuple[Any, Callable[..., Any]]:
     if os.environ.get("OTEL_METRICS_EXPORTER", "otlp").lower() == "none":
         raise RuntimeError("OTEL_METRICS_EXPORTER=none disables metric export")
 
+    # [2] OTelを使わない通常CLIではbase dependencyを増やさない。
     try:
         metrics_api = import_module("opentelemetry.metrics")
         resource_module = import_module("opentelemetry.sdk.resources")
@@ -206,11 +265,11 @@ def load_otlp_runtime() -> tuple[Any, Callable[..., Any]]:
     except ModuleNotFoundError as exc:
         raise RuntimeError("install the OpenTelemetry extra: pip install 'agent-workflow[otel]'") from exc
 
-    # The report command is short lived, so disable periodic collection and
-    # rely on OtelReportExporter.force_flush before shutdown.
+    # [3] report commandは短命なためperiodic collectionを待たず、明示flushへ委ねる。
     exporter = otlp_export.OTLPMetricExporter()
     reader = sdk_export.PeriodicExportingMetricReader(exporter, export_interval_millis=math.inf)
     resource = build_otel_resource(resource_module)
+    # [4] atexit任せにせずOtelReportExporterがlifecycleを閉じるproviderを返す。
     provider = sdk_metrics.MeterProvider(
         resource=resource,
         metric_readers=[reader],
@@ -220,17 +279,27 @@ def load_otlp_runtime() -> tuple[Any, Callable[..., Any]]:
 
 
 def load_otlp_trace_runtime(run_attributes: dict[str, object]) -> OtelTraceSession | None:
-    """Build a per-run OTLP/HTTP trace session when trace export is configured."""
+    """trace export設定時だけrun単位のOTLP/HTTP sessionを構築する。
 
+    処理フロー:
+    - [1] trace export無効化とendpoint未設定を判定する。
+    - [2] signal固有protocolがHTTP/protobufであることを検証する。
+    - [3] optional OTel packageを必要時だけimportする。
+    - [4] run専用provider・processor・tracerを組み立ててsessionを返す。
+    """
+
+    # [1] 明示無効化またはendpoint未設定ならlocal JSONLだけを使用する。
     if os.environ.get("OTEL_TRACES_EXPORTER", "otlp").lower() == "none":
         return None
     endpoint = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
     if not endpoint:
         return None
+    # [2] 現在実装しているHTTP/protobuf以外を暗黙に誤送信しない。
     protocol = (os.environ.get("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL") or os.environ.get("OTEL_EXPORTER_OTLP_PROTOCOL") or "http/protobuf").lower()
     if protocol not in {"http", "http/protobuf"}:
         raise RuntimeError("agent-workflow currently supports OTLP traces over HTTP/protobuf")
 
+    # [3] endpointを指定した利用者にだけotel extraを要求する。
     try:
         trace_api = import_module("opentelemetry.trace")
         resource_module = import_module("opentelemetry.sdk.resources")
@@ -240,8 +309,7 @@ def load_otlp_trace_runtime(run_attributes: dict[str, object]) -> OtelTraceSessi
     except ModuleNotFoundError as exc:
         raise RuntimeError("install the OpenTelemetry extra: pip install 'agent-workflow[otel]'") from exc
 
-    # One provider is scoped to one workflow invocation so resume/retry runs
-    # can flush every new attempt before the short-lived CLI process exits.
+    # [4] invocationごとにproviderを分け、resume/retryの新attemptだけを確実にflushする。
     provider = sdk_trace.TracerProvider(
         resource=build_otel_resource(resource_module),
         shutdown_on_exit=False,

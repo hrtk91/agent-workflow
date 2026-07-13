@@ -533,17 +533,35 @@ class WorkflowRunner:
         return RunState.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
     def save_state(self, state: RunState) -> None:
-        """Persist JSON state, the operational index, and normalized analytics."""
+        """run状態をartifact・運用index・分析DBへ同じ順序で永続化する。
 
+        処理フロー:
+        - [1] 更新時刻を確定してstate.jsonへ書き込む。
+        - [2] jobs tableの最新状態indexを更新する。
+        - [3] 同じstateを正規化したanalytics tableへ反映する。
+        """
+
+        # [1] 後続の2つのDB更新と同じupdated_atを持つstate artifactを先に確定する。
         state.updated_at = utc_now()
         state.run_path.mkdir(parents=True, exist_ok=True)
         (state.run_path / "state.json").write_text(json.dumps(asdict(state), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        # [2] status表示やworker回復が参照する軽量な運用indexを更新する。
         self._upsert_job(state)
+        # [3] run/attempt分析値を同じjobs.sqlite内へ正規化して保存する。
         self.analytics.record_state(state)
 
     def _run_from(self, state: RunState, start_index: int) -> RunState:
-        """Execute remaining steps under one run trace and flush it on exit."""
+        """指定位置から残りstepを実行し、run traceを終了時にflushする。
 
+        処理フロー:
+        - [1] run属性を持つlocal/remote trace sessionを開始する。
+        - [2] runをrunningとして保存し、未完了stepを順番に実行する。
+        - [3] QC失敗時は上限内でexecutorへ戻し、上限到達時は失敗を確定する。
+        - [4] 全step成功時はsummaryとterminal stateを保存する。
+        - [5] return・失敗・例外の全経路でrun traceをflushして閉じる。
+        """
+
+        # [1] resume/retryを含む今回の呼び出し単位で親run spanを作る。
         tracer = TraceRecorder(
             Path(state.trace_path),
             run_attributes={
@@ -558,6 +576,7 @@ class WorkflowRunner:
             },
         )
         try:
+            # [2] current stateを先に永続化し、未完了stepだけを順次実行する。
             state.status = "running"
             self.save_state(state)
             index = start_index
@@ -569,6 +588,7 @@ class WorkflowRunner:
                     continue
                 ok = self._run_step(state, step, tracer)
                 if not ok:
+                    # [3] QCだけは修正loopへ戻し、その他の失敗または上限到達を確定する。
                     if step.name == "run_qc" and qc_repair_attempts < QC_REPAIR_MAX_ATTEMPTS:
                         qc_repair_attempts += 1
                         self._prepare_qc_repair_loop(state, qc_repair_attempts)
@@ -577,14 +597,14 @@ class WorkflowRunner:
                     self._finalize_failed_summary(state)
                     return state
                 index += 1
+            # [4] 最後のstep完了後にrun全体の成功summaryとstateを確定する。
             state.status = "succeeded"
             state.current_step = None
             self._write_summary(state)
             self.save_state(state)
             return state
         finally:
-            # A workflow CLI is short lived; finish the root span and force all
-            # step attempts to OTLP before the process exits.
+            # [5] 短命CLIが終了する前に親spanを閉じ、全step attemptをOTLPへflushする。
             tracer.close(state.status)
 
     def _prepare_qc_repair_loop(self, state: RunState, attempt: int) -> None:
@@ -622,8 +642,18 @@ class WorkflowRunner:
                 f.write("\n```\n")
 
     def _run_step(self, state: RunState, step: StepState, tracer: TraceRecorder) -> bool:
-        """Execute and persist one step attempt inside its local/remote span."""
+        """1回のstep attemptをspan内で実行し、結果とstateを永続化する。
 
+        処理フロー:
+        - [1] attempt番号と開始状態を初期化して保存する。
+        - [2] SIGINT/SIGTERMをworkflow中断へ変換するhandlerを設定する。
+        - [3] run属性を持つstep span内で対象処理を実行する。
+        - [4] 成功・StepFailure・中断をstep/run/spanのstatusへ反映する。
+        - [5] 終了時刻と最終stateを必ず保存する。
+        - [6] 呼び出し元のsignal handlerを必ず復元する。
+        """
+
+        # [1] retry前の結果を残さず、今回attemptの開始状態として保存する。
         step.status = "running"
         step.attempts += 1
         step.started_at = utc_now()
@@ -633,6 +663,7 @@ class WorkflowRunner:
         step.error = None
         state.current_step = step.name
         self.save_state(state)
+        # [2] process signalを通常のstep失敗処理へ合流できる例外に変換する。
         previous_sigint = signal.getsignal(signal.SIGINT)
         previous_sigterm = signal.getsignal(signal.SIGTERM)
 
@@ -642,6 +673,7 @@ class WorkflowRunner:
         signal.signal(signal.SIGINT, interrupt_handler)
         signal.signal(signal.SIGTERM, interrupt_handler)
         try:
+            # [3] model/task typeを含む共通属性でlocal/remote step spanを開始する。
             with tracer.span(
                 f"agent_workflow.step.{step.name}",
                 run_id=state.run_id,
@@ -654,6 +686,7 @@ class WorkflowRunner:
                 executor_bin=state.executor_bin,
                 attempt=step.attempts,
             ) as span:
+                # [4] 各終了経路をstep/run/spanのterminal情報へ変換する。
                 try:
                     getattr(self, f"_step_{step.name}")(state, step, span)
                     step.status = "succeeded"
@@ -680,9 +713,11 @@ class WorkflowRunner:
                     span["status_message"] = message
                     return False
                 finally:
+                    # [5] どの結果でもattempt終了時刻と最終stateを欠かさず保存する。
                     step.finished_at = utc_now()
                     self.save_state(state)
         finally:
+            # [6] runner外のsignal挙動を変更したままにしない。
             signal.signal(signal.SIGINT, previous_sigint)
             signal.signal(signal.SIGTERM, previous_sigterm)
 

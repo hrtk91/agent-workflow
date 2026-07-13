@@ -38,18 +38,26 @@ class AnalyticsStore:
         self._init_schema()
 
     def record_state(self, state: RunState, *, allow_task_identity_create: bool = True) -> None:
-        """Snapshot state while preserving first-input and final-change invariants."""
+        """run状態を、初期入力と完了時変更量を壊さず分析DBへ反映する。
 
-        # Finish filesystem and Git inspection before opening a write transaction so
-        # parallel workers are not blocked by comparatively slow local I/O.
+        処理フロー:
+        - [1] DB transaction外でタスク識別子と完了時のGit変更量を取得する。
+        - [2] 現在までに開始されたstep attemptを正規化して保存する。
+        - [3] QC結果・終了時刻・試行回数などrun単位の集計値を算出する。
+        - [4] 初期入力と最初の完了時変更量を保持しながらrun_metricsを更新する。
+        """
+
+        # [1] 比較的遅いfilesystem/Git処理で並列workerのwrite transactionを占有しない。
         task_sha256, task_bytes = durable_task_packet_identity(state, create=allow_task_identity_create)
         change_stats = collect_change_stats(state) if state.status in TERMINAL_RUN_STATUSES else None
 
         with self._db() as conn:
+            # [2] state.jsonが保持する各stepの最新attemptを、安定した複合keyで保存する。
             for step in state.steps:
                 if step.attempts > 0 and step.status != "pending":
                     self._upsert_step_attempt(conn, state.run_id, step)
 
+            # [3] attempt履歴と現在stateから、run単位で比較する値を確定する。
             first_pass_qc, eventual_qc = self._qc_outcomes(conn, state)
             finished_at = run_finished_at(state) if state.status in TERMINAL_RUN_STATUSES else None
             elapsed = duration_seconds(state.created_at, finished_at)
@@ -58,6 +66,7 @@ class AnalyticsStore:
             qc_profile_hash = hashlib.sha256(state.verify_command.encode("utf-8")).hexdigest()
             changed_files, additions, deletions = change_stats or (None, None, None)
 
+            # [4] runningへ戻った場合だけ変更量を未確定へ戻し、terminal値は最初のsnapshotを保持する。
             conn.execute(
                 """
                 insert into run_metrics(
@@ -129,18 +138,29 @@ class AnalyticsStore:
             )
 
     def refresh_from_runs(self, runs_dir: Path) -> int:
-        """Backfill missing analytics rows from immutable state and trace artifacts."""
+        """run成果物から不足・更新分だけを分析DBへ復元する。
 
+        処理フロー:
+        - [1] run directoryの有無を確認し、対象state.jsonを列挙する。
+        - [2] 読み取れるstateだけを復元する。
+        - [3] DBが最新ならfilesystemやtraceの再走査を省略する。
+        - [4] 過去traceのattempt履歴を戻してからrun状態を再記録する。
+        """
+
+        # [1] 初回利用などrun directoryがない場合は何も更新しない。
         refreshed = 0
         if not runs_dir.exists():
             return refreshed
         for state_path in sorted(runs_dir.glob("*/state.json")):
+            # [2] 破損・途中書き込みなど、復元できないstateは他のrunを妨げない。
             try:
                 state = RunState.from_dict(json.loads(state_path.read_text(encoding="utf-8")))
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 continue
+            # [3] updated_atとattempt件数が揃うrunは追加I/Oなしでskipする。
             if not self._needs_refresh(state):
                 continue
+            # [4] 旧runのattempt履歴を先に戻し、そこからQC結果を再計算する。
             self._record_trace_attempts(state.run_id, Path(state.trace_path))
             self.record_state(state, allow_task_identity_create=False)
             refreshed += 1
@@ -153,8 +173,18 @@ class AnalyticsStore:
         since: str | None = None,
         include_repair: bool = False,
     ) -> dict[str, Any]:
-        """Aggregate completed runs; QC rates use only runs that executed QC."""
+        """完了runを指定軸で集計し、QC通過率と中央値を返す。
 
+        処理フロー:
+        - [1] group-by指定を検証する。
+        - [2] terminal run・purpose・repository・期間の検索条件を組み立てる。
+        - [3] SQLiteから対象runを取得する。
+        - [4] 指定されたdimension値でrunをグルーピングする。
+        - [5] QC実行runだけを分母に通過率と各中央値を算出する。
+        - [6] 生成時刻・条件・集計行を構造化して返す。
+        """
+
+        # [1] SQL列名へ変換できる既知dimensionだけを受け付ける。
         groups = tuple(group_by)
         invalid = [field for field in groups if field not in GROUP_FIELDS]
         if invalid:
@@ -162,6 +192,7 @@ class AnalyticsStore:
         if not groups:
             raise ValueError("--group-by must contain at least one field")
 
+        # [2] repair runを既定で除外し、指定された絞り込みだけをparameter化する。
         where = [f"status in ({','.join('?' for _ in TERMINAL_RUN_STATUSES)})"]
         params: list[object] = []
         params.extend(sorted(TERMINAL_RUN_STATUSES))
@@ -174,6 +205,7 @@ class AnalyticsStore:
             where.append("created_at >= ?")
             params.append(since)
 
+        # [3] report対象となる完了runを時系列順で取得する。
         with self._db() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
@@ -181,11 +213,13 @@ class AnalyticsStore:
                 params,
             ).fetchall()
 
+        # [4] nullや空値を表示用の安定したdimension値へ正規化してまとめる。
         grouped: dict[tuple[str, ...], list[sqlite3.Row]] = defaultdict(list)
         for row in rows:
             key = tuple(display_dimension(row[GROUP_FIELDS[field]], field) for field in groups)
             grouped[key].append(row)
 
+        # [5] QC未実行runを通過率の分母から外し、比較用の統計値を作る。
         report_rows: list[dict[str, Any]] = []
         for key, members in sorted(grouped.items()):
             first_pass = [int(row["first_pass_qc"]) for row in members if row["first_pass_qc"] is not None]
@@ -210,6 +244,7 @@ class AnalyticsStore:
                 }
             )
 
+        # [6] text表示とOTel exportが同じpayloadを利用できる形で返す。
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "group_by": list(groups),
@@ -222,9 +257,15 @@ class AnalyticsStore:
         }
 
     def _init_schema(self) -> None:
-        """Create analytics tables alongside the existing operational tables."""
+        """既存jobs.sqliteへversion管理された分析schemaを初期化する。
+
+        処理フロー:
+        - [1] run・attemptテーブルと検索indexを冪等に作成する。
+        - [2] 適用済みschema versionを記録する。
+        """
 
         with self._db() as conn:
+            # [1] operational tableを変更せず、分析用tableを同じDBへ追加する。
             conn.executescript(
                 """
                 create table if not exists analytics_schema_migrations (
@@ -280,14 +321,23 @@ class AnalyticsStore:
                 create index if not exists idx_step_attempts_run_step on step_attempts(run_id, step_name);
                 """
             )
+            # [2] 再起動時に重複しないversion recordを残す。
             conn.execute(
                 "insert or ignore into analytics_schema_migrations(version, applied_at) values(1, ?)",
                 (datetime.now(timezone.utc).isoformat(),),
             )
 
     def _record_trace_attempts(self, run_id: str, trace_path: Path) -> None:
-        """Recover per-attempt rows that predate normalized SQLite persistence."""
+        """正規化DB導入前のtrace.jsonlからstep attempt履歴を復元する。
 
+        処理フロー:
+        - [1] 読み取り可能なtrace.jsonlを行単位で取得する。
+        - [2] agent-workflowのstep spanだけを選別する。
+        - [3] 旧属性名と新OTel属性名を共通値へ正規化する。
+        - [4] 復元できたattemptをSQLiteへupsertする。
+        """
+
+        # [1] traceがないrunや読み取れないrunはstateから復元できる範囲に留める。
         if not trace_path.is_file():
             return
         try:
@@ -297,14 +347,14 @@ class AnalyticsStore:
         with self._db() as conn:
             for line in lines:
                 try:
+                    # [2] root spanや他形式のrecordを除外し、step名を取り出す。
                     record = json.loads(line)
                     name = str(record.get("name") or "")
                     if not name.startswith("agent_workflow.step."):
                         continue
                     step_name = name.removeprefix("agent_workflow.step.")
                     attrs = record.get("attributes") or {}
-                    # Accept both the original local keys and the normalized
-                    # OTel keys so old and new run directories rebuild alike.
+                    # [3] 旧local keyと正規化済みOTel keyのどちらからでも同じ値を得る。
                     attempt = int(attrs.get("agent_workflow.step.attempt") or attrs.get("attempt") or 0)
                     if attempt < 1:
                         continue
@@ -317,6 +367,7 @@ class AnalyticsStore:
                     ) or None
                     status_code = str((record.get("status") or {}).get("code") or "")
                     status = trace_attempt_status(step_name, status_code, timed_out, error)
+                    # [4] trace時刻とstatusを正規化済みattempt rowとして保存する。
                     self._upsert_attempt_values(
                         conn,
                         run_id=run_id,
@@ -397,15 +448,26 @@ class AnalyticsStore:
         )
 
     def _qc_outcomes(self, conn: sqlite3.Connection, state: RunState) -> tuple[int | None, int | None]:
+        """attempt履歴から初回QCと最終QCの成否を判定する。
+
+        処理フロー:
+        - [1] run_qc attemptを実行順に取得する。
+        - [2] attempt 1がterminalならfirst-pass結果を確定する。
+        - [3] いずれかの成功、またはrunのterminal失敗からeventual結果を確定する。
+        """
+
+        # [1] resume/retryを含む通算attempt番号の順でQC履歴を読む。
         rows = conn.execute(
             "select attempt, status from step_attempts where run_id = ? and step_name = 'run_qc' order by attempt",
             (state.run_id,),
         ).fetchall()
+        # [2] 初回attemptが未完了の場合は成功率の分母へ入れない。
         first_pass: int | None = None
         for attempt, status in rows:
             if int(attempt) == 1 and str(status) in TERMINAL_STEP_STATUSES:
                 first_pass = int(status == "succeeded")
                 break
+        # [3] 後続attemptで一度でも成功すればeventual successとする。
         eventual: int | None = None
         if any(str(status) == "succeeded" for _, status in rows):
             eventual = 1
@@ -414,12 +476,19 @@ class AnalyticsStore:
         return first_pass, eventual
 
     def _needs_refresh(self, state: RunState) -> bool:
-        """Skip unchanged runs whose expected attempt history is already complete."""
+        """state更新時刻とattempt件数からartifact再走査の要否を判定する。
 
+        処理フロー:
+        - [1] run_metricsがない、またはupdated_atが異なるrunを更新対象にする。
+        - [2] 時刻が同じ場合も、保存済みattempt数がstateより少なければ更新対象にする。
+        """
+
+        # [1] 未登録または更新されたstateは詳細比較せずrefreshする。
         with self._db() as conn:
             row = conn.execute("select updated_at from run_metrics where run_id = ?", (state.run_id,)).fetchone()
             if row is None or str(row[0]) != state.updated_at:
                 return True
+            # [2] trace backfill途中などattempt履歴が不足するrunだけ再処理する。
             recorded_attempts = int(
                 conn.execute("select count(*) from step_attempts where run_id = ?", (state.run_id,)).fetchone()[0]
             )
@@ -432,12 +501,20 @@ class AnalyticsStore:
 
 
 def render_text_report(report: dict[str, Any]) -> str:
-    """Render a compact terminal table from the structured report payload."""
+    """構造化reportをterminal向けの固定幅tableへ変換する。
 
+    処理フロー:
+    - [1] 空結果を短いmessageとして返す。
+    - [2] 各集計行を表示文字列へ変換し、列幅を算出する。
+    - [3] header・区切り・data行を組み立てる。
+    """
+
+    # [1] headerだけのtableを出さず、絞り込み結果が空であることを明示する。
     rows = list(report["rows"])
     if not rows:
         return "No completed workflow runs matched."
 
+    # [2] 数値とdurationを表示用へ整形し、内容が切れない最大列幅を求める。
     headers = ["group", "runs", "qc", "first-pass", "eventual", "attempts p50", "elapsed p50", "changed p50"]
     values: list[list[str]] = []
     for row in rows:
@@ -455,6 +532,7 @@ def render_text_report(report: dict[str, Any]) -> str:
             ]
         )
     widths = [max(len(headers[index]), *(len(row[index]) for row in values)) for index in range(len(headers))]
+    # [3] すべての行を同じ列幅で左寄せして出力する。
     lines = ["Agent workflow report", "  ".join(header.ljust(widths[index]) for index, header in enumerate(headers))]
     lines.append("  ".join("-" * width for width in widths))
     for row in values:
@@ -463,8 +541,14 @@ def render_text_report(report: dict[str, Any]) -> str:
 
 
 def task_packet_identity(task_dir: Path) -> tuple[str | None, int | None]:
-    """Hash the ordered task packet so equivalent inputs have one identity."""
+    """順序固定のtask packetから再現可能なhashとbyte数を計算する。
 
+    処理フロー:
+    - [1] 対象ファイルを定義順に読み、ファイル名と内容をhashへ加える。
+    - [2] 1ファイル以上読めた場合だけ識別子を返す。
+    """
+
+    # [1] 同じ内容でもfile境界が異なるpacketを別入力として扱う。
     digest = hashlib.sha256()
     total = 0
     found = False
@@ -479,12 +563,20 @@ def task_packet_identity(task_dir: Path) -> tuple[str | None, int | None]:
         found = True
         total += len(data)
         digest.update(name.encode("utf-8") + b"\0" + data + b"\0")
+    # [2] task生成前など入力が存在しない状態をnullで表す。
     return (digest.hexdigest(), total) if found else (None, None)
 
 
 def durable_task_packet_identity(state: RunState, *, create: bool) -> tuple[str | None, int | None]:
-    """Read or create the immutable identity captured before QC mutates context.md."""
+    """QCがcontext.mdを変更する前のtask識別子を永続化して再利用する。
 
+    処理フロー:
+    - [1] 保存済みtask-identity.jsonがあれば検証して返す。
+    - [2] backfill時など新規作成を許可しない場合は未取得として返す。
+    - [3] 現在のtask packetを計算し、初回値だけをartifactへ保存する。
+    """
+
+    # [1] live taskの現在値より、run開始時に固定したartifactを常に優先する。
     identity_path = Path(state.run_dir) / TASK_IDENTITY_NAME
     if identity_path.is_file():
         try:
@@ -494,8 +586,10 @@ def durable_task_packet_identity(state: RunState, *, create: bool) -> tuple[str 
             return sha256, size
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
             return None, None
+    # [2] 過去runに初期値の証拠がない場合、現在の変異済みtaskから推測しない。
     if not create:
         return None, None
+    # [3] 入力が揃った最初の時点でhashとbyte数を固定する。
     sha256, size = task_packet_identity(Path(state.task_dir))
     if sha256 is None or size is None:
         return None, None
@@ -507,14 +601,23 @@ def durable_task_packet_identity(state: RunState, *, create: bool) -> tuple[str 
 
 
 def collect_change_stats(state: RunState) -> tuple[int, int, int] | None:
-    """Count tracked and untracked worktree changes against the run base ref."""
+    """run開始refに対するtracked/untracked変更量を集計する。
 
+    処理フロー:
+    - [1] 比較可能なworktreeとbase refがあることを確認する。
+    - [2] git diff --numstatからtracked fileの増減を集計する。
+    - [3] untracked text fileを追加行として重複なく集計する。
+    - [4] file数・追加行・削除行を返し、Git失敗時は未計測とする。
+    """
+
+    # [1] worktree未作成・cleanup済み・base未確定のrunは計測できない。
     if not state.worktree_path or not state.base_ref:
         return None
     worktree = Path(state.worktree_path)
     if not worktree.is_dir():
         return None
     try:
+        # [2] binaryと内部TAKT成果物を除き、tracked差分のfile数と行数を数える。
         diff = subprocess.run(
             ["git", "-C", str(worktree), "diff", "--numstat", state.base_ref],
             text=True,
@@ -540,6 +643,7 @@ def collect_change_stats(state: RunState) -> tuple[int, int, int] | None:
             if deleted.isdigit():
                 deletions += int(deleted)
 
+        # [3] tracked側で数えたpathを除外し、text fileだけを追加行として扱う。
         untracked = subprocess.run(
             ["git", "-C", str(worktree), "ls-files", "--others", "--exclude-standard", "-z"],
             stdout=subprocess.PIPE,
@@ -561,6 +665,7 @@ def collect_change_stats(state: RunState) -> tuple[int, int, int] | None:
                 continue
             if b"\0" not in data:
                 additions += len(data.splitlines())
+        # [4] 途中のGit/filesystem失敗では不正確な0を保存せずnull扱いにする。
         return len(seen), additions, deletions
     except OSError:
         return None
