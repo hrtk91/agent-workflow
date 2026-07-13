@@ -7,6 +7,13 @@ import sys
 from pathlib import Path
 
 from agent_workflow.analytics import render_text_report
+from agent_workflow.config import (
+    CONFIG_FILE_ENV,
+    default_config_path,
+    initialize_settings,
+    load_settings,
+    render_settings,
+)
 from agent_workflow.merge import MergeBlocked, MergeGateConfig, run_merge_approved, run_merge_gate
 from agent_workflow.repair import REPAIR_ACTIONS, REPAIR_CATEGORIES, REPAIR_RISKS, RepairDraftInput, RepairManager
 from agent_workflow.runner import (
@@ -23,6 +30,7 @@ from agent_workflow.telemetry import export_report_to_otel
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="aw", description="Lightweight resumable agent workflow runner")
     parser.add_argument("--state-dir", type=Path, default=default_state_dir())
+    parser.add_argument("--config-file", type=Path, default=default_config_path())
     sub = parser.add_subparsers(dest="command", required=True)
 
     run = sub.add_parser("run", help="start a new task run")
@@ -89,6 +97,13 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup = sub.add_parser("cleanup", help="remove a run worktree")
     cleanup.add_argument("--run-id", required=True)
 
+    config = sub.add_parser("config", help="inspect and initialize agent-workflow settings")
+    config_sub = config.add_subparsers(dest="config_command", required=True)
+    config_sub.add_parser("path", help="print the active config file path")
+    config_sub.add_parser("show", help="print the effective config as TOML")
+    config_init = config_sub.add_parser("init", help="write the default config file")
+    config_init.add_argument("--force", action="store_true")
+
     repair = sub.add_parser("repair", help="create and validate workflow repair drafts")
     repair_sub = repair.add_subparsers(dest="repair_command", required=True)
     repair_draft = repair_sub.add_parser("draft", help="write a validated repair draft artifact")
@@ -135,7 +150,10 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--max-age-seconds", type=int, default=int(os.environ.get("HERMES_MERGE_DECISION_MAX_AGE_SECONDS", "86400")))
     merge.add_argument("--method", choices=["merge", "squash", "rebase"], default="squash")
     merge.add_argument("--keep-branch", action="store_true")
-    merge.add_argument("--allow-no-checks", action="store_true", help="allow live PR with no GitHub checks even without local QC in decision")
+    merge.add_argument("--repo-path", type=Path, help="local git repository used to re-run QC when the live PR has no checks")
+    merge.add_argument("--verify-command", help="local QC command to re-run at the live PR head when no checks are reported")
+    merge.add_argument("--timeout-seconds", type=float, default=7200)
+    merge.add_argument("--allow-no-checks", action="store_true", help="explicitly allow a live PR with no GitHub checks and skip local QC re-check")
 
     return parser
 
@@ -263,9 +281,21 @@ def run_exit_code(status: str, notify_error: str = "") -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    runner = WorkflowRunner(args.state_dir)
+    config_path = args.config_file.expanduser().absolute()
+    os.environ[CONFIG_FILE_ENV] = str(config_path)
 
     try:
+        if args.command == "config":
+            if args.config_command == "path":
+                print(config_path)
+                return 0
+            if args.config_command == "show":
+                print(render_settings(load_settings(config_path)), end="")
+                return 0
+            if args.config_command == "init":
+                print(initialize_settings(config_path, force=args.force))
+                return 0
+        runner = WorkflowRunner(args.state_dir)
         if args.command == "run":
             state = runner.run_new(config_from_args(args))
             notify_error = notify_result_if_requested(runner, state, args)
@@ -421,6 +451,9 @@ def main(argv: list[str] | None = None) -> int:
                     method=args.method,
                     delete_branch=not args.keep_branch,
                     allow_no_checks=args.allow_no_checks,
+                    repo_path=args.repo_path,
+                    verify_command=args.verify_command,
+                    timeout_seconds=args.timeout_seconds,
                 )
             )
             return 0

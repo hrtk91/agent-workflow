@@ -30,6 +30,7 @@ class LightweightRunnerTest(unittest.TestCase):
         self.state_dir = self.root / "state"
         self.repo = self._make_repo()
         self.fake_takt = self._make_fake_takt()
+        self.fake_notification_provider = self._make_fake_notification_provider()
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -73,6 +74,11 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertIn("duration_seconds=", summary_text)
         self.assertIn("- takt_session_shadow: `", summary_text)
         self.assertIn("- takt_phase_usage: `", summary_text)
+        report_snapshots = list(
+            Path(state["run_dir"]).glob("executor_observability/takt/*/reports/01-implementation.md")
+        )
+        self.assertEqual(1, len(report_snapshots))
+        self.assertIn("fixture implementation", report_snapshots[0].read_text())
         trace_rows = [json.loads(line) for line in Path(state["trace_path"]).read_text().splitlines()]
         self.assertEqual(["OK"] * 5, [row["status"]["code"] for row in trace_rows])
         self.assertEqual({"gpt-test"}, {row["attributes"]["gen_ai.request.model"] for row in trace_rows})
@@ -427,7 +433,11 @@ class LightweightRunnerTest(unittest.TestCase):
             "1",
             "--notify-command",
             f"{notify_script} {{status}} {{run_id}} {{discord_summary}}",
-            env={"FAKE_NOTIFY_LOG": str(notify_log)},
+            env={
+                "FAKE_NOTIFY_LOG": str(notify_log),
+                "AGENT_WORKFLOW_NOTIFICATION_PROVIDER": "fixture",
+                "AGENT_WORKFLOW_NOTIFICATION_FIXTURE_COMMAND": str(self.fake_notification_provider),
+            },
             check=False,
         )
 
@@ -439,6 +449,27 @@ class LightweightRunnerTest(unittest.TestCase):
         discord_summary = Path(notify_args[2])
         self.assertTrue(discord_summary.exists())
         self.assertIn("🔁 retry candidate", discord_summary.read_text())
+
+    def test_notify_state_does_not_generate_llm_without_notification_command(self) -> None:
+        runner = WorkflowRunner(self.state_dir)
+        state = mock.Mock(status="failed")
+        with mock.patch("agent_workflow.runner.render_llm_notification") as render:
+            result = runner.notify_state(state, None, {"failed"})
+
+        self.assertEqual("", result)
+        render.assert_not_called()
+
+    def test_notify_state_does_not_send_mechanical_fallback_when_llm_fails(self) -> None:
+        runner = WorkflowRunner(self.state_dir)
+        state = mock.Mock(status="failed")
+        with (
+            mock.patch("agent_workflow.runner.render_llm_notification", return_value=None),
+            mock.patch("agent_workflow.runner.subprocess.run") as send,
+        ):
+            result = runner.notify_state(state, "notify {discord_summary}", {"failed"})
+
+        self.assertEqual("LLM notification generation failed", result)
+        send.assert_not_called()
 
     def test_tick_does_not_notify_failed_repair_jobs(self) -> None:
         enqueued = self._aw(
@@ -472,7 +503,11 @@ class LightweightRunnerTest(unittest.TestCase):
             str(self.fake_takt),
             "--notify-command",
             f"{notify_script} {{status}} {{run_id}} {{discord_summary}}",
-            env={"FAKE_NOTIFY_LOG": str(notify_log)},
+            env={
+                "FAKE_NOTIFY_LOG": str(notify_log),
+                "AGENT_WORKFLOW_NOTIFICATION_PROVIDER": "fixture",
+                "AGENT_WORKFLOW_NOTIFICATION_FIXTURE_COMMAND": str(self.fake_notification_provider),
+            },
             check=False,
         )
         self.assertIn(f"{job_id}\tqc_failed", first.stdout)
@@ -486,7 +521,11 @@ class LightweightRunnerTest(unittest.TestCase):
             str(self.fake_takt),
             "--notify-command",
             f"{notify_script} {{status}} {{run_id}} {{discord_summary}}",
-            env={"FAKE_NOTIFY_LOG": str(notify_log)},
+            env={
+                "FAKE_NOTIFY_LOG": str(notify_log),
+                "AGENT_WORKFLOW_NOTIFICATION_PROVIDER": "fixture",
+                "AGENT_WORKFLOW_NOTIFICATION_FIXTURE_COMMAND": str(self.fake_notification_provider),
+            },
             check=False,
         )
 
@@ -1088,6 +1127,20 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertFalse(runner._active_worker_job_timed_out(fresh_child))
         self.assertFalse(runner._active_worker_job_timed_out(disabled_child))
 
+    def test_worker_child_receives_active_config_file(self) -> None:
+        runner = WorkflowRunner(self.state_dir)
+        config_path = self.root / "config.toml"
+        process = mock.Mock()
+        with (
+            mock.patch.dict(os.environ, {"AGENT_WORKFLOW_CONFIG_FILE": str(config_path)}),
+            mock.patch("agent_workflow.runner.subprocess.Popen", return_value=process) as popen,
+        ):
+            spawned = runner._spawn_claimed_job("job-1", None, {"failed"}, None)
+
+        self.assertIs(process, spawned)
+        args = popen.call_args.args[0]
+        self.assertEqual(str(config_path), args[args.index("--config-file") + 1])
+
     def test_worker_times_out_active_child_and_marks_queue_failed(self) -> None:
         runner = WorkflowRunner(self.state_dir)
         job_id = runner.enqueue(
@@ -1499,7 +1552,7 @@ class LightweightRunnerTest(unittest.TestCase):
             "  attempt=$(( $(cat \"$count_file\") + 1 ))\n"
             "fi\n"
             "printf '%s\\n' \"$attempt\" > \"$count_file\"\n"
-            "mkdir -p .takt/runs/fake-run/logs\n"
+            "mkdir -p .takt/runs/fake-run/logs .takt/runs/fake-run/reports\n"
             "cat > .takt/runs/fake-run/trace.md <<'TRACE'\n"
             "# Execution Trace: default\n"
             "- Started: 2026-01-01T00:00:00.000Z\n"
@@ -1543,12 +1596,45 @@ class LightweightRunnerTest(unittest.TestCase):
             "  ]\n"
             "}\n"
             "MONITOR\n"
+            "cat > .takt/runs/fake-run/reports/00-analysis.md <<'ANALYSIS'\n"
+            "fixture analysis\n"
+            "ANALYSIS\n"
+            "cat > .takt/runs/fake-run/reports/01-implementation.md <<'IMPLEMENTATION'\n"
+            "fixture implementation\n"
+            "IMPLEMENTATION\n"
             "printf '{\"type\":\"workflow_start\"}\\n' > .takt/runs/fake-run/logs/session-otel-session-shadow.jsonl\n"
             "printf '{\"type\":\"phase_usage\"}\\n' > .takt/runs/fake-run/logs/session-usage-events.phase.jsonl\n"
             "echo ok > implemented.txt\n"
             "if [[ \"${FAKE_TAKT_QC_PASS_ON_ATTEMPT:-}\" != \"\" && \"$attempt\" -ge \"$FAKE_TAKT_QC_PASS_ON_ATTEMPT\" ]]; then\n"
             "  echo ok > qc-pass\n"
             "fi\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+        return path
+
+    def _make_fake_notification_provider(self) -> Path:
+        path = self.root / "fake-notification-provider"
+        path.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "cat >/dev/null\n"
+            "cat <<'NOTIFICATION'\n"
+            "⚠️ **eb-temp workflow: fixture notification**\n"
+            "- Run: `fixture` / 1秒\n\n"
+            "**TAKT 進行**\n"
+            "| analyze | implement | verify | fix |\n"
+            "|---------|-----------|--------|-----|\n"
+            "| ✅ | ✅ | ❌ | ➖ |\n\n"
+            "**やったこと**\n"
+            "🔁 retry candidate\n\n"
+            "**テスト結果**\n"
+            "- ❌ fixture — QC failed\n\n"
+            "**ブロッカー**\n"
+            "QC failed\n\n"
+            "**次にすること**\n"
+            "1. Retry QC\n"
+            "NOTIFICATION\n",
             encoding="utf-8",
         )
         path.chmod(0o755)

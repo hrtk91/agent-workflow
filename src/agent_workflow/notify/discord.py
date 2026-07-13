@@ -3,24 +3,15 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-import tempfile
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from agent_workflow.notify.provider import NotificationProvider, notification_provider
 from agent_workflow.state import RunState, StepState
 
 
-_CODEX_COMMAND = [
-    "codex",
-    "exec",
-    "-m",
-    "gpt-5.6-luna",
-    "--config",
-    "model_reasoning_effort=max",
-]
-_CODEX_TIMEOUT_SECONDS = 120
 _GH_TIMEOUT_SECONDS = 10
 _REPORT_MAX_CHARS = 4000
 _SESSION_ERROR_MAX_CHARS = 2000
@@ -169,25 +160,47 @@ TAKT 進行表:
 """
 
 
-def render_llm_notification(state: RunState) -> str | None:
+def render_llm_notification(
+    state: RunState,
+    provider: NotificationProvider | None = None,
+) -> str | None:
     """RunState と TAKT の成果物から Discord 用通知を生成する。
 
-    summary.md、TAKT reports、session-shadow.jsonl、任意の GitHub 情報を収集し、
-    codex exec に構造化された通知の生成を依頼する。通知生成の失敗は workflow
-    の完了処理へ伝播させず、None を返す。
+    処理フロー:
+    - [1] summary、TAKT、session error、GitHub 情報を収集する。
+    - [2] 明示指定または設定ファイルから通知 provider を選ぶ。
+    - [3] 収集結果だけを prompt にして通知文を生成する。
+    - [4] 生成文が Discord 通知の形式を満たすか検証する。
+    - [5] どの段階で失敗しても workflow へ伝播させず None を返す。
     """
     try:
+        # [1] LLM が追加調査をしなくても判断できる、実行済み成果物を集める。
         context = _collect_notification_context(state)
-        output = _run_codex(_build_llm_prompt(context))
+        # [2] テスト等の明示 provider を優先し、通常は永続設定から選択する。
+        selected_provider = provider or notification_provider()
+        if selected_provider is None:
+            return None
+        # [3] 収集した JSON だけを根拠にする prompt を組み立て、provider へ渡す。
+        output = selected_provider.generate(_build_llm_prompt(context))
         if output is None:
             return None
+        # [4] 長さ、見出し、セクションなど、送信可能な最低限の形式を確認する。
         return _validate_notification(output)
     except Exception:
+        # [5] 通知生成の問題で、本体 workflow の完了状態を壊さない。
         return None
 
 
 def _collect_notification_context(state: RunState) -> NotificationContext:
-    """LLM に渡す通知生成用コンテキストを収集する。"""
+    """LLM に渡す通知生成用コンテキストを収集する。
+
+    処理フロー:
+    - [1] summary と、そこに記録された observability path を読む。
+    - [2] session error と TAKT reports を収集する。
+    - [3] 収集済みテキストから関連 Issue / PR 情報を取得する。
+    - [4] step duration と経過時間を含む NotificationContext にまとめる。
+    """
+    # [1] summary path が壊れていても空の path として縮退し、残りの収集を続ける。
     try:
         summary_path = Path(state.summary_path)
     except (TypeError, ValueError, OSError):
@@ -195,16 +208,19 @@ def _collect_notification_context(state: RunState) -> NotificationContext:
 
     summary_text = _read_summary(summary_path)
     paths = _extract_observability_paths(summary_text, state)
+    # [2] executor snapshot から最後の session error と既知の TAKT report を読む。
     session_error = _extract_last_session_error(paths.get("takt_session_shadow"))
     reports_dir = _resolve_reports_directory(paths)
     reports = _read_takt_reports(reports_dir)
 
+    # [3] summary、report、session error に明示された情報だけから GitHub metadata を探す。
     context_parts = [summary_text]
     context_parts.extend(f"[{name}]\n{text}" for name, text in reports.items())
     if session_error:
         context_parts.append(f"[session-shadow error]\n{session_error}")
     github = _collect_github_metadata("\n\n".join(part for part in context_parts if part), state)
 
+    # [4] prompt の入力を一つの型へ集約し、生成側での推測や追加参照を不要にする。
     return NotificationContext(
         state=state,
         summary_text=summary_text,
@@ -546,37 +562,6 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     return value
-
-
-def _run_codex(prompt: str) -> str | None:
-    """一時ファイルを stdin にして codex exec を実行する。"""
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w+",
-            encoding="utf-8",
-            suffix=".md",
-        ) as prompt_file:
-            prompt_file.write(prompt)
-            prompt_file.flush()
-            prompt_file.seek(0)
-            result = subprocess.run(
-                _CODEX_COMMAND,
-                stdin=prompt_file,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=_CODEX_TIMEOUT_SECONDS,
-                check=False,
-            )
-    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
-        return None
-    if result.returncode != 0:
-        return None
-    stdout = result.stdout
-    if not isinstance(stdout, str) or not stdout.strip():
-        return None
-    return stdout
 
 
 def _validate_notification(text: str) -> str | None:

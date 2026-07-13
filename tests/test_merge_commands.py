@@ -101,10 +101,16 @@ class MergeCommandsTest(unittest.TestCase):
             + "\n"
         )
 
-        dry_run = self._aw("merge", "--decision", str(decision_path))
+        qc_args = (
+            "--repo-path",
+            str(self.repo),
+            "--verify-command",
+            "test -f feature.txt",
+        )
+        dry_run = self._aw("merge", "--decision", str(decision_path), *qc_args)
         self.assertIn(f"dry-run: would merge https://github.com/hrtk91/eb-temp/pull/853 at {self.head_sha}", dry_run.stdout)
 
-        executed = self._aw("merge", "--decision", str(decision_path), "--execute")
+        executed = self._aw("merge", "--decision", str(decision_path), "--execute", *qc_args)
         self.assertIn("merged", executed.stdout)
         merge_args = json.loads(self.merge_call.read_text())
         self.assertIn("--squash", merge_args)
@@ -133,6 +139,32 @@ class MergeCommandsTest(unittest.TestCase):
         result = self._aw("merge", "--decision", str(decision_path), check=False)
         self.assertEqual(1, result.returncode)
         self.assertIn("no PR checks reported", result.stderr)
+
+    def test_merge_rejects_forged_local_qc_without_live_recheck(self) -> None:
+        decision_path = self._write_approved_decision(local_qc={"status": "succeeded"})
+
+        result = self._aw("merge", "--decision", str(decision_path), check=False)
+
+        self.assertEqual(1, result.returncode)
+        self.assertIn("pass --repo-path and --verify-command", result.stderr)
+
+    def test_merge_blocks_pr_that_closed_after_approval(self) -> None:
+        decision_path = self._write_approved_decision()
+        self._update_gh_pr(state="CLOSED")
+
+        result = self._aw("merge", "--decision", str(decision_path), "--allow-no-checks", check=False)
+
+        self.assertEqual(1, result.returncode)
+        self.assertIn("PR is not open: CLOSED", result.stderr)
+
+    def test_merge_blocks_pr_that_is_no_longer_mergeable(self) -> None:
+        decision_path = self._write_approved_decision()
+        self._update_gh_pr(mergeable="CONFLICTING")
+
+        result = self._aw("merge", "--decision", str(decision_path), "--allow-no-checks", check=False)
+
+        self.assertEqual(1, result.returncode)
+        self.assertIn("PR is not mergeable: CONFLICTING", result.stderr)
 
     def test_merge_gate_allows_old_gh_checks_without_json_when_local_qc_passes(self) -> None:
         self._write_gh_state(checks=None)
@@ -211,6 +243,29 @@ class MergeCommandsTest(unittest.TestCase):
             )
             + "\n"
         )
+
+    def _write_approved_decision(self, local_qc: dict[str, object] | None = None) -> Path:
+        decision_path = self.root / f"approved-{len(list(self.root.glob('approved-*.json')))}.json"
+        decision: dict[str, object] = {
+            "schemaVersion": 1,
+            "decision": "MERGE_APPROVED",
+            "repo": "hrtk91/eb-temp",
+            "prNumber": 853,
+            "baseBranch": "main",
+            "baseSha": self.base_sha,
+            "headBranch": "feature",
+            "headSha": self.head_sha,
+            "approvedAt": datetime.now(timezone.utc).isoformat(),
+        }
+        if local_qc is not None:
+            decision["localQc"] = local_qc
+        decision_path.write_text(json.dumps(decision) + "\n", encoding="utf-8")
+        return decision_path
+
+    def _update_gh_pr(self, **updates: object) -> None:
+        state = json.loads(self.gh_state.read_text(encoding="utf-8"))
+        state["pr"].update(updates)
+        self.gh_state.write_text(json.dumps(state) + "\n", encoding="utf-8")
 
     def _write_fake_gh(self) -> None:
         path = self.fake_bin / "gh"
