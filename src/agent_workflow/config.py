@@ -65,23 +65,45 @@ def default_settings() -> AgentWorkflowSettings:
 
 
 def load_settings(path: Path | None = None) -> AgentWorkflowSettings:
+    """TOML を型付き設定へ読み込む。
+
+    処理フロー:
+    - [1] 読み込み先と組み込みの既定値を決める。
+    - [2] ファイルがなければ既定値をそのまま返す。
+    - [3] TOML ファイルを読み込んで解析する。
+    - [4] TOML の値を既定値へ重ね、検証済みの設定を返す。
+    """
+    # [1] 明示されたパスを優先し、設定されていない項目の土台を用意する。
     config_path = (path or default_config_path()).expanduser()
     settings = default_settings()
+    # [2] 初回起動は設定ファイルを必須にせず、安全な既定値で動かす。
     if not config_path.exists():
         return settings
+    # [3] 読み込み・文字コード・TOML 構文の失敗を設定エラーとしてまとめる。
     try:
         data = tomllib.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"failed to read config {config_path}: {exc}") from exc
+    # [4] provider ごとの部分設定を既定値へ重ね、型と値を検証する。
     return _settings_from_dict(data, settings, config_path)
 
 
 def save_settings(settings: AgentWorkflowSettings, path: Path | None = None) -> Path:
+    """型付き設定を、途中状態を見せずに TOML へ保存する。
+
+    処理フロー:
+    - [1] 保存先と設定内容を検証し、親ディレクトリを作る。
+    - [2] 同じディレクトリの一時ファイルへ TOML を書く。
+    - [3] 一時ファイルを対象ファイルへ原子的に置き換える。
+    - [4] 失敗時は一時ファイルを削除して例外を戻す。
+    """
+    # [1] 不正な設定を永続化せず、保存先だけ先に用意する。
     config_path = (path or default_config_path()).expanduser()
     validate_settings(settings)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path: Path | None = None
     try:
+        # [2] TUI と CLI が読み込み途中の TOML を参照しないよう、別ファイルへ完成形を書く。
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -92,8 +114,10 @@ def save_settings(settings: AgentWorkflowSettings, path: Path | None = None) -> 
         ) as temp_file:
             temp_path = Path(temp_file.name)
             temp_file.write(render_settings(settings))
+        # [3] 完成した一時ファイルだけを、同一ファイルシステム上で原子的に反映する。
         os.replace(temp_path, config_path)
     except BaseException:
+        # [4] 書き込みや置換に失敗した場合は一時ファイルを残さない。
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
         raise

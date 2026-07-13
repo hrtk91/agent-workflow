@@ -50,6 +50,18 @@ class MergeGateResult:
 
 
 def run_merge_gate(config: MergeGateConfig) -> MergeGateResult:
+    """PR の現状態を評価し、merge 可否の decision artifacts を作る。
+
+    処理フロー:
+    - [1] 入力値と local QC の前提を検証する。
+    - [2] decision、report、log の出力先を作る。
+    - [3] GitHub から PR、checks、base SHA の現状態を取得する。
+    - [4] PR 状態と checks から blocker を収集する。
+    - [5] 指定されていれば PR head の隔離 worktree で local QC を行う。
+    - [6] blocker の優先度から decision payload を確定する。
+    - [7] JSON decision、人間向け report、Discord summary を保存する。
+    """
+    # [1] 評価対象を一意に特定し、local QC を再現できる入力だけを受け付ける。
     if config.pr_number <= 0:
         raise MergeError("--pr must be a positive integer")
     if "/" not in config.repo:
@@ -57,16 +69,19 @@ def run_merge_gate(config: MergeGateConfig) -> MergeGateResult:
     if config.verify_command and config.repo_path is None:
         raise MergeError("--repo-path is required when --verify-command is set")
 
+    # [2] 一回の評価結果をまとめる専用ディレクトリを作り、既存成果物は上書きしない。
     output_dir = (config.output_dir or config.state_dir / "merge-gates" / f"{new_run_id()}-pr{config.pr_number}").expanduser()
     output_dir.mkdir(parents=True, exist_ok=False)
     logs_dir = output_dir / "logs"
     logs_dir.mkdir()
 
+    # [3] decision file 内の自己申告ではなく、GitHub の live state を評価材料にする。
     pr = gh_pr_view(config.repo, config.pr_number)
     checks = gh_pr_checks(config.repo, config.pr_number)
     base_sha = gh_base_sha(config.repo, config.base_branch)
     blockers: list[dict[str, str]] = []
 
+    # [4] open/draft/base/mergeability/checks を個別に評価し、理由をすべて残す。
     if pr.get("state") != "OPEN":
         blockers.append(blocker("MERGE_BLOCKED_NEEDS_HUMAN", f"PR is not open: {pr.get('state')}"))
     if pr.get("isDraft") is True:
@@ -85,6 +100,7 @@ def run_merge_gate(config: MergeGateConfig) -> MergeGateResult:
     check_blockers = check_blocking_reasons(checks, config.allow_no_checks or bool(config.verify_command))
     blockers.extend(check_blockers)
 
+    # [5] checks がない構成でも、PR head SHA 固定の local QC で品質条件を評価する。
     local_qc: dict[str, Any] | None = None
     if config.verify_command:
         assert config.repo_path is not None
@@ -102,6 +118,7 @@ def run_merge_gate(config: MergeGateConfig) -> MergeGateResult:
             kind = "MERGE_BLOCKED_WAITING_CHECKS" if local_qc.get("timedOut") else "MERGE_BLOCKED_FIX_REQUIRED"
             blockers.append(blocker(kind, f"local QC {local_qc['status']}"))
 
+    # [6] blocker の重要度から単一decisionを選び、判断に使ったlive値も一緒に固定する。
     decision_name = choose_decision(blockers)
     evaluated_at = utc_now()
     decision: dict[str, Any] = {
@@ -130,6 +147,7 @@ def run_merge_gate(config: MergeGateConfig) -> MergeGateResult:
     if local_qc is not None:
         decision["localQc"] = local_qc
 
+    # [7] 機械判定、人間の確認、通知が同じdecisionを参照できる3成果物を保存する。
     decision_file = output_dir / "merge-decision.json"
     report_file = output_dir / "merge-gate.md"
     summary_file = output_dir / "hermes-discord-summary.md"
@@ -150,9 +168,21 @@ def run_merge_approved(
     verify_command: str | None = None,
     timeout_seconds: float = 7200,
 ) -> str:
+    """承認済み decision を live state で再検証し、dry-run または merge する。
+
+    処理フロー:
+    - [1] decision の形式、承認状態、SHA、鮮度を検証する。
+    - [2] PR と base の live state が decision 作成時から変わっていないか再検証する。
+    - [3] live checks、または同じ head SHA の local QC を再検証する。
+    - [4] dry-run では merge 対象だけを返して終了する。
+    - [5] execute 時は head SHA lock 付きで GitHub merge を実行する。
+    - [6] GitHub merge の失敗を block として返し、成功結果だけを返す。
+    """
+    # [1] 編集可能なJSONをそのまま信用せず、必要fieldと承認時刻を先に検証する。
     decision = json.loads(decision_file.expanduser().read_text(encoding="utf-8"))
     repo, pr_number, base_branch, base_sha, head_sha = validate_decision_shape(decision, max_age_seconds)
 
+    # [2] head/base SHA、open/draft、merge state、mergeable をGitHubから取り直して比較する。
     pr = gh_pr_view(repo, pr_number)
     actual_head_sha = str(pr.get("headRefOid") or "")
     actual_base = str(pr.get("baseRefName") or "")
@@ -174,6 +204,7 @@ def run_merge_approved(
     if mergeable != "MERGEABLE":
         raise MergeBlocked(f"PR is not mergeable: {mergeable or 'unknown'}")
 
+    # [3] live checks を優先し、checks がない場合は同じ head SHA で local QC をやり直す。
     checks = gh_pr_checks(repo, pr_number)
     if checks:
         check_blockers = check_blocking_reasons(checks, allow_no_checks=False)
@@ -188,14 +219,17 @@ def run_merge_approved(
             timeout_seconds=timeout_seconds,
         )
 
+    # [4] default は副作用のないdry-runとし、再検証済みの対象だけを表示する。
     url = str(pr.get("url") or f"https://github.com/{repo}/pull/{pr_number}")
     if not execute:
         return f"dry-run: would merge {url} at {head_sha}"
 
+    # [5] decision と同じ head 以外をmergeしないよう、GitHub側にもSHA lockを渡す。
     args = ["gh", "pr", "merge", str(pr_number), "--repo", repo, f"--{method}", "--match-head-commit", head_sha]
     if delete_branch:
         args.insert(-2, "--delete-branch")
     result = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # [6] GitHub CLI の失敗を成功として扱わず、上位CLIが判別できる block に変換する。
     if result.returncode != 0:
         raise MergeBlocked(result.stdout.strip() or "gh pr merge failed")
     return result.stdout.strip() or f"merged {url} at {head_sha}"
@@ -351,6 +385,16 @@ def run_local_qc(
     timeout_seconds: float,
     keep_worktree: bool,
 ) -> dict[str, Any]:
+    """指定された head SHA の隔離 worktree で検証commandを実行する。
+
+    処理フロー:
+    - [1] 失敗を既定値とする結果と worktree path を用意する。
+    - [2] head commit を取得し、その SHA の detached worktree を作る。
+    - [3] timeout と log 保存付きで検証 command を実行する。
+    - [4] 成功、失敗、timeout、例外を結果へ記録する。
+    - [5] 指定がなければ worktree を必ず削除する。
+    """
+    # [1] 途中で例外が起きても成功扱いにならない初期状態を作る。
     worktree_root = output_dir / "worktree"
     worktree = worktree_root / "repo"
     local_qc: dict[str, Any] = {
@@ -360,9 +404,12 @@ def run_local_qc(
         "worktree": str(worktree),
     }
     try:
+        # [2] PR headを手元へ用意し、現在のbranchを汚さないdetached worktreeを作る。
         ensure_commit_available(repo_path, head_sha, head_branch)
         run_git(repo_path, ["worktree", "add", "--detach", str(worktree), head_sha])
+        # [3] 検証の標準出力・標準エラーを成果物へ残し、上限時間も適用する。
         result = run_logged(["bash", "-lc", verify_command], worktree, logs_dir, "local_qc", timeout_seconds)
+        # [4] exit code と timeout の両方を使って最終statusを確定する。
         local_qc.update(
             {
                 "status": "succeeded" if result.exit_code == 0 and not result.timed_out else ("timed_out" if result.timed_out else "failed"),
@@ -373,8 +420,10 @@ def run_local_qc(
             }
         )
     except Exception as exc:
+        # [4] commit取得やworktree作成を含む例外も、decisionに残せる形へ変換する。
         local_qc["error"] = str(exc)
     finally:
+        # [5] 調査目的で保持する指定がない限り、一時worktreeを必ず片付ける。
         if not keep_worktree:
             subprocess.run(["git", "-C", str(repo_path), "worktree", "remove", "--force", str(worktree)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             shutil.rmtree(worktree_root, ignore_errors=True)

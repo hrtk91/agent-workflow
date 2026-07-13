@@ -69,7 +69,19 @@ class CodexNotificationProvider:
 
 
 def notification_provider(config_path: Path | None = None) -> NotificationProvider | None:
+    """永続設定と一時上書きから、今回使う通知 provider を組み立てる。
+
+    処理フロー:
+    - [1] TOML の永続設定を読み込む。
+    - [2] 使用する provider 名を決め、無効化指定なら終了する。
+    - [3] provider 固有、共通、TOML の順でコマンドを解決する。
+    - [4] 未登録 provider は環境変数のコマンドから一時設定を作る。
+    - [5] 環境変数を優先して timeout を解決する。
+    - [6] kind に応じた実行オブジェクトを返す。
+    """
+    # [1] CLI が選んだ config path を起点に、provider ごとの永続設定を読む。
     settings = load_settings(config_path)
+    # [2] 環境変数は一時的な選択を優先し、明示的な無効化もここで扱う。
     provider_name = os.environ.get(
         "AGENT_WORKFLOW_NOTIFICATION_PROVIDER",
         settings.notification.provider,
@@ -77,20 +89,24 @@ def notification_provider(config_path: Path | None = None) -> NotificationProvid
     if provider_name in {"", "disabled", "none"}:
         return None
 
+    # [3] provider 固有の環境変数、共通環境変数、TOML の command の順で解決する。
     provider_settings = settings.notification.providers.get(provider_name)
     provider_key = re.sub(r"[^A-Z0-9]+", "_", provider_name.upper()).strip("_")
     raw_command = os.environ.get(f"AGENT_WORKFLOW_NOTIFICATION_{provider_key}_COMMAND")
     if not raw_command:
         raw_command = os.environ.get("AGENT_WORKFLOW_NOTIFICATION_COMMAND")
+    # [4] 後方互換のため、未登録名でも command があれば一時的な汎用 provider として扱う。
     if provider_settings is None:
         if not raw_command:
             raise ConfigError(f"notification provider is not configured: {provider_name}")
         provider_settings = NotificationProviderSettings("command", tuple(shlex.split(raw_command)))
 
+    # [5] timeout は一時上書きを優先し、不正値なら provider 設定へ戻す。
     timeout_seconds = _positive_float_override(
         os.environ.get("AGENT_WORKFLOW_NOTIFICATION_TIMEOUT_SECONDS"),
         provider_settings.timeout_seconds,
     )
+    # [6] Codex は隔離オプションを付ける専用実装、それ以外は汎用 command 実装を返す。
     if provider_settings.kind == "codex":
         return CodexNotificationProvider(
             command_prefix=_command_override(raw_command, provider_settings.command),

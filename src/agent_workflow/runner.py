@@ -487,14 +487,27 @@ class WorkflowRunner:
             self.save_state(state)
 
     def notify_state(self, state: RunState, command_template: str | None, statuses: set[str] | None, job_id: str = "") -> str:
+        """完了した run の通知文を生成し、外部の通知 command へ渡す。
+
+        処理フロー:
+        - [1] 通知 command と対象 status を確認する。
+        - [2] LLM provider で最終通知文を生成する。
+        - [3] 生成した本文を Discord summary へ保存する。
+        - [4] placeholder を埋めた通知 command を実行する。
+        - [5] command の失敗内容、または成功を呼び出し元へ返す。
+        """
+        # [1] 送信先がない場合と、通知対象外の status では LLM も起動しない。
         if not command_template:
             return ""
         if statuses is not None and state.status not in statuses:
             return ""
+        # [2] 実行成果物を根拠にした最終通知文を生成し、失敗時は機械文を送らない。
         notification = render_llm_notification(state)
         if notification is None:
             return "LLM notification generation failed"
+        # [3] 外部 command が同じ本文を参照できるよう、確定した通知だけを保存する。
         discord_summary_path(state.summary_path).write_text(notification, encoding="utf-8")
+        # [4] run 情報と通知ファイルの path を安全に展開し、通知 adapter を起動する。
         command = render_notification_command(
             command_template,
             {
@@ -506,6 +519,7 @@ class WorkflowRunner:
             },
         )
         result = subprocess.run(["bash", "-lc", command], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        # [5] 呼び出し元が通知基盤の失敗だけを判別できるよう、空文字を成功値にする。
         if result.returncode != 0:
             return result.stdout.strip() or f"notification command exited with {result.returncode}"
         return ""
@@ -889,21 +903,35 @@ class WorkflowRunner:
         return len(repair_job_statuses) >= AUTO_REPAIR_MAX_ATTEMPTS
 
     def _snapshot_executor_observability(self, state: RunState, started_at: float) -> Path | None:
+        """今回の executor に対応する TAKT 成果物を run directory へ退避する。
+
+        処理フロー:
+        - [1] worktree から今回実行された最新 TAKT run を選ぶ。
+        - [2] snapshot のコピー先を空にする。
+        - [3] trace と monitor をコピーする。
+        - [4] session shadow と usage log をコピーする。
+        - [5] 通知生成に使う Markdown reports をコピーする。
+        - [6] 1件以上コピーできた場合だけ snapshot path を返す。
+        """
+        # [1] executor 開始時刻より古い TAKT run を別runの成果物として除外する。
         if not state.worktree_path:
             return None
         takt_run = self._latest_takt_run(Path(state.worktree_path) / ".takt" / "runs", min_mtime=started_at)
         if takt_run is None:
             return None
+        # [2] retry 時に古いファイルが混ざらないよう、同名 snapshot を作り直す。
         dest = Path(state.run_dir) / "executor_observability" / "takt" / takt_run.name
         if dest.exists():
             shutil.rmtree(dest)
         copied = False
+        # [3] workflow 全体と各stepの状態を示す主要ファイルを保存する。
         for rel in [Path("trace.md"), Path("monitor.json")]:
             source = takt_run / rel
             if source.exists():
                 (dest / rel.parent).mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, dest / rel)
                 copied = True
+        # [4] session error と利用量を通知・調査で参照できるように保存する。
         logs = takt_run / "logs"
         if logs.exists():
             for source in sorted([*logs.glob("*-otel-session-shadow.jsonl"), *logs.glob("*-usage-events.phase.jsonl")]):
@@ -911,6 +939,7 @@ class WorkflowRunner:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
                 copied = True
+        # [5] 実装・検証の意味を LLM 通知へ渡せるよう、Markdown report を保存する。
         reports = takt_run / "reports"
         if reports.exists():
             for source in sorted(reports.glob("*.md")):
@@ -918,6 +947,7 @@ class WorkflowRunner:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
                 copied = True
+        # [6] 空のディレクトリは observability snapshot として扱わない。
         return dest if copied else None
 
     def _executor_observability_summary(self, state: RunState) -> list[str]:
@@ -1164,6 +1194,16 @@ class WorkflowRunner:
         notify_statuses: set[str] | None,
         auto_repair: AutoRepairConfig | None,
     ) -> subprocess.Popen[bytes]:
+        """claim 済み job を、同じ設定を持つ子プロセスで開始する。
+
+        処理フロー:
+        - [1] Python entrypoint と active config path を組み立てる。
+        - [2] state directory と claim 済み job ID を渡す。
+        - [3] 通知 command と対象 status を引き継ぐ。
+        - [4] 自動修復の設定を引き継ぐ。
+        - [5] 独立した process session で子を起動する。
+        """
+        # [1] 親と同じ Python を使い、TUI/CLI が選んだ設定ファイルも明示的に渡す。
         args = [
             sys.executable,
             "-m",
@@ -1172,6 +1212,7 @@ class WorkflowRunner:
         config_file = os.environ.get("AGENT_WORKFLOW_CONFIG_FILE")
         if config_file:
             args.extend(["--config-file", str(Path(config_file).expanduser().absolute())])
+        # [2] 子は queue を再claimせず、指定された running job の設定を読み直す。
         args.extend(
             [
                 "--state-dir",
@@ -1181,13 +1222,16 @@ class WorkflowRunner:
                 job_id,
             ]
         )
+        # [3] 親workerと同じ通知先・status filter を子へ引き継ぐ。
         if notify_command:
             args.extend(["--notify-command", notify_command])
         if notify_statuses is None:
             args.extend(["--notify-statuses", "all"])
         elif notify_statuses:
             args.extend(["--notify-statuses", ",".join(sorted(notify_statuses))])
+        # [4] diagnosis loop の有効化や上限値も同じ CLI 引数へ展開する。
         append_auto_repair_args(args, auto_repair)
+        # [5] timeout 時に子の process group 全体を停止できる session として起動する。
         return subprocess.Popen(args, start_new_session=True)
 
     def _active_worker_job_timed_out(self, child: ActiveWorkerJob) -> bool:
