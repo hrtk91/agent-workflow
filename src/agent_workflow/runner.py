@@ -491,6 +491,10 @@ class WorkflowRunner:
             return ""
         if statuses is not None and state.status not in statuses:
             return ""
+        notification = render_llm_notification(state)
+        if notification is None:
+            return "LLM notification generation failed"
+        discord_summary_path(state.summary_path).write_text(notification, encoding="utf-8")
         command = render_notification_command(
             command_template,
             {
@@ -904,6 +908,13 @@ class WorkflowRunner:
         if logs.exists():
             for source in sorted([*logs.glob("*-otel-session-shadow.jsonl"), *logs.glob("*-usage-events.phase.jsonl")]):
                 target = dest / "logs" / source.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+                copied = True
+        reports = takt_run / "reports"
+        if reports.exists():
+            for source in sorted(reports.glob("*.md")):
+                target = dest / "reports" / source.name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
                 copied = True
@@ -1411,10 +1422,7 @@ def _render_mechanical_summary(state: RunState, task_preview: str) -> str:
 
 
 def render_run_discord_summary(state: RunState, task_preview: str) -> str:
-    """LLM 通知を優先し、生成できなければ機械的 summary を返す。"""
-    llm = render_llm_notification(state)
-    if llm:
-        return llm
+    """通知送信前の内部確認用に機械的 summary を返す。"""
     return _render_mechanical_summary(state, task_preview)
 
 

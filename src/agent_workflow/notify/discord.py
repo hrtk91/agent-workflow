@@ -3,24 +3,15 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-import tempfile
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from agent_workflow.notify.provider import NotificationProvider, notification_provider_from_env
 from agent_workflow.state import RunState, StepState
 
 
-_CODEX_COMMAND = [
-    "codex",
-    "exec",
-    "-m",
-    "gpt-5.6-luna",
-    "--config",
-    "model_reasoning_effort=max",
-]
-_CODEX_TIMEOUT_SECONDS = 120
 _GH_TIMEOUT_SECONDS = 10
 _REPORT_MAX_CHARS = 4000
 _SESSION_ERROR_MAX_CHARS = 2000
@@ -169,16 +160,22 @@ TAKT 進行表:
 """
 
 
-def render_llm_notification(state: RunState) -> str | None:
+def render_llm_notification(
+    state: RunState,
+    provider: NotificationProvider | None = None,
+) -> str | None:
     """RunState と TAKT の成果物から Discord 用通知を生成する。
 
     summary.md、TAKT reports、session-shadow.jsonl、任意の GitHub 情報を収集し、
-    codex exec に構造化された通知の生成を依頼する。通知生成の失敗は workflow
+    設定された CLI provider に通知の生成を依頼する。通知生成の失敗は workflow
     の完了処理へ伝播させず、None を返す。
     """
     try:
         context = _collect_notification_context(state)
-        output = _run_codex(_build_llm_prompt(context))
+        selected_provider = provider or notification_provider_from_env()
+        if selected_provider is None:
+            return None
+        output = selected_provider.generate(_build_llm_prompt(context))
         if output is None:
             return None
         return _validate_notification(output)
@@ -546,37 +543,6 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     return value
-
-
-def _run_codex(prompt: str) -> str | None:
-    """一時ファイルを stdin にして codex exec を実行する。"""
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w+",
-            encoding="utf-8",
-            suffix=".md",
-        ) as prompt_file:
-            prompt_file.write(prompt)
-            prompt_file.flush()
-            prompt_file.seek(0)
-            result = subprocess.run(
-                _CODEX_COMMAND,
-                stdin=prompt_file,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=_CODEX_TIMEOUT_SECONDS,
-                check=False,
-            )
-    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
-        return None
-    if result.returncode != 0:
-        return None
-    stdout = result.stdout
-    if not isinstance(stdout, str) or not stdout.strip():
-        return None
-    return stdout
 
 
 def _validate_notification(text: str) -> str | None:

@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -145,6 +146,9 @@ def run_merge_approved(
     method: str = "squash",
     delete_branch: bool = True,
     allow_no_checks: bool = False,
+    repo_path: Path | None = None,
+    verify_command: str | None = None,
+    timeout_seconds: float = 7200,
 ) -> str:
     decision = json.loads(decision_file.expanduser().read_text(encoding="utf-8"))
     repo, pr_number, base_branch, base_sha, head_sha = validate_decision_shape(decision, max_age_seconds)
@@ -159,16 +163,30 @@ def run_merge_approved(
     current_base_sha = gh_base_sha(repo, base_branch)
     if current_base_sha != base_sha:
         raise MergeBlocked(f"base branch advanced: decision={base_sha} actual={current_base_sha}")
+    if pr.get("state") != "OPEN":
+        raise MergeBlocked(f"PR is not open: {pr.get('state')}")
     if pr.get("isDraft") is True:
         raise MergeBlocked("draft PR cannot be merged")
     merge_state = str(pr.get("mergeStateStatus") or "")
     if merge_state in UNACCEPTABLE_MERGE_STATES:
         raise MergeBlocked(f"PR merge state is not acceptable: {merge_state}")
+    mergeable = str(pr.get("mergeable") or "")
+    if mergeable != "MERGEABLE":
+        raise MergeBlocked(f"PR is not mergeable: {mergeable or 'unknown'}")
 
     checks = gh_pr_checks(repo, pr_number)
-    check_blockers = check_blocking_reasons(checks, allow_no_checks or decision_allows_no_checks(decision))
-    if check_blockers:
-        raise MergeBlocked("; ".join(item["reason"] for item in check_blockers))
+    if checks:
+        check_blockers = check_blocking_reasons(checks, allow_no_checks=False)
+        if check_blockers:
+            raise MergeBlocked("; ".join(item["reason"] for item in check_blockers))
+    elif not allow_no_checks:
+        recheck_local_qc(
+            repo_path=repo_path,
+            head_sha=head_sha,
+            head_branch=str(pr.get("headRefName") or ""),
+            verify_command=verify_command,
+            timeout_seconds=timeout_seconds,
+        )
 
     url = str(pr.get("url") or f"https://github.com/{repo}/pull/{pr_number}")
     if not execute:
@@ -222,11 +240,35 @@ def parse_approved_at(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def decision_allows_no_checks(decision: dict[str, Any]) -> bool:
-    local_qc = decision.get("localQc")
-    if isinstance(local_qc, dict) and local_qc.get("status") == "succeeded":
-        return True
-    return bool(decision.get("allowNoChecks"))
+def recheck_local_qc(
+    repo_path: Path | None,
+    head_sha: str,
+    head_branch: str,
+    verify_command: str | None,
+    timeout_seconds: float,
+) -> None:
+    if repo_path is None or not verify_command:
+        raise MergeBlocked(
+            "no PR checks reported; pass --repo-path and --verify-command to re-run local QC, "
+            "or explicitly pass --allow-no-checks"
+        )
+    with tempfile.TemporaryDirectory(prefix="agent-workflow-merge-qc-") as temp_dir:
+        output_dir = Path(temp_dir)
+        logs_dir = output_dir / "logs"
+        logs_dir.mkdir()
+        result = run_local_qc(
+            repo_path=repo_path.expanduser().resolve(),
+            head_sha=head_sha,
+            head_branch=head_branch,
+            output_dir=output_dir,
+            logs_dir=logs_dir,
+            verify_command=verify_command,
+            timeout_seconds=timeout_seconds,
+            keep_worktree=False,
+        )
+    if result["status"] != "succeeded":
+        error = result.get("error") or f"exit={result.get('exitCode')}"
+        raise MergeBlocked(f"local QC re-check {result['status']}: {error}")
 
 
 def gh_pr_view(repo: str, pr_number: int) -> dict[str, Any]:

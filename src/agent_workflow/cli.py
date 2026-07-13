@@ -124,7 +124,10 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--max-age-seconds", type=int, default=int(os.environ.get("HERMES_MERGE_DECISION_MAX_AGE_SECONDS", "86400")))
     merge.add_argument("--method", choices=["merge", "squash", "rebase"], default="squash")
     merge.add_argument("--keep-branch", action="store_true")
-    merge.add_argument("--allow-no-checks", action="store_true", help="allow live PR with no GitHub checks even without local QC in decision")
+    merge.add_argument("--repo-path", type=Path, help="local git repository used to re-run QC when the live PR has no checks")
+    merge.add_argument("--verify-command", help="local QC command to re-run at the live PR head when no checks are reported")
+    merge.add_argument("--timeout-seconds", type=float, default=7200)
+    merge.add_argument("--allow-no-checks", action="store_true", help="explicitly allow a live PR with no GitHub checks and skip local QC re-check")
 
     return parser
 
@@ -390,6 +393,9 @@ def main(argv: list[str] | None = None) -> int:
                     method=args.method,
                     delete_branch=not args.keep_branch,
                     allow_no_checks=args.allow_no_checks,
+                    repo_path=args.repo_path,
+                    verify_command=args.verify_command,
+                    timeout_seconds=args.timeout_seconds,
                 )
             )
             return 0

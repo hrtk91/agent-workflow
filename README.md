@@ -122,6 +122,26 @@ Notification commands support `{job_id}`, `{run_id}`, `{status}`,
 are sent only for `blocked`, `failed`, `qc_failed`, and `timed_out`; use
 `--notify-statuses all` when a worker should also report successful runs.
 
+The internal Discord summary is mechanical until a matching notification is
+sent. At send time, the notification adapter generates the final text with an
+isolated Codex invocation. Configure another subscription-backed CLI through a
+named command that reads the prompt from stdin and writes the notification to
+stdout:
+
+```bash
+export AGENT_WORKFLOW_NOTIFICATION_PROVIDER=claude
+export AGENT_WORKFLOW_NOTIFICATION_CLAUDE_COMMAND='claude --print'
+```
+
+The provider name is arbitrary, so the same interface can wrap Grok or another
+CLI. Codex is the default. Its model, reasoning effort, and timeout can be set
+with `AGENT_WORKFLOW_NOTIFICATION_CODEX_MODEL`,
+`AGENT_WORKFLOW_NOTIFICATION_CODEX_REASONING_EFFORT`, and
+`AGENT_WORKFLOW_NOTIFICATION_TIMEOUT_SECONDS`. Codex runs in a temporary empty
+directory with a read-only sandbox, no inherited shell environment, no loaded
+user rules or configuration, and no persisted session. Custom provider commands
+must provide their own equivalent isolation.
+
 Enable diagnosis-loop dispatch when the worker should enqueue a diagnosis task
 after a normal workflow reaches a terminal failure:
 
@@ -246,9 +266,17 @@ SHA, base SHA, draft state, merge state, and live checks before doing anything.
 The default is dry-run; pass `--execute` to merge.
 
 ```bash
-aw merge --decision /path/to/merge-decision.json
-aw merge --decision /path/to/merge-decision.json --execute
+aw merge --decision /path/to/merge-decision.json \
+  --repo-path /path/to/repo \
+  --verify-command 'bashx scripts/agent-workflow-qc.bashx'
+aw merge --decision /path/to/merge-decision.json --execute \
+  --repo-path /path/to/repo \
+  --verify-command 'bashx scripts/agent-workflow-qc.bashx'
 ```
+
+When the live PR has no GitHub checks, `aw merge` re-runs the supplied local QC
+at the approved head SHA. Use `--allow-no-checks` only to explicitly skip that
+re-check.
 
 ## OpenTelemetry
 
