@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
+from agent_workflow.analytics import AnalyticsStore
 from agent_workflow.notify.discord import render_llm_notification
 from agent_workflow.state import RunState, StepState
 from agent_workflow.tracing import TraceRecorder, trace_enabled_hint
@@ -39,6 +40,7 @@ class RunnerConfig:
     executor_bin: str = "takt"
     provider: str | None = None
     model: str | None = None
+    task_type: str = "unspecified"
     base_ref: str | None = None
     purpose: str = "workflow"
     repair_for_run_id: str | None = None
@@ -79,6 +81,7 @@ class WorkflowRunner:
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        self.analytics = AnalyticsStore(self.db_path)
 
     def run_new(self, config: RunnerConfig) -> RunState:
         config = self._normalize_config(config)
@@ -104,6 +107,7 @@ class WorkflowRunner:
             executor_bin=config.executor_bin,
             provider=config.provider,
             model=config.model,
+            task_type=config.task_type,
             base_ref=config.base_ref,
             purpose=config.purpose,
             repair_for_run_id=config.repair_for_run_id,
@@ -511,10 +515,13 @@ class WorkflowRunner:
         return RunState.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
     def save_state(self, state: RunState) -> None:
+        """Persist JSON state, the operational index, and normalized analytics."""
+
         state.updated_at = utc_now()
         state.run_path.mkdir(parents=True, exist_ok=True)
         (state.run_path / "state.json").write_text(json.dumps(asdict(state), indent=2, sort_keys=True) + "\n", encoding="utf-8")
         self._upsert_job(state)
+        self.analytics.record_state(state)
 
     def _run_from(self, state: RunState, start_index: int) -> RunState:
         tracer = TraceRecorder(Path(state.trace_path))
@@ -582,6 +589,8 @@ class WorkflowRunner:
         step.attempts += 1
         step.started_at = utc_now()
         step.finished_at = None
+        step.exit_code = None
+        step.timed_out = False
         step.error = None
         state.current_step = step.name
         self.save_state(state)
@@ -599,6 +608,11 @@ class WorkflowRunner:
                 run_id=state.run_id,
                 repo_path=state.repo_path,
                 workflow=state.workflow,
+                provider=state.provider or "",
+                model=state.model or "",
+                task_type=state.task_type,
+                purpose=state.purpose,
+                executor_bin=state.executor_bin,
                 attempt=step.attempts,
                 otel_hint=trace_enabled_hint(),
             ) as span:
@@ -711,6 +725,9 @@ class WorkflowRunner:
             f"- repo: `{state.repo_path}`",
             f"- worktree: `{state.worktree_path or ''}`",
             f"- workflow: `{state.workflow}`",
+            f"- provider: `{state.provider or ''}`",
+            f"- model: `{state.model or ''}`",
+            f"- task_type: `{state.task_type}`",
             f"- purpose: `{state.purpose}`",
             f"- repair_for_run_id: `{state.repair_for_run_id or ''}`",
             f"- base_ref: `{state.base_ref or ''}`",
@@ -1104,6 +1121,7 @@ class WorkflowRunner:
             executor_bin=config.executor_bin,
             provider=config.provider,
             model=config.model,
+            task_type=config.task_type.strip() or "unspecified",
             base_ref=config.base_ref,
             purpose=config.purpose,
             repair_for_run_id=config.repair_for_run_id,
@@ -1676,6 +1694,7 @@ def config_to_dict(config: RunnerConfig) -> dict[str, object]:
         "executor_bin": config.executor_bin,
         "provider": config.provider,
         "model": config.model,
+        "task_type": config.task_type,
         "base_ref": config.base_ref,
         "purpose": config.purpose,
         "repair_for_run_id": config.repair_for_run_id,
@@ -1695,6 +1714,7 @@ def config_from_dict(data: dict[str, object], state_dir: Path) -> RunnerConfig:
         executor_bin=str(data.get("executor_bin") or "takt"),
         provider=str(data["provider"]) if data.get("provider") else None,
         model=str(data["model"]) if data.get("model") else None,
+        task_type=str(data.get("task_type") or "unspecified"),
         base_ref=str(data["base_ref"]) if data.get("base_ref") else None,
         purpose=str(data.get("purpose") or "workflow"),
         repair_for_run_id=str(data["repair_for_run_id"]) if data.get("repair_for_run_id") else None,
@@ -1712,6 +1732,7 @@ def runner_config_from_state(state: RunState, state_dir: Path) -> RunnerConfig:
         executor_bin=state.executor_bin,
         provider=state.provider,
         model=state.model,
+        task_type=state.task_type,
         base_ref=state.base_ref,
         purpose=state.purpose,
         repair_for_run_id=state.repair_for_run_id,

@@ -34,6 +34,7 @@ class RunState:
     executor_bin: str
     provider: str | None = None
     model: str | None = None
+    task_type: str = "unspecified"
     base_ref: str | None = None
     purpose: str = "workflow"
     repair_for_run_id: str | None = None

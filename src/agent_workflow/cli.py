@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
 
+from agent_workflow.analytics import render_text_report
 from agent_workflow.merge import MergeBlocked, MergeGateConfig, run_merge_approved, run_merge_gate
 from agent_workflow.repair import REPAIR_ACTIONS, REPAIR_CATEGORIES, REPAIR_RISKS, RepairDraftInput, RepairManager
 from agent_workflow.runner import (
@@ -15,6 +17,7 @@ from agent_workflow.runner import (
     WorkflowRunner,
     default_state_dir,
 )
+from agent_workflow.telemetry import export_report_to_otel
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -70,6 +73,14 @@ def build_parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="show run status")
     status.add_argument("--run-id")
     status.add_argument("--include-repair", action="store_true", help="include internal repair-diagnosis jobs in recent status output")
+
+    report = sub.add_parser("report", help="report QC success and run metrics from SQLite")
+    report.add_argument("--group-by", default="model", help="comma-separated dimensions: model, provider, task_type, workflow, repo, status")
+    report.add_argument("--repo", type=Path, help="filter by repository path")
+    report.add_argument("--since", help="include runs created at or after this ISO date/time")
+    report.add_argument("--format", choices=["text", "json"], default="text")
+    report.add_argument("--export-otel", action="store_true", help="export the grouped report as OTLP/HTTP gauges")
+    report.add_argument("--include-repair", action="store_true", help="include repair and repair-action runs")
 
     summary = sub.add_parser("summary", help="print summary path")
     summary.add_argument("--run-id", required=True)
@@ -141,6 +152,7 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--executor-bin", default="takt")
     parser.add_argument("--provider")
     parser.add_argument("--model")
+    parser.add_argument("--task-type", default="unspecified", help="task classification used by analytics reports")
     parser.add_argument("--base-ref")
     parser.add_argument("--keep-worktree", action="store_true", default=True)
     add_notify_args(parser)
@@ -196,6 +208,7 @@ def config_from_args(args: argparse.Namespace) -> RunnerConfig:
         executor_bin=getattr(args, "executor_bin", "takt"),
         provider=getattr(args, "provider", None),
         model=getattr(args, "model", None),
+        task_type=getattr(args, "task_type", "unspecified"),
         base_ref=getattr(args, "base_ref", None),
     )
 
@@ -322,6 +335,24 @@ def main(argv: list[str] | None = None) -> int:
             return run_exit_code(state.status, notify_error)
         if args.command == "status":
             print(runner.status(args.run_id, include_repair=args.include_repair))
+            return 0
+        if args.command == "report":
+            # Rebuild only missing or stale analytics rows before querying SQLite.
+            runner.analytics.refresh_from_runs(runner.runs_dir)
+            group_by = [field.strip() for field in args.group_by.split(",") if field.strip()]
+            repo_path = str(args.repo.expanduser().resolve()) if args.repo else None
+            report_data = runner.analytics.report(
+                group_by=group_by,
+                repo_path=repo_path,
+                since=args.since,
+                include_repair=args.include_repair,
+            )
+            if args.export_otel:
+                export_report_to_otel(report_data)
+            if args.format == "json":
+                print(json.dumps(report_data, indent=2, sort_keys=True))
+            else:
+                print(render_text_report(report_data))
             return 0
         if args.command == "summary":
             summary_path = Path(runner.load_state(args.run_id).summary_path)

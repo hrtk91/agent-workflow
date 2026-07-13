@@ -56,6 +56,7 @@ Step state is stored in:
 ~/.local/state/agent-workflow/
   jobs.sqlite
   runs/<run-id>/state.json
+  runs/<run-id>/task-identity.json
   runs/<run-id>/summary.md
   runs/<run-id>/trace.jsonl
   runs/<run-id>/logs/*.log
@@ -173,6 +174,37 @@ Show recent queued jobs and runs:
 aw status
 ```
 
+## Local Analytics
+
+Tag runs when model and task-type comparisons are needed:
+
+```bash
+aw run \
+  --repo /path/to/repo \
+  --task-file /path/to/task.md \
+  --verify-command 'mise run check-all' \
+  --provider openai \
+  --model gpt-example \
+  --task-type bug_fix
+```
+
+Report first-pass QC, eventual QC, QC attempts, elapsed time, and changed lines from `jobs.sqlite`:
+
+```bash
+aw report
+aw report --group-by model,task_type
+aw report --repo /path/to/repo --since 2026-07-01
+aw report --group-by model,task_type --format json
+```
+
+`aw report` refreshes analytics rows from saved `state.json` and `trace.jsonl` files before querying. New runs are recorded as they execute. The analytics tables are:
+
+- `run_metrics`: run configuration, QC outcomes, duration, task identity, and final change size
+- `step_attempts`: one row per executor, QC, or other workflow step attempt
+- `analytics_schema_migrations`: analytics schema version history
+
+Repair and repair-action runs are excluded by default. Pass `--include-repair` to include them.
+
 Remove a run worktree:
 
 ```bash
@@ -264,8 +296,20 @@ always available without external services and includes:
 - timeout flag
 - stdout/stderr log paths
 
-The JSONL format is intentionally close to OTel span fields so an OTLP exporter
-can be added without changing the runner state model.
+`trace.jsonl` is a local artifact; step spans are not sent to OTLP.
+
+Export a grouped SQLite report as OpenTelemetry gauges over OTLP/HTTP:
+
+```bash
+python3 -m pip install '.[otel]'
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+aw report --group-by model,task_type --export-otel
+```
+
+The export includes run/QC counts, first-pass and eventual QC rates, median QC
+attempts, median elapsed time, and median changed lines. Report group values are
+metric attributes. SQLite remains the durable source; OTLP export occurs only
+when `--export-otel` is passed.
 
 ## Tests
 

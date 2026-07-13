@@ -10,6 +10,8 @@ from typing import Iterator
 
 
 class TraceRecorder:
+    """Append durable OTel-shaped step spans without requiring the OTel SDK."""
+
     def __init__(self, path: Path, trace_id: str | None = None) -> None:
         self.path = path
         self.trace_id = trace_id or secrets.token_hex(16)
@@ -17,6 +19,8 @@ class TraceRecorder:
 
     @contextmanager
     def span(self, name: str, **attrs: object) -> Iterator[dict[str, object]]:
+        """Record one step attempt even when the wrapped operation raises."""
+
         span_id = secrets.token_hex(8)
         start_ns = time.time_ns()
         data: dict[str, object] = {"span_id": span_id, "attributes": attrs}
@@ -51,7 +55,9 @@ class TraceRecorder:
 
 
 def trace_enabled_hint() -> str:
-    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+    """Describe configured telemetry without persisting endpoint credentials."""
+
+    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") or os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
     if endpoint:
-        return f"OTLP endpoint requested via OTEL_EXPORTER_OTLP_ENDPOINT={endpoint}; local trace.jsonl is always written"
+        return "OTLP endpoint configured; local trace.jsonl is always written"
     return "local trace.jsonl is always written"
