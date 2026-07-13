@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import sys
-import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,9 +77,6 @@ class FakeRemoteSpan:
 
 
 class FakeTraceSession:
-    trace_id = "a" * 32
-    root_span_id = "b" * 16
-
     def __init__(self) -> None:
         self.started: list[tuple[str, dict[str, object], FakeRemoteSpan]] = []
         self.finished: list[tuple[FakeRemoteSpan, str, str, dict[str, object]]] = []
@@ -162,7 +157,7 @@ class OtelReportExporterTest(unittest.TestCase):
         self.assertIn("configured", hint)
         self.assertNotIn(endpoint, hint)
 
-    def test_trace_recorder_mirrors_step_to_jsonl_and_remote_session(self) -> None:
+    def test_trace_recorder_exports_step_directly_to_remote_session(self) -> None:
         session = FakeTraceSession()
         captured_run_attributes: dict[str, object] = {}
 
@@ -170,27 +165,23 @@ class OtelReportExporterTest(unittest.TestCase):
             captured_run_attributes.update(attributes)
             return session
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            trace_path = Path(temp_dir) / "trace.jsonl"
-            recorder = TraceRecorder(
-                trace_path,
-                run_attributes={"run_id": "run-1", "model": "gpt-test"},
-                otel_factory=factory,
-            )
-            with recorder.span("agent_workflow.step.run_qc", attempt=2, task_type="bug_fix") as span:
-                span_attributes = cast(dict[str, object], span["attributes"])
-                span["attributes"] = {**span_attributes, "exit_code": 0, "timed_out": False}
-            recorder.close("succeeded")
-            local_record = json.loads(trace_path.read_text(encoding="utf-8"))
+        recorder = TraceRecorder(
+            run_attributes={"run_id": "run-1", "model": "gpt-test"},
+            otel_factory=factory,
+        )
+        with recorder.span("agent_workflow.step.run_qc", attempt=2, task_type="bug_fix") as span:
+            span_attributes = cast(dict[str, object], span["attributes"])
+            span["attributes"] = {**span_attributes, "exit_code": 0, "timed_out": False}
+        recorder.close("succeeded")
 
-        self.assertEqual({"run_id": "run-1", "model": "gpt-test"}, captured_run_attributes)
-        self.assertEqual("a" * 32, local_record["trace_id"])
-        self.assertEqual("b" * 16, local_record["parent_span_id"])
-        self.assertEqual("0000000000000001", local_record["span_id"])
-        self.assertEqual("bug_fix", local_record["attributes"]["agent_workflow.task.type"])
-        self.assertEqual(0, local_record["attributes"]["process.exit.code"])
+        self.assertEqual(
+            {"run_id": "run-1", "model": "gpt-test"},
+            captured_run_attributes,
+        )
         self.assertEqual("agent_workflow.step.run_qc", session.started[0][0])
+        self.assertEqual("bug_fix", session.started[0][1]["agent_workflow.task.type"])
         self.assertEqual("OK", session.finished[0][1])
+        self.assertEqual(0, session.finished[0][3]["process.exit.code"])
         self.assertEqual("succeeded", session.run_status)
 
     def test_trace_runtime_is_disabled_without_a_trace_endpoint(self) -> None:
@@ -199,12 +190,11 @@ class OtelReportExporterTest(unittest.TestCase):
 
     def test_trace_recorder_exports_error_status_for_failed_attempt_and_run(self) -> None:
         session = FakeTraceSession()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            recorder = TraceRecorder(Path(temp_dir) / "trace.jsonl", otel_factory=lambda _attrs: session)
-            with recorder.span("agent_workflow.step.run_qc", attempt=1) as span:
-                span["status_code"] = "ERROR"
-                span["status_message"] = "QC failed"
-            recorder.close("qc_failed")
+        recorder = TraceRecorder(otel_factory=lambda _attrs: session)
+        with recorder.span("agent_workflow.step.run_qc", attempt=1) as span:
+            span["status_code"] = "ERROR"
+            span["status_message"] = "QC failed"
+        recorder.close("qc_failed")
 
         self.assertEqual("ERROR", session.finished[0][1])
         self.assertEqual("QC failed", session.finished[0][2])

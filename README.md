@@ -18,8 +18,9 @@ agent-workflow
   per-run worktree
   executor
   QC command
-  state.json / jobs.sqlite
-  summary.md / trace.jsonl
+  jobs.sqlite (run state / step attempts)
+  summary.md / logs
+  optional OTLP export
 ```
 
 Hermes should normally enqueue work and exit quickly. Long-running execution is
@@ -50,17 +51,23 @@ Each run records these steps:
 - `run_qc`
 - `write_summary`
 
-Step state is stored in:
+Run state and step-attempt history use SQLite as the single source of truth.
+Human-readable summaries and command logs remain files:
 
 ```text
 ~/.local/state/agent-workflow/
-  jobs.sqlite
-  runs/<run-id>/state.json
+  jobs.sqlite                       queue / runs / run_steps / step_attempts
+  runs/<run-id>/task/*              copied task packet
   runs/<run-id>/summary.md
-  runs/<run-id>/trace.jsonl
   runs/<run-id>/logs/*.log
+  runs/<run-id>/executor_observability/*
   worktrees/<run-id>/repo
 ```
+
+`state.json` and `trace.jsonl` are not created for new runs. On the first
+writer-side startup after upgrading, existing `state.json` snapshots are
+imported into SQLite once. Legacy files are left untouched as historical
+artifacts, but they are no longer read after the migration completes.
 
 Executor success is not workflow success. The run is only `succeeded` after the
 explicit QC command passes. If QC fails, the runner returns to the executor and
@@ -170,7 +177,8 @@ aw worker --interval-seconds 60 --parallelism 1 --repo-parallelism 1 \
 ```
 
 The diagnosis job is a normal queued `aw` run with `purpose=repair`. It reads
-the failed run summary, logs, trace, and worktree, then must call
+the failed run through `aw report --run-id`, plus its summary, logs, and
+worktree, then must call
 `aw repair draft` to create a validated handoff artifact. Diagnosis jobs do not
 recursively create more diagnosis jobs, and diagnosis-job failures are not sent
 through the normal workflow notification command. When a diagnosis job succeeds
@@ -234,11 +242,28 @@ aw report --repo /path/to/repo --since 2026-07-01
 aw report --group-by model,task_type --format json
 ```
 
-`aw report` opens SQLite in read-only mode and never creates or updates analytics rows. If the database or analytics schema does not exist yet, it returns an empty report without creating either one. New runs are recorded as they execute. The analytics tables are:
+Inspect one run's current step state and complete attempt history without
+opening an internal state file:
 
-- `run_metrics`: run configuration, QC outcomes, duration, task identity, and final change size
-- `step_attempts`: one row per executor, QC, or other workflow step attempt
-- `analytics_schema_migrations`: analytics schema version history
+```bash
+aw report --run-id <run-id>
+aw report --run-id <run-id> --format json
+```
+
+`aw report` opens SQLite in read-only mode and never creates, migrates, or
+updates rows. If the database or current schema does not exist yet, aggregate
+reporting returns an empty report without creating either one. Writer commands
+such as `aw run`, `aw worker`, and `aw status` initialize the schema and perform
+the one-time legacy import. The canonical tables are:
+
+- `queue`: queued worker jobs
+- `runs`: current run state, configuration, duration, task identity, and final change size
+- `run_steps`: current resumable state for every workflow step
+- `step_attempts`: one raw row per attempt, including status, timing, exit/error, and log paths
+- `storage_schema_migrations`: storage schema and legacy-import version history
+
+First-pass QC, eventual QC, and attempt counts are derived by the reporter from
+`step_attempts`; they are not stored as a second set of mutable aggregate rows.
 
 Repair and repair-action runs are excluded by default. Pass `--include-repair` to include them.
 
@@ -329,33 +354,23 @@ re-check.
 
 ## OpenTelemetry
 
-Every step writes one OpenTelemetry-shaped span record to `trace.jsonl`. This is
-always available without external services and includes:
-
-- `trace_id`
-- `span_id`
-- step name
-- duration
-- status code
-- exit code
-- timeout flag
-- stdout/stderr log paths
-
-`trace.jsonl` is always retained as the durable local trace. When a trace OTLP
-endpoint is configured, the same invocation is also exported as one
+SQLite retains the durable run and attempt facts used by `aw report`. When a
+trace OTLP endpoint is configured, each invocation is exported directly as one
 `agent_workflow.run` span with a child span for every step attempt:
 
 ```bash
 python3 -m pip install '.[otel]'
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
-aw run --repo /path/to/repo --task /path/to/task.md --workflow implementation --verify 'pytest'
+aw run --repo /path/to/repo --task-file /path/to/task.md \
+  --workflow implementation --verify-command 'pytest'
 ```
 
 The root and step spans include the requested model, provider, task type,
 workflow, run status, attempt number, command result, and timeout state. A
 resume or retry creates a new run span and exports only the attempts executed by
-that invocation. Set `OTEL_TRACES_EXPORTER=none` to retain local JSONL without
-remote trace export.
+that invocation. Without an endpoint, tracing is a no-op. Set
+`OTEL_TRACES_EXPORTER=none` to explicitly disable remote trace export; no local
+trace file is written.
 
 Export a grouped SQLite report as OpenTelemetry gauges over OTLP/HTTP:
 

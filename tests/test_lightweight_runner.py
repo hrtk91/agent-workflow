@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from dataclasses import asdict
 from unittest import mock
 from pathlib import Path
 
@@ -21,6 +22,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from agent_workflow.state import RunState, StepState
 from agent_workflow.runner import ActiveWorkerJob, AutoRepairConfig, RunnerConfig, WorkflowRunner, run_logged
+from agent_workflow.storage import RunStore
 
 
 class LightweightRunnerTest(unittest.TestCase):
@@ -55,7 +57,7 @@ class LightweightRunnerTest(unittest.TestCase):
             ).fetchall()
         self.assertEqual([("existing_jobs",)], tables)
 
-    def test_success_writes_state_summary_trace_and_sqlite(self) -> None:
+    def test_success_writes_summary_and_canonical_sqlite_state(self) -> None:
         result = self._aw(
             "run",
             "--repo",
@@ -99,41 +101,59 @@ class LightweightRunnerTest(unittest.TestCase):
         )
         self.assertEqual(1, len(report_snapshots))
         self.assertIn("fixture implementation", report_snapshots[0].read_text())
-        trace_rows = [json.loads(line) for line in Path(state["trace_path"]).read_text().splitlines()]
-        self.assertEqual(["OK"] * 5, [row["status"]["code"] for row in trace_rows])
-        self.assertEqual({"gpt-test"}, {row["attributes"]["gen_ai.request.model"] for row in trace_rows})
-        self.assertEqual({"bug_fix"}, {row["attributes"]["agent_workflow.task.type"] for row in trace_rows})
-        self.assertEqual({"workflow"}, {row["attributes"]["agent_workflow.run.purpose"] for row in trace_rows})
+        self.assertFalse((summary.parent / "state.json").exists())
+        self.assertFalse((summary.parent / "trace.jsonl").exists())
 
         conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
-        row = conn.execute("select status, summary_path from jobs where run_id = ?", (state["run_id"],)).fetchone()
-        self.assertEqual(("succeeded", str(summary)), row)
-        metric = conn.execute(
+        run = conn.execute(
             """
-            select provider, model, task_type, first_pass_qc, eventual_qc,
-                   executor_attempts, qc_attempts, changed_files, additions, deletions
-            from run_metrics where run_id = ?
+            select status, summary_path, provider, model, task_type,
+                   changed_files, additions, deletions
+            from runs where run_id = ?
             """,
             (state["run_id"],),
         ).fetchone()
-        self.assertEqual(("openai", "gpt-test", "bug_fix", 1, 1, 1, 1), metric[:7])
-        self.assertGreater(metric[7], 0)
-        self.assertGreater(metric[8] + metric[9], 0)
+        self.assertEqual(("succeeded", str(summary), "openai", "gpt-test", "bug_fix"), run[:5])
+        self.assertGreater(run[5], 0)
+        self.assertGreater(run[6] + run[7], 0)
         attempts = conn.execute(
             "select step_name, attempt, status from step_attempts where run_id = ? order by step_name",
             (state["run_id"],),
         ).fetchall()
         self.assertEqual(5, len(attempts))
         self.assertIn(("run_qc", 1, "succeeded"), attempts)
+        tables = {
+            row[0]
+            for row in conn.execute("select name from sqlite_master where type = 'table'").fetchall()
+        }
+        self.assertTrue({"runs", "run_steps", "step_attempts", "queue"}.issubset(tables))
+        self.assertTrue({"jobs", "run_metrics"}.isdisjoint(tables))
+
+        detail = json.loads(
+            self._aw("report", "--run-id", state["run_id"], "--format", "json").stdout
+        )
+        self.assertEqual("succeeded", detail["run"]["status"])
+        self.assertEqual(5, len(detail["steps"]))
+        self.assertEqual(5, len(detail["attempts"]))
+        executor_attempt = next(
+            attempt for attempt in detail["attempts"] if attempt["step_name"] == "run_executor"
+        )
+        self.assertTrue(Path(executor_attempt["stdout_path"]).is_file())
+        self.assertTrue(Path(executor_attempt["stderr_path"]).is_file())
+        self.assertIn(
+            "run_qc#1\tsucceeded",
+            self._aw("report", "--run-id", state["run_id"]).stdout,
+        )
+        self.assertIn("stdout:", self._aw("report", "--run-id", state["run_id"]).stdout)
         timing_before_cleanup = conn.execute(
-            "select finished_at, elapsed_seconds from run_metrics where run_id = ?",
+            "select finished_at, elapsed_seconds from runs where run_id = ?",
             (state["run_id"],),
         ).fetchone()
-        change_stats_before_human_edit = metric[7:]
+        change_stats_before_human_edit = run[5:]
         Path(state["worktree_path"], "human-edit.txt").write_text("not agent output\n", encoding="utf-8")
         self._aw("report")
         change_stats_after_human_edit = conn.execute(
-            "select changed_files, additions, deletions from run_metrics where run_id = ?",
+            "select changed_files, additions, deletions from runs where run_id = ?",
             (state["run_id"],),
         ).fetchone()
         self.assertEqual(change_stats_before_human_edit, change_stats_after_human_edit)
@@ -145,7 +165,7 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertIn("worktree: ``", cleaned_summary_text)
         self.assertIn("## executor observability", cleaned_summary_text)
         timing_after_cleanup = conn.execute(
-            "select finished_at, elapsed_seconds from run_metrics where run_id = ?",
+            "select finished_at, elapsed_seconds from runs where run_id = ?",
             (state["run_id"],),
         ).fetchone()
         self.assertEqual(timing_before_cleanup, timing_after_cleanup)
@@ -209,7 +229,7 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertIn("resume after interruption", discord_text)
 
         conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
-        row = conn.execute("select status, current_step from jobs where run_id = ?", (state.run_id,)).fetchone()
+        row = conn.execute("select status, current_step from runs where run_id = ?", (state.run_id,)).fetchone()
         self.assertEqual(("interrupted", "run_executor"), row)
 
     def test_cli_sigint_marks_run_interrupted_and_prints_summary(self) -> None:
@@ -238,14 +258,14 @@ class LightweightRunnerTest(unittest.TestCase):
             text=True,
         )
         self.addCleanup(lambda: process.poll() is None and process.kill())
-        state_path = self._wait_for_running_step(state_dir, "run_executor")
+        run_dir = self._wait_for_running_step(state_dir, "run_executor")
 
         process.send_signal(signal.SIGINT)
         stdout, stderr = process.communicate(timeout=10)
 
         self.assertEqual(130, process.returncode, stderr)
         summary = Path(stdout.strip())
-        self.assertEqual(state_path.with_name("summary.md"), summary)
+        self.assertEqual(run_dir / "summary.md", summary)
         state = self._state(summary)
         self.assertEqual("interrupted", state["status"])
         self.assertEqual("run_executor", state["current_step"])
@@ -317,13 +337,12 @@ class LightweightRunnerTest(unittest.TestCase):
             [(1, "qc_failed", "qc_failure"), (2, "qc_failed", "qc_failure"), (3, "succeeded", None)],
             qc_attempts,
         )
-        metric = conn.execute(
-            "select first_pass_qc, eventual_qc, qc_attempts, task_sha256, task_bytes from run_metrics where run_id = ?",
+        run_facts = conn.execute(
+            "select task_sha256, task_bytes from runs where run_id = ?",
             (state["run_id"],),
         ).fetchone()
-        self.assertEqual((0, 1, 3), metric[:3])
-        self.assertIsNotNone(metric[3])
-        self.assertGreater(metric[4], 0)
+        self.assertIsNotNone(run_facts[0])
+        self.assertGreater(run_facts[1], 0)
 
         report = self._aw("report", "--group-by", "model,task_type", "--format", "json")
         report_data = json.loads(report.stdout)
@@ -339,18 +358,20 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertIn("0.0%", text_report.stdout)
         self.assertIn("100.0%", text_report.stdout)
 
-        # reportは読み取り専用なので、分析行を削除してもrun成果物から復元しない。
+        # reportは読み取り専用なので、削除したattempt factsを成果物から復元しない。
         conn.execute("delete from step_attempts where run_id = ?", (state["run_id"],))
-        conn.execute("delete from run_metrics where run_id = ?", (state["run_id"],))
         conn.commit()
-        empty_report = self._aw("report", "--group-by", "model,task_type", "--format", "json")
-        self.assertEqual([], json.loads(empty_report.stdout)["rows"])
+        report_without_attempts = self._aw(
+            "report", "--group-by", "model,task_type", "--format", "json"
+        )
+        row_without_attempts = json.loads(report_without_attempts.stdout)["rows"][0]
+        self.assertEqual(0, row_without_attempts["qc_runs"])
+        self.assertIsNone(row_without_attempts["first_pass_qc_rate"])
         self.assertEqual(
-            (0, 0),
-            (
-                conn.execute("select count(*) from run_metrics where run_id = ?", (state["run_id"],)).fetchone()[0],
-                conn.execute("select count(*) from step_attempts where run_id = ?", (state["run_id"],)).fetchone()[0],
-            ),
+            0,
+            conn.execute(
+                "select count(*) from step_attempts where run_id = ?", (state["run_id"],)
+            ).fetchone()[0],
         )
 
     def test_qc_failure_stops_after_repair_loop_limit(self) -> None:
@@ -376,7 +397,7 @@ class LightweightRunnerTest(unittest.TestCase):
         context = Path(state["task_dir"], "context.md").read_text()
         self.assertIn("QC repair loop 5/5", context)
 
-    def test_timeout_marks_takt_step_and_trace_error(self) -> None:
+    def test_timeout_is_available_from_run_report(self) -> None:
         result = self._aw(
             "run",
             "--repo",
@@ -404,8 +425,16 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertIn("--timeout-seconds 600", discord_text)
         run_executor = next(step for step in state["steps"] if step["name"] == "run_executor")
         self.assertTrue(run_executor["timed_out"])
-        trace_rows = [json.loads(line) for line in Path(state["trace_path"]).read_text().splitlines()]
-        self.assertIn("ERROR", [row["status"]["code"] for row in trace_rows])
+        detail = json.loads(
+            self._aw("report", "--run-id", state["run_id"], "--format", "json").stdout
+        )
+        executor_attempt = next(
+            attempt for attempt in detail["attempts"] if attempt["step_name"] == "run_executor"
+        )
+        self.assertEqual("timed_out", executor_attempt["status"])
+        self.assertTrue(executor_attempt["timed_out"])
+        self.assertEqual("timeout", executor_attempt["failure_category"])
+        self.assertFalse((Path(state["run_dir"]) / "trace.jsonl").exists())
 
     def test_enqueue_then_tick_runs_job(self) -> None:
         enqueued = self._aw(
@@ -849,7 +878,7 @@ class LightweightRunnerTest(unittest.TestCase):
 
         conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
         conn.execute(
-            "update jobs set updated_at = ? where run_id = ?",
+            "update runs set updated_at = ? where run_id = ?",
             ("2026-01-01T00:00:00+00:00", failed_state["run_id"]),
         )
         conn.commit()
@@ -1225,7 +1254,6 @@ class LightweightRunnerTest(unittest.TestCase):
             timeout_seconds=0.1,
             executor_bin=str(self.fake_takt),
             summary_path=str(self.state_dir / "runs" / "running-child-run" / "summary.md"),
-            trace_path=str(self.state_dir / "runs" / "running-child-run" / "trace.jsonl"),
             current_step="run_executor",
             created_at="2026-01-01T00:00:01+00:00",
             updated_at="2026-01-01T00:00:01+00:00",
@@ -1259,7 +1287,7 @@ class LightweightRunnerTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(("failed", state.run_id, state.summary_path, error), queue_row)
         run_row = conn.execute(
-            "select status, current_step from jobs where run_id = ?",
+            "select status, current_step from runs where run_id = ?",
             (state.run_id,),
         ).fetchone()
         self.assertEqual(("failed", "run_executor"), run_row)
@@ -1343,6 +1371,10 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertEqual("QC expects qc-pass, but the worktree lacks the marker.\n", (draft_dir / "diagnosis.md").read_text())
         self.assertIn("status = validated", repair_ini.read_text())
         self.assertIn("proposed_action = repo_config_patch", repair_ini.read_text())
+        self.assertIn(
+            f"report --run-id {state['run_id']} --format json",
+            repair_ini.read_text(),
+        )
 
         validated = self._aw("repair", "validate", "--draft-id", draft_dir.name)
         self.assertEqual(str(draft_dir), validated.stdout.strip())
@@ -1668,15 +1700,28 @@ class LightweightRunnerTest(unittest.TestCase):
         return path
 
     def _state(self, summary: Path) -> dict[str, object]:
-        return json.loads((summary.parent / "state.json").read_text())
+        state_dir = summary.parents[2]
+        return asdict(RunStore(state_dir).load(summary.parent.name))
 
     def _wait_for_running_step(self, state_dir: Path, step_name: str) -> Path:
         deadline = time.time() + 10
         while time.time() < deadline:
-            for state_path in state_dir.glob("runs/*/state.json"):
-                state = json.loads(state_path.read_text(encoding="utf-8"))
-                if state.get("current_step") == step_name:
-                    return state_path
+            db_path = state_dir / "jobs.sqlite"
+            if db_path.is_file():
+                try:
+                    with sqlite3.connect(db_path) as conn:
+                        row = conn.execute(
+                            """
+                            select run_id from runs
+                            where current_step = ? and status = 'running'
+                            order by created_at desc limit 1
+                            """,
+                            (step_name,),
+                        ).fetchone()
+                    if row:
+                        return state_dir / "runs" / row[0]
+                except sqlite3.OperationalError:
+                    pass
             time.sleep(0.05)
         self.fail(f"run did not reach {step_name}")
 

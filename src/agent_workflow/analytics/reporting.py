@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from statistics import median
 from typing import Any, Iterable
 
-from agent_workflow.analytics.constants import GROUP_FIELDS, TERMINAL_RUN_STATUSES
+from agent_workflow.analytics.constants import GROUP_FIELDS, TERMINAL_RUN_STATUSES, TERMINAL_STEP_STATUSES
 
 
 def build_report(
@@ -34,22 +34,40 @@ def build_report(
     groups = validated_groups(group_by)
 
     # [2] repair runを既定で除外し、指定された絞り込みだけをparameter化する。
-    where = [f"status in ({','.join('?' for _ in TERMINAL_RUN_STATUSES)})"]
+    where = [f"r.status in ({','.join('?' for _ in TERMINAL_RUN_STATUSES)})"]
     params: list[object] = []
     params.extend(sorted(TERMINAL_RUN_STATUSES))
     if not include_repair:
-        where.append("purpose = 'workflow'")
+        where.append("r.purpose = 'workflow'")
     if repo_path:
-        where.append("repo_path = ?")
+        where.append("r.repo_path = ?")
         params.append(repo_path)
     if since:
-        where.append("created_at >= ?")
+        where.append("r.created_at >= ?")
         params.append(since)
 
     # [3] report対象となる完了runを時系列順で取得する。
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        f"select * from run_metrics where {' and '.join(where)} order by created_at",
+        f"""
+        select
+          r.*,
+          (
+            select status from step_attempts
+            where run_id = r.run_id and step_name = 'run_qc' and attempt = 1
+          ) as first_qc_status,
+          (
+            select count(*) from step_attempts
+            where run_id = r.run_id and step_name = 'run_qc'
+          ) as qc_attempts,
+          (
+            select count(*) from step_attempts
+            where run_id = r.run_id and step_name = 'run_qc' and status = 'succeeded'
+          ) as qc_successes
+        from runs r
+        where {' and '.join(where)}
+        order by r.created_at
+        """,
         params,
     ).fetchall()
 
@@ -62,9 +80,17 @@ def build_report(
     # [5] QC未実行runを通過率の分母から外し、比較用の統計値を作る。
     report_rows: list[dict[str, Any]] = []
     for key, members in sorted(grouped.items()):
-        first_pass = [int(row["first_pass_qc"]) for row in members if row["first_pass_qc"] is not None]
-        eventual = [int(row["eventual_qc"]) for row in members if row["eventual_qc"] is not None]
-        attempts = [int(row["qc_attempts"]) for row in members if row["first_pass_qc"] is not None]
+        first_pass = [
+            int(str(row["first_qc_status"]) == "succeeded")
+            for row in members
+            if row["first_qc_status"] in TERMINAL_STEP_STATUSES
+        ]
+        eventual = [
+            int(int(row["qc_successes"]) > 0)
+            for row in members
+            if int(row["qc_attempts"]) > 0
+        ]
+        attempts = [int(row["qc_attempts"]) for row in members if row["first_qc_status"] in TERMINAL_STEP_STATUSES]
         elapsed = [float(row["elapsed_seconds"]) for row in members if row["elapsed_seconds"] is not None]
         changed = [
             int(row["additions"]) + int(row["deletions"])
