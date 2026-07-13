@@ -263,7 +263,7 @@ class RepairFlowE2ETest(unittest.TestCase):
             "  verify_args=(--verify-command 'test -f repaired.txt')\n"
             "  if [[ \"${FAKE_DIAGNOSIS_MODE:-}\" == \"human_needed\" ]]; then\n"
             "    proposed_action=human_needed\n"
-            "    verify_args=()\n"
+            "    verify_args=(--verify-command '')\n"
             "  fi\n"
             "  python3 -m agent_workflow --state-dir \"$AGENT_WORKFLOW_STATE_DIR\" repair draft \\\n"
             "    --failed-run-id \"$failed_run_id\" \\\n"

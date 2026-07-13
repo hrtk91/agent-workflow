@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
 
+from agent_workflow.analytics import AnalyticsStore, render_text_report
 from agent_workflow.config import (
     CONFIG_FILE_ENV,
     default_config_path,
@@ -22,6 +24,7 @@ from agent_workflow.runner import (
     WorkflowRunner,
     default_state_dir,
 )
+from agent_workflow.telemetry import export_report_to_otel
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,6 +81,14 @@ def build_parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="show run status")
     status.add_argument("--run-id")
     status.add_argument("--include-repair", action="store_true", help="include internal repair-diagnosis jobs in recent status output")
+
+    report = sub.add_parser("report", help="report QC success and run metrics from SQLite")
+    report.add_argument("--group-by", default="model", help="comma-separated dimensions: model, provider, task_type, workflow, repo, status")
+    report.add_argument("--repo", type=Path, help="filter by repository path")
+    report.add_argument("--since", help="include runs created at or after this ISO date/time")
+    report.add_argument("--format", choices=["text", "json"], default="text")
+    report.add_argument("--export-otel", action="store_true", help="export the grouped report as OTLP/HTTP gauges")
+    report.add_argument("--include-repair", action="store_true", help="include repair and repair-action runs")
 
     summary = sub.add_parser("summary", help="print summary path")
     summary.add_argument("--run-id", required=True)
@@ -159,6 +170,7 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--executor-bin", default="takt")
     parser.add_argument("--provider")
     parser.add_argument("--model")
+    parser.add_argument("--task-type", default="unspecified", help="task classification used by analytics reports")
     parser.add_argument("--base-ref")
     parser.add_argument("--keep-worktree", action="store_true", default=True)
     add_notify_args(parser)
@@ -214,6 +226,7 @@ def config_from_args(args: argparse.Namespace) -> RunnerConfig:
         executor_bin=getattr(args, "executor_bin", "takt"),
         provider=getattr(args, "provider", None),
         model=getattr(args, "model", None),
+        task_type=getattr(args, "task_type", "unspecified"),
         base_ref=getattr(args, "base_ref", None),
     )
 
@@ -282,6 +295,30 @@ def main(argv: list[str] | None = None) -> int:
             if args.config_command == "init":
                 print(initialize_settings(config_path, force=args.force))
                 return 0
+        if args.command == "report":
+            # report 処理フロー:
+            # [1] group/filter引数を正規化し、SQLiteの集計payloadを読み取る。
+            # [2] 指定時だけ同じpayloadをOTLP metricsへ送信する。
+            # [3] JSONまたはterminal tableとして標準出力へ表示する。
+            # [1] runnerを初期化せず、report専用のread-only query経路を使う。
+            analytics = AnalyticsStore(args.state_dir.expanduser() / "jobs.sqlite")
+            group_by = [field.strip() for field in args.group_by.split(",") if field.strip()]
+            repo_path = str(args.repo.expanduser().resolve()) if args.repo else None
+            report_data = analytics.report(
+                group_by=group_by,
+                repo_path=repo_path,
+                since=args.since,
+                include_repair=args.include_repair,
+            )
+            # [2] SQLiteから読み取った集計結果を、明示指定された場合だけ外部へ投影する。
+            if args.export_otel:
+                export_report_to_otel(report_data)
+            # [3] textとJSONのどちらでも同じreport payloadを表示する。
+            if args.format == "json":
+                print(json.dumps(report_data, indent=2, sort_keys=True))
+            else:
+                print(render_text_report(report_data))
+            return 0
         runner = WorkflowRunner(args.state_dir)
         if args.command == "run":
             state = runner.run_new(config_from_args(args))

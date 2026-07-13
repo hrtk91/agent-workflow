@@ -15,9 +15,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
+from agent_workflow.analytics import AnalyticsStore
 from agent_workflow.notify.discord import render_llm_notification
 from agent_workflow.state import RunState, StepState
-from agent_workflow.tracing import TraceRecorder, trace_enabled_hint
+from agent_workflow.tracing import TraceRecorder
 
 STEPS = ["load_task", "create_worktree", "run_executor", "run_qc", "write_summary"]
 FAILURE_NOTIFY_STATUSES = {"blocked", "failed", "interrupted", "qc_failed", "timed_out"}
@@ -39,6 +40,7 @@ class RunnerConfig:
     executor_bin: str = "takt"
     provider: str | None = None
     model: str | None = None
+    task_type: str = "unspecified"
     base_ref: str | None = None
     purpose: str = "workflow"
     repair_for_run_id: str | None = None
@@ -79,6 +81,8 @@ class WorkflowRunner:
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        self.analytics = AnalyticsStore(self.db_path)
+        self.analytics.initialize()
 
     def run_new(self, config: RunnerConfig) -> RunState:
         config = self._normalize_config(config)
@@ -104,6 +108,7 @@ class WorkflowRunner:
             executor_bin=config.executor_bin,
             provider=config.provider,
             model=config.model,
+            task_type=config.task_type,
             base_ref=config.base_ref,
             purpose=config.purpose,
             repair_for_run_id=config.repair_for_run_id,
@@ -529,37 +534,79 @@ class WorkflowRunner:
         return RunState.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
     def save_state(self, state: RunState) -> None:
+        """run状態をartifact・運用index・分析DBへ同じ順序で永続化する。
+
+        処理フロー:
+        - [1] 更新時刻を確定してstate.jsonへ書き込む。
+        - [2] jobs tableの最新状態indexを更新する。
+        - [3] 同じstateを正規化したanalytics tableへ反映する。
+        """
+
+        # [1] 後続の2つのDB更新と同じupdated_atを持つstate artifactを先に確定する。
         state.updated_at = utc_now()
         state.run_path.mkdir(parents=True, exist_ok=True)
         (state.run_path / "state.json").write_text(json.dumps(asdict(state), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        # [2] status表示やworker回復が参照する軽量な運用indexを更新する。
         self._upsert_job(state)
+        # [3] run/attempt分析値を同じjobs.sqlite内へ正規化して保存する。
+        self.analytics.record_state(state)
 
     def _run_from(self, state: RunState, start_index: int) -> RunState:
-        tracer = TraceRecorder(Path(state.trace_path))
-        state.status = "running"
-        self.save_state(state)
-        index = start_index
-        qc_repair_attempts = 0
-        while index < len(state.steps):
-            step = state.steps[index]
-            if step.status == "succeeded":
-                index += 1
-                continue
-            ok = self._run_step(state, step, tracer)
-            if not ok:
-                if step.name == "run_qc" and qc_repair_attempts < QC_REPAIR_MAX_ATTEMPTS:
-                    qc_repair_attempts += 1
-                    self._prepare_qc_repair_loop(state, qc_repair_attempts)
-                    index = STEPS.index("run_executor")
+        """指定位置から残りstepを実行し、run traceを終了時にflushする。
+
+        処理フロー:
+        - [1] run属性を持つlocal/remote trace sessionを開始する。
+        - [2] runをrunningとして保存し、未完了stepを順番に実行する。
+        - [3] QC失敗時は上限内でexecutorへ戻し、上限到達時は失敗を確定する。
+        - [4] 全step成功時はsummaryとterminal stateを保存する。
+        - [5] return・失敗・例外の全経路でrun traceをflushして閉じる。
+        """
+
+        # [1] resume/retryを含む今回の呼び出し単位で親run spanを作る。
+        tracer = TraceRecorder(
+            Path(state.trace_path),
+            run_attributes={
+                "run_id": state.run_id,
+                "repo_path": state.repo_path,
+                "workflow": state.workflow,
+                "provider": state.provider or "",
+                "model": state.model or "",
+                "task_type": state.task_type,
+                "purpose": state.purpose,
+                "executor_bin": state.executor_bin,
+            },
+        )
+        try:
+            # [2] current stateを先に永続化し、未完了stepだけを順次実行する。
+            state.status = "running"
+            self.save_state(state)
+            index = start_index
+            qc_repair_attempts = 0
+            while index < len(state.steps):
+                step = state.steps[index]
+                if step.status == "succeeded":
+                    index += 1
                     continue
-                self._finalize_failed_summary(state)
-                return state
-            index += 1
-        state.status = "succeeded"
-        state.current_step = None
-        self._write_summary(state)
-        self.save_state(state)
-        return state
+                ok = self._run_step(state, step, tracer)
+                if not ok:
+                    # [3] QCだけは修正loopへ戻し、その他の失敗または上限到達を確定する。
+                    if step.name == "run_qc" and qc_repair_attempts < QC_REPAIR_MAX_ATTEMPTS:
+                        qc_repair_attempts += 1
+                        self._prepare_qc_repair_loop(state, qc_repair_attempts)
+                        index = STEPS.index("run_executor")
+                        continue
+                    self._finalize_failed_summary(state)
+                    return state
+                index += 1
+            # [4] 最後のstep完了後にrun全体の成功summaryとstateを確定する。
+            state.status = "succeeded"
+            state.current_step = None
+            self._write_summary(state)
+            self.save_state(state)
+            return state
+        finally:
+            # [5] 短命CLIが終了する前に親spanを閉じ、全step attemptをOTLPへflushする。
+            tracer.close(state.status)
 
     def _prepare_qc_repair_loop(self, state: RunState, attempt: int) -> None:
         qc_step = state.step("run_qc")
@@ -596,13 +643,28 @@ class WorkflowRunner:
                 f.write("\n```\n")
 
     def _run_step(self, state: RunState, step: StepState, tracer: TraceRecorder) -> bool:
+        """1回のstep attemptをspan内で実行し、結果とstateを永続化する。
+
+        処理フロー:
+        - [1] attempt番号と開始状態を初期化して保存する。
+        - [2] SIGINT/SIGTERMをworkflow中断へ変換するhandlerを設定する。
+        - [3] run属性を持つstep span内で対象処理を実行する。
+        - [4] 成功・StepFailure・中断をstep/run/spanのstatusへ反映する。
+        - [5] 終了時刻と最終stateを必ず保存する。
+        - [6] 呼び出し元のsignal handlerを必ず復元する。
+        """
+
+        # [1] retry前の結果を残さず、今回attemptの開始状態として保存する。
         step.status = "running"
         step.attempts += 1
         step.started_at = utc_now()
         step.finished_at = None
+        step.exit_code = None
+        step.timed_out = False
         step.error = None
         state.current_step = step.name
         self.save_state(state)
+        # [2] process signalを通常のstep失敗処理へ合流できる例外に変換する。
         previous_sigint = signal.getsignal(signal.SIGINT)
         previous_sigterm = signal.getsignal(signal.SIGTERM)
 
@@ -612,14 +674,20 @@ class WorkflowRunner:
         signal.signal(signal.SIGINT, interrupt_handler)
         signal.signal(signal.SIGTERM, interrupt_handler)
         try:
+            # [3] model/task typeを含む共通属性でlocal/remote step spanを開始する。
             with tracer.span(
                 f"agent_workflow.step.{step.name}",
                 run_id=state.run_id,
                 repo_path=state.repo_path,
                 workflow=state.workflow,
+                provider=state.provider or "",
+                model=state.model or "",
+                task_type=state.task_type,
+                purpose=state.purpose,
+                executor_bin=state.executor_bin,
                 attempt=step.attempts,
-                otel_hint=trace_enabled_hint(),
             ) as span:
+                # [4] 各終了経路をstep/run/spanのterminal情報へ変換する。
                 try:
                     getattr(self, f"_step_{step.name}")(state, step, span)
                     step.status = "succeeded"
@@ -646,9 +714,11 @@ class WorkflowRunner:
                     span["status_message"] = message
                     return False
                 finally:
+                    # [5] どの結果でもattempt終了時刻と最終stateを欠かさず保存する。
                     step.finished_at = utc_now()
                     self.save_state(state)
         finally:
+            # [6] runner外のsignal挙動を変更したままにしない。
             signal.signal(signal.SIGINT, previous_sigint)
             signal.signal(signal.SIGTERM, previous_sigterm)
 
@@ -729,6 +799,9 @@ class WorkflowRunner:
             f"- repo: `{state.repo_path}`",
             f"- worktree: `{state.worktree_path or ''}`",
             f"- workflow: `{state.workflow}`",
+            f"- provider: `{state.provider or ''}`",
+            f"- model: `{state.model or ''}`",
+            f"- task_type: `{state.task_type}`",
             f"- purpose: `{state.purpose}`",
             f"- repair_for_run_id: `{state.repair_for_run_id or ''}`",
             f"- base_ref: `{state.base_ref or ''}`",
@@ -1145,6 +1218,7 @@ class WorkflowRunner:
             executor_bin=config.executor_bin,
             provider=config.provider,
             model=config.model,
+            task_type=config.task_type.strip() or "unspecified",
             base_ref=config.base_ref,
             purpose=config.purpose,
             repair_for_run_id=config.repair_for_run_id,
@@ -1735,6 +1809,7 @@ def config_to_dict(config: RunnerConfig) -> dict[str, object]:
         "executor_bin": config.executor_bin,
         "provider": config.provider,
         "model": config.model,
+        "task_type": config.task_type,
         "base_ref": config.base_ref,
         "purpose": config.purpose,
         "repair_for_run_id": config.repair_for_run_id,
@@ -1754,6 +1829,7 @@ def config_from_dict(data: dict[str, object], state_dir: Path) -> RunnerConfig:
         executor_bin=str(data.get("executor_bin") or "takt"),
         provider=str(data["provider"]) if data.get("provider") else None,
         model=str(data["model"]) if data.get("model") else None,
+        task_type=str(data.get("task_type") or "unspecified"),
         base_ref=str(data["base_ref"]) if data.get("base_ref") else None,
         purpose=str(data.get("purpose") or "workflow"),
         repair_for_run_id=str(data["repair_for_run_id"]) if data.get("repair_for_run_id") else None,
@@ -1771,6 +1847,7 @@ def runner_config_from_state(state: RunState, state_dir: Path) -> RunnerConfig:
         executor_bin=state.executor_bin,
         provider=state.provider,
         model=state.model,
+        task_type=state.task_type,
         base_ref=state.base_ref,
         purpose=state.purpose,
         repair_for_run_id=state.repair_for_run_id,

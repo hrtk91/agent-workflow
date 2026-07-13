@@ -211,6 +211,37 @@ Show recent queued jobs and runs:
 aw status
 ```
 
+## Local Analytics
+
+Tag runs when model and task-type comparisons are needed:
+
+```bash
+aw run \
+  --repo /path/to/repo \
+  --task-file /path/to/task.md \
+  --verify-command 'mise run check-all' \
+  --provider openai \
+  --model gpt-example \
+  --task-type bug_fix
+```
+
+Report first-pass QC, eventual QC, QC attempts, elapsed time, and changed lines from `jobs.sqlite`:
+
+```bash
+aw report
+aw report --group-by model,task_type
+aw report --repo /path/to/repo --since 2026-07-01
+aw report --group-by model,task_type --format json
+```
+
+`aw report` opens SQLite in read-only mode and never creates or updates analytics rows. If the database or analytics schema does not exist yet, it returns an empty report without creating either one. New runs are recorded as they execute. The analytics tables are:
+
+- `run_metrics`: run configuration, QC outcomes, duration, task identity, and final change size
+- `step_attempts`: one row per executor, QC, or other workflow step attempt
+- `analytics_schema_migrations`: analytics schema version history
+
+Repair and repair-action runs are excluded by default. Pass `--include-repair` to include them.
+
 Remove a run worktree:
 
 ```bash
@@ -310,8 +341,33 @@ always available without external services and includes:
 - timeout flag
 - stdout/stderr log paths
 
-The JSONL format is intentionally close to OTel span fields so an OTLP exporter
-can be added without changing the runner state model.
+`trace.jsonl` is always retained as the durable local trace. When a trace OTLP
+endpoint is configured, the same invocation is also exported as one
+`agent_workflow.run` span with a child span for every step attempt:
+
+```bash
+python3 -m pip install '.[otel]'
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+aw run --repo /path/to/repo --task /path/to/task.md --workflow implementation --verify 'pytest'
+```
+
+The root and step spans include the requested model, provider, task type,
+workflow, run status, attempt number, command result, and timeout state. A
+resume or retry creates a new run span and exports only the attempts executed by
+that invocation. Set `OTEL_TRACES_EXPORTER=none` to retain local JSONL without
+remote trace export.
+
+Export a grouped SQLite report as OpenTelemetry gauges over OTLP/HTTP:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+aw report --group-by model,task_type --export-otel
+```
+
+The export includes run/QC counts, first-pass and eventual QC rates, median QC
+attempts, median elapsed time, and median changed lines. Report group values are
+metric attributes. SQLite remains the durable source; OTLP export occurs only
+when `--export-otel` is passed.
 
 ## Tests
 

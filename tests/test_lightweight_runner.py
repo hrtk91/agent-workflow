@@ -35,6 +35,26 @@ class LightweightRunnerTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    def test_report_does_not_create_state_database_or_schema(self) -> None:
+        self.assertFalse(self.state_dir.exists())
+
+        report = self._aw("report", "--format", "json")
+
+        self.assertEqual([], json.loads(report.stdout)["rows"])
+        self.assertFalse(self.state_dir.exists())
+
+        self.state_dir.mkdir()
+        db_path = self.state_dir / "jobs.sqlite"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("create table existing_jobs(run_id text primary key)")
+        legacy_report = self._aw("report", "--format", "json")
+        self.assertEqual([], json.loads(legacy_report.stdout)["rows"])
+        with sqlite3.connect(db_path) as conn:
+            tables = conn.execute(
+                "select name from sqlite_master where type = 'table' order by name"
+            ).fetchall()
+        self.assertEqual([("existing_jobs",)], tables)
+
     def test_success_writes_state_summary_trace_and_sqlite(self) -> None:
         result = self._aw(
             "run",
@@ -46,6 +66,12 @@ class LightweightRunnerTest(unittest.TestCase):
             "test -f implemented.txt",
             "--executor-bin",
             str(self.fake_takt),
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-test",
+            "--task-type",
+            "bug_fix",
         )
 
         summary = Path(result.stdout.strip())
@@ -75,10 +101,42 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertIn("fixture implementation", report_snapshots[0].read_text())
         trace_rows = [json.loads(line) for line in Path(state["trace_path"]).read_text().splitlines()]
         self.assertEqual(["OK"] * 5, [row["status"]["code"] for row in trace_rows])
+        self.assertEqual({"gpt-test"}, {row["attributes"]["gen_ai.request.model"] for row in trace_rows})
+        self.assertEqual({"bug_fix"}, {row["attributes"]["agent_workflow.task.type"] for row in trace_rows})
+        self.assertEqual({"workflow"}, {row["attributes"]["agent_workflow.run.purpose"] for row in trace_rows})
 
         conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
         row = conn.execute("select status, summary_path from jobs where run_id = ?", (state["run_id"],)).fetchone()
         self.assertEqual(("succeeded", str(summary)), row)
+        metric = conn.execute(
+            """
+            select provider, model, task_type, first_pass_qc, eventual_qc,
+                   executor_attempts, qc_attempts, changed_files, additions, deletions
+            from run_metrics where run_id = ?
+            """,
+            (state["run_id"],),
+        ).fetchone()
+        self.assertEqual(("openai", "gpt-test", "bug_fix", 1, 1, 1, 1), metric[:7])
+        self.assertGreater(metric[7], 0)
+        self.assertGreater(metric[8] + metric[9], 0)
+        attempts = conn.execute(
+            "select step_name, attempt, status from step_attempts where run_id = ? order by step_name",
+            (state["run_id"],),
+        ).fetchall()
+        self.assertEqual(5, len(attempts))
+        self.assertIn(("run_qc", 1, "succeeded"), attempts)
+        timing_before_cleanup = conn.execute(
+            "select finished_at, elapsed_seconds from run_metrics where run_id = ?",
+            (state["run_id"],),
+        ).fetchone()
+        change_stats_before_human_edit = metric[7:]
+        Path(state["worktree_path"], "human-edit.txt").write_text("not agent output\n", encoding="utf-8")
+        self._aw("report")
+        change_stats_after_human_edit = conn.execute(
+            "select changed_files, additions, deletions from run_metrics where run_id = ?",
+            (state["run_id"],),
+        ).fetchone()
+        self.assertEqual(change_stats_before_human_edit, change_stats_after_human_edit)
 
         self._aw("cleanup", "--run-id", state["run_id"])
         cleaned_state = self._state(summary)
@@ -86,6 +144,11 @@ class LightweightRunnerTest(unittest.TestCase):
         cleaned_summary_text = summary.read_text()
         self.assertIn("worktree: ``", cleaned_summary_text)
         self.assertIn("## executor observability", cleaned_summary_text)
+        timing_after_cleanup = conn.execute(
+            "select finished_at, elapsed_seconds from run_metrics where run_id = ?",
+            (state["run_id"],),
+        ).fetchone()
+        self.assertEqual(timing_before_cleanup, timing_after_cleanup)
 
     def test_resume_continues_from_failed_qc_step(self) -> None:
         first = self._aw(
@@ -227,6 +290,12 @@ class LightweightRunnerTest(unittest.TestCase):
             "test -f qc-pass",
             "--executor-bin",
             str(self.fake_takt),
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-test",
+            "--task-type",
+            "bug_fix",
             env={"FAKE_TAKT_QC_PASS_ON_ATTEMPT": "3"},
         )
 
@@ -238,6 +307,51 @@ class LightweightRunnerTest(unittest.TestCase):
         context = Path(state["task_dir"], "context.md").read_text()
         self.assertIn("QC repair loop 1/5", context)
         self.assertIn("QC repair loop 2/5", context)
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        qc_attempts = conn.execute(
+            "select attempt, status, failure_category from step_attempts where run_id = ? and step_name = 'run_qc' order by attempt",
+            (state["run_id"],),
+        ).fetchall()
+        self.assertEqual(
+            [(1, "qc_failed", "qc_failure"), (2, "qc_failed", "qc_failure"), (3, "succeeded", None)],
+            qc_attempts,
+        )
+        metric = conn.execute(
+            "select first_pass_qc, eventual_qc, qc_attempts, task_sha256, task_bytes from run_metrics where run_id = ?",
+            (state["run_id"],),
+        ).fetchone()
+        self.assertEqual((0, 1, 3), metric[:3])
+        self.assertIsNotNone(metric[3])
+        self.assertGreater(metric[4], 0)
+
+        report = self._aw("report", "--group-by", "model,task_type", "--format", "json")
+        report_data = json.loads(report.stdout)
+        self.assertEqual(1, len(report_data["rows"]))
+        report_row = report_data["rows"][0]
+        self.assertEqual({"model": "gpt-test", "task_type": "bug_fix"}, report_row["group"])
+        self.assertEqual(0.0, report_row["first_pass_qc_rate"])
+        self.assertEqual(100.0, report_row["eventual_qc_rate"])
+        self.assertEqual(3.0, report_row["qc_attempts_p50"])
+        text_report = self._aw("report", "--group-by", "model,task_type")
+        self.assertIn("Agent workflow report", text_report.stdout)
+        self.assertIn("model=gpt-test,task_type=bug_fix", text_report.stdout)
+        self.assertIn("0.0%", text_report.stdout)
+        self.assertIn("100.0%", text_report.stdout)
+
+        # reportは読み取り専用なので、分析行を削除してもrun成果物から復元しない。
+        conn.execute("delete from step_attempts where run_id = ?", (state["run_id"],))
+        conn.execute("delete from run_metrics where run_id = ?", (state["run_id"],))
+        conn.commit()
+        empty_report = self._aw("report", "--group-by", "model,task_type", "--format", "json")
+        self.assertEqual([], json.loads(empty_report.stdout)["rows"])
+        self.assertEqual(
+            (0, 0),
+            (
+                conn.execute("select count(*) from run_metrics where run_id = ?", (state["run_id"],)).fetchone()[0],
+                conn.execute("select count(*) from step_attempts where run_id = ?", (state["run_id"],)).fetchone()[0],
+            ),
+        )
 
     def test_qc_failure_stops_after_repair_loop_limit(self) -> None:
         result = self._aw(
