@@ -38,13 +38,12 @@ def task_packet_identity(task_dir: Path) -> tuple[str | None, int | None]:
     return (digest.hexdigest(), total) if found else (None, None)
 
 
-def durable_task_packet_identity(state: RunState, *, create: bool) -> tuple[str | None, int | None]:
+def durable_task_packet_identity(state: RunState) -> tuple[str | None, int | None]:
     """QCがcontext.mdを変更する前のtask識別子を永続化して再利用する。
 
     処理フロー:
     - [1] 保存済みtask-identity.jsonがあれば検証して返す。
-    - [2] backfill時など新規作成を許可しない場合は未取得として返す。
-    - [3] 現在のtask packetを計算し、初回値だけをartifactへ保存する。
+    - [2] 現在のtask packetを計算し、初回値だけをartifactへ保存する。
     """
 
     # [1] live taskの現在値より、run開始時に固定したartifactを常に優先する。
@@ -57,10 +56,7 @@ def durable_task_packet_identity(state: RunState, *, create: bool) -> tuple[str 
             return sha256, size
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
             return None, None
-    # [2] 過去runに初期値の証拠がない場合、現在の変異済みtaskから推測しない。
-    if not create:
-        return None, None
-    # [3] 入力が揃った最初の時点でhashとbyte数を固定する。
+    # [2] 入力が揃った最初の時点でhashとbyte数を固定する。
     sha256, size = task_packet_identity(Path(state.task_dir))
     if sha256 is None or size is None:
         return None, None

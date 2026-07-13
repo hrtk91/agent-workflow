@@ -1,7 +1,7 @@
 """SQLite analyticsの公開API。
 
-既存の ``agent_workflow.analytics`` importを維持しながら、保存・復元・集計・
-artifact計測の実装を責務別moduleへ分離する。
+既存の ``agent_workflow.analytics`` importを維持しながら、保存・集計・
+入力および変更量計測の実装を責務別moduleへ分離する。
 """
 
 from agent_workflow.analytics.artifacts import (
@@ -20,10 +20,7 @@ from agent_workflow.analytics.constants import (
 from agent_workflow.analytics.normalization import (
     duration_seconds,
     failure_category,
-    integer_or_none,
-    nanos_to_iso,
     run_finished_at,
-    trace_attempt_status,
 )
 from agent_workflow.analytics.reporting import (
     display_dimension,
@@ -53,13 +50,10 @@ __all__ = [
     "format_duration",
     "format_number",
     "format_rate",
-    "integer_or_none",
-    "nanos_to_iso",
     "rate",
     "render_text_report",
     "rounded_median",
     "run_finished_at",
     "task_packet_identity",
-    "trace_attempt_status",
     "wilson_interval",
 ]

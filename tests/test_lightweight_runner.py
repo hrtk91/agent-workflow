@@ -35,6 +35,26 @@ class LightweightRunnerTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    def test_report_does_not_create_state_database_or_schema(self) -> None:
+        self.assertFalse(self.state_dir.exists())
+
+        report = self._aw("report", "--format", "json")
+
+        self.assertEqual([], json.loads(report.stdout)["rows"])
+        self.assertFalse(self.state_dir.exists())
+
+        self.state_dir.mkdir()
+        db_path = self.state_dir / "jobs.sqlite"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("create table existing_jobs(run_id text primary key)")
+        legacy_report = self._aw("report", "--format", "json")
+        self.assertEqual([], json.loads(legacy_report.stdout)["rows"])
+        with sqlite3.connect(db_path) as conn:
+            tables = conn.execute(
+                "select name from sqlite_master where type = 'table' order by name"
+            ).fetchall()
+        self.assertEqual([("existing_jobs",)], tables)
+
     def test_success_writes_state_summary_trace_and_sqlite(self) -> None:
         result = self._aw(
             "run",
@@ -302,11 +322,9 @@ class LightweightRunnerTest(unittest.TestCase):
             (state["run_id"],),
         ).fetchone()
         self.assertEqual((0, 1, 3), metric[:3])
+        self.assertIsNotNone(metric[3])
+        self.assertGreater(metric[4], 0)
 
-        # Simulate an older state directory that must be rebuilt from durable artifacts.
-        conn.execute("delete from step_attempts where run_id = ?", (state["run_id"],))
-        conn.execute("delete from run_metrics where run_id = ?", (state["run_id"],))
-        conn.commit()
         report = self._aw("report", "--group-by", "model,task_type", "--format", "json")
         report_data = json.loads(report.stdout)
         self.assertEqual(1, len(report_data["rows"]))
@@ -315,16 +333,25 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertEqual(0.0, report_row["first_pass_qc_rate"])
         self.assertEqual(100.0, report_row["eventual_qc_rate"])
         self.assertEqual(3.0, report_row["qc_attempts_p50"])
-        rebuilt_identity = conn.execute(
-            "select task_sha256, task_bytes from run_metrics where run_id = ?",
-            (state["run_id"],),
-        ).fetchone()
-        self.assertEqual(metric[3:], rebuilt_identity)
         text_report = self._aw("report", "--group-by", "model,task_type")
         self.assertIn("Agent workflow report", text_report.stdout)
         self.assertIn("model=gpt-test,task_type=bug_fix", text_report.stdout)
         self.assertIn("0.0%", text_report.stdout)
         self.assertIn("100.0%", text_report.stdout)
+
+        # reportは読み取り専用なので、分析行を削除してもrun成果物から復元しない。
+        conn.execute("delete from step_attempts where run_id = ?", (state["run_id"],))
+        conn.execute("delete from run_metrics where run_id = ?", (state["run_id"],))
+        conn.commit()
+        empty_report = self._aw("report", "--group-by", "model,task_type", "--format", "json")
+        self.assertEqual([], json.loads(empty_report.stdout)["rows"])
+        self.assertEqual(
+            (0, 0),
+            (
+                conn.execute("select count(*) from run_metrics where run_id = ?", (state["run_id"],)).fetchone()[0],
+                conn.execute("select count(*) from step_attempts where run_id = ?", (state["run_id"],)).fetchone()[0],
+            ),
+        )
 
     def test_qc_failure_stops_after_repair_loop_limit(self) -> None:
         result = self._aw(

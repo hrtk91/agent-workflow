@@ -31,12 +31,7 @@ def build_report(
     """
 
     # [1] SQL列名へ変換できる既知dimensionだけを受け付ける。
-    groups = tuple(group_by)
-    invalid = [field for field in groups if field not in GROUP_FIELDS]
-    if invalid:
-        raise ValueError(f"unsupported report group: {', '.join(invalid)}")
-    if not groups:
-        raise ValueError("--group-by must contain at least one field")
+    groups = validated_groups(group_by)
 
     # [2] repair runを既定で除外し、指定された絞り込みだけをparameter化する。
     where = [f"status in ({','.join('?' for _ in TERMINAL_RUN_STATUSES)})"]
@@ -94,6 +89,50 @@ def build_report(
         )
 
     # [6] text表示とOTel exportが同じpayloadを利用できる形で返す。
+    return report_payload(
+        groups=groups,
+        repo_path=repo_path,
+        since=since,
+        include_repair=include_repair,
+        rows=report_rows,
+    )
+
+
+def build_empty_report(
+    group_by: Iterable[str],
+    repo_path: str | None = None,
+    since: str | None = None,
+    include_repair: bool = False,
+) -> dict[str, Any]:
+    """分析DBがまだ存在しない場合の空reportを返す。"""
+
+    return report_payload(
+        groups=validated_groups(group_by),
+        repo_path=repo_path,
+        since=since,
+        include_repair=include_repair,
+        rows=[],
+    )
+
+
+def validated_groups(group_by: Iterable[str]) -> tuple[str, ...]:
+    groups = tuple(group_by)
+    invalid = [field for field in groups if field not in GROUP_FIELDS]
+    if invalid:
+        raise ValueError(f"unsupported report group: {', '.join(invalid)}")
+    if not groups:
+        raise ValueError("--group-by must contain at least one field")
+    return groups
+
+
+def report_payload(
+    *,
+    groups: tuple[str, ...],
+    repo_path: str | None,
+    since: str | None,
+    include_repair: bool,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "group_by": list(groups),
@@ -102,7 +141,7 @@ def build_report(
             "since": since,
             "include_repair": include_repair,
         },
-        "rows": report_rows,
+        "rows": rows,
     }
 
 

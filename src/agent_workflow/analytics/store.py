@@ -1,18 +1,17 @@
-"""分析データの保存とartifact backfillを統括する公開store。"""
+"""分析データの保存と集計を統括する公開store。"""
 
 from __future__ import annotations
 
 import hashlib
-import json
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
 from agent_workflow.analytics.artifacts import collect_change_stats, durable_task_packet_identity
-from agent_workflow.analytics.attempts import needs_refresh, qc_outcomes, recover_trace_attempts, upsert_step_attempt
+from agent_workflow.analytics.attempts import qc_outcomes, upsert_step_attempt
 from agent_workflow.analytics.constants import TERMINAL_RUN_STATUSES
 from agent_workflow.analytics.normalization import duration_seconds, run_finished_at
-from agent_workflow.analytics.reporting import build_report
+from agent_workflow.analytics.reporting import build_empty_report, build_report
 from agent_workflow.analytics.schema import initialize_schema
 from agent_workflow.state import RunState
 
@@ -22,10 +21,14 @@ class AnalyticsStore:
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
+
+    def initialize(self) -> None:
+        """分析値を書き込む実行系からschemaを初期化する。"""
+
         with self._db() as conn:
             initialize_schema(conn)
 
-    def record_state(self, state: RunState, *, allow_task_identity_create: bool = True) -> None:
+    def record_state(self, state: RunState) -> None:
         """run状態を、初期入力と完了時変更量を壊さず分析DBへ反映する。
 
         処理フロー:
@@ -36,7 +39,7 @@ class AnalyticsStore:
         """
 
         # [1] 比較的遅いfilesystem/Git処理で並列workerのwrite transactionを占有しない。
-        task_sha256, task_bytes = durable_task_packet_identity(state, create=allow_task_identity_create)
+        task_sha256, task_bytes = durable_task_packet_identity(state)
         change_stats = collect_change_stats(state) if state.status in TERMINAL_RUN_STATUSES else None
 
         with self._db() as conn:
@@ -125,38 +128,6 @@ class AnalyticsStore:
                 ),
             )
 
-    def refresh_from_runs(self, runs_dir: Path) -> int:
-        """run成果物から不足・更新分だけを分析DBへ復元する。
-
-        処理フロー:
-        - [1] run directoryの有無を確認し、対象state.jsonを列挙する。
-        - [2] 読み取れるstateだけを復元する。
-        - [3] DBが最新ならfilesystemやtraceの再走査を省略する。
-        - [4] 過去traceのattempt履歴を戻してからrun状態を再記録する。
-        """
-
-        # [1] 初回利用などrun directoryがない場合は何も更新しない。
-        refreshed = 0
-        if not runs_dir.exists():
-            return refreshed
-        for state_path in sorted(runs_dir.glob("*/state.json")):
-            # [2] 破損・途中書き込みなど、復元できないstateは他のrunを妨げない。
-            try:
-                state = RunState.from_dict(json.loads(state_path.read_text(encoding="utf-8")))
-            except (OSError, TypeError, ValueError, json.JSONDecodeError):
-                continue
-            # [3] updated_atとattempt件数が揃うrunは追加I/Oなしでskipする。
-            with self._db() as conn:
-                refresh_required = needs_refresh(conn, state)
-            if not refresh_required:
-                continue
-            # [4] 旧runのattempt履歴を先に戻し、そこからQC結果を再計算する。
-            with self._db() as conn:
-                recover_trace_attempts(conn, state.run_id, Path(state.trace_path))
-            self.record_state(state, allow_task_identity_create=False)
-            refreshed += 1
-        return refreshed
-
     def report(
         self,
         group_by: Iterable[str],
@@ -167,13 +138,32 @@ class AnalyticsStore:
         """完了runを指定軸で集計し、QC通過率と中央値を返す。
 
         処理フロー:
-        - [1] analytics DBへのconnectionを開く。
-        - [2] query・group集計・統計値生成をreporting moduleへ委譲する。
+        - [1] 分析DBが未作成なら、fileを作らず空payloadを返す。
+        - [2] DBをread-onlyで開き、分析schemaの有無を確認する。
+        - [3] query・group集計・統計値生成をreporting moduleへ委譲する。
         """
 
-        # [1] report処理だけで閉じるread connectionを開く。
-        with self._db() as conn:
-            # [2] CLIとOTelが共有するpayload構築を一箇所へ集約する。
+        # [1] DB未作成時もfileを新規作成せず、同じ形式の空payloadを返す。
+        if not self.db_path.is_file():
+            return build_empty_report(
+                group_by=group_by,
+                repo_path=repo_path,
+                since=since,
+                include_repair=include_repair,
+            )
+        # [2] SQLite自体にもwriteを拒否させ、旧DBにも分析schemaを追加しない。
+        with self._read_db() as conn:
+            has_metrics = conn.execute(
+                "select 1 from sqlite_master where type = 'table' and name = 'run_metrics'"
+            ).fetchone()
+            if has_metrics is None:
+                return build_empty_report(
+                    group_by=group_by,
+                    repo_path=repo_path,
+                    since=since,
+                    include_repair=include_repair,
+                )
+            # [3] CLIとOTelが共有するpayload構築を一箇所へ集約する。
             return build_report(
                 conn,
                 group_by=group_by,
@@ -185,4 +175,10 @@ class AnalyticsStore:
     def _db(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.execute("pragma journal_mode=wal")
+        return conn
+
+    def _read_db(self) -> sqlite3.Connection:
+        uri = f"{self.db_path.expanduser().resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        conn.execute("pragma query_only=on")
         return conn

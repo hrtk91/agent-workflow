@@ -2,25 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime
 
 from agent_workflow.state import RunState
-
-
-def trace_attempt_status(step_name: str, status_code: str, timed_out: bool, error: str | None) -> str:
-    if status_code == "OK":
-        return "succeeded"
-    if timed_out:
-        return "timed_out"
-    message = (error or "").lower()
-    if "interrupt" in message:
-        return "interrupted"
-    if "blocked" in message:
-        return "blocked"
-    if step_name == "run_qc":
-        return "qc_failed"
-    return "failed"
 
 
 def failure_category(step_name: str, status: str, timed_out: bool) -> str | None:
@@ -53,19 +37,3 @@ def duration_seconds(start: str | None, end: str | None) -> float | None:
 def run_finished_at(state: RunState) -> str:
     step_finishes = [step.finished_at for step in state.steps if step.finished_at]
     return max(step_finishes, default=state.updated_at)
-
-
-def nanos_to_iso(value: Any) -> str | None:
-    try:
-        return datetime.fromtimestamp(int(value) / 1_000_000_000, timezone.utc).isoformat()
-    except (TypeError, ValueError, OSError, OverflowError):
-        return None
-
-
-def integer_or_none(value: Any) -> int | None:
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None

@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from agent_workflow.analytics import render_text_report
+from agent_workflow.analytics import AnalyticsStore, render_text_report
 from agent_workflow.config import (
     CONFIG_FILE_ENV,
     default_config_path,
@@ -295,6 +295,30 @@ def main(argv: list[str] | None = None) -> int:
             if args.config_command == "init":
                 print(initialize_settings(config_path, force=args.force))
                 return 0
+        if args.command == "report":
+            # report 処理フロー:
+            # [1] group/filter引数を正規化し、SQLiteの集計payloadを読み取る。
+            # [2] 指定時だけ同じpayloadをOTLP metricsへ送信する。
+            # [3] JSONまたはterminal tableとして標準出力へ表示する。
+            # [1] runnerを初期化せず、report専用のread-only query経路を使う。
+            analytics = AnalyticsStore(args.state_dir.expanduser() / "jobs.sqlite")
+            group_by = [field.strip() for field in args.group_by.split(",") if field.strip()]
+            repo_path = str(args.repo.expanduser().resolve()) if args.repo else None
+            report_data = analytics.report(
+                group_by=group_by,
+                repo_path=repo_path,
+                since=args.since,
+                include_repair=args.include_repair,
+            )
+            # [2] SQLiteから読み取った集計結果を、明示指定された場合だけ外部へ投影する。
+            if args.export_otel:
+                export_report_to_otel(report_data)
+            # [3] textとJSONのどちらでも同じreport payloadを表示する。
+            if args.format == "json":
+                print(json.dumps(report_data, indent=2, sort_keys=True))
+            else:
+                print(render_text_report(report_data))
+            return 0
         runner = WorkflowRunner(args.state_dir)
         if args.command == "run":
             state = runner.run_new(config_from_args(args))
@@ -365,32 +389,6 @@ def main(argv: list[str] | None = None) -> int:
             return run_exit_code(state.status, notify_error)
         if args.command == "status":
             print(runner.status(args.run_id, include_repair=args.include_repair))
-            return 0
-        if args.command == "report":
-            # report 処理フロー:
-            # [1] run artifactから不足・更新分だけをanalytics DBへ復元する。
-            # [2] group/filter引数を正規化し、SQLiteの集計payloadを作る。
-            # [3] 指定時だけ同じpayloadをOTLP metricsへ送信する。
-            # [4] JSONまたはterminal tableとして標準出力へ表示する。
-            # [1] 古いrunを含め、report対象となるanalytics rowを先に最新化する。
-            runner.analytics.refresh_from_runs(runner.runs_dir)
-            # [2] CLI表記をAnalyticsStoreが受け取るdimension/pathへ変換する。
-            group_by = [field.strip() for field in args.group_by.split(",") if field.strip()]
-            repo_path = str(args.repo.expanduser().resolve()) if args.repo else None
-            report_data = runner.analytics.report(
-                group_by=group_by,
-                repo_path=repo_path,
-                since=args.since,
-                include_repair=args.include_repair,
-            )
-            # [3] SQLiteを正本にした集計結果を、明示指定された場合だけ外部へ投影する。
-            if args.export_otel:
-                export_report_to_otel(report_data)
-            # [4] textとJSONのどちらでも同じreport payloadを表示する。
-            if args.format == "json":
-                print(json.dumps(report_data, indent=2, sort_keys=True))
-            else:
-                print(render_text_report(report_data))
             return 0
         if args.command == "summary":
             summary_path = Path(runner.load_state(args.run_id).summary_path)

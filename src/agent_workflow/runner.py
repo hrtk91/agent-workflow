@@ -82,6 +82,7 @@ class WorkflowRunner:
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
         self._init_db()
         self.analytics = AnalyticsStore(self.db_path)
+        self.analytics.initialize()
 
     def run_new(self, config: RunnerConfig) -> RunState:
         config = self._normalize_config(config)

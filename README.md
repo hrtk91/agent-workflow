@@ -235,7 +235,7 @@ aw report --repo /path/to/repo --since 2026-07-01
 aw report --group-by model,task_type --format json
 ```
 
-`aw report` refreshes analytics rows from saved `state.json` and `trace.jsonl` files before querying. New runs are recorded as they execute. The analytics tables are:
+`aw report` opens SQLite in read-only mode and never creates or updates analytics rows. If the database or analytics schema does not exist yet, it returns an empty report without creating either one. New runs are recorded as they execute. The analytics tables are:
 
 - `run_metrics`: run configuration, QC outcomes, duration, task identity, and final change size
 - `step_attempts`: one row per executor, QC, or other workflow step attempt
