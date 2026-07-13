@@ -296,12 +296,25 @@ always available without external services and includes:
 - timeout flag
 - stdout/stderr log paths
 
-`trace.jsonl` is a local artifact; step spans are not sent to OTLP.
+`trace.jsonl` is always retained as the durable local trace. When a trace OTLP
+endpoint is configured, the same invocation is also exported as one
+`agent_workflow.run` span with a child span for every step attempt:
+
+```bash
+python3 -m pip install '.[otel]'
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+aw run --repo /path/to/repo --task /path/to/task.md --workflow implementation --verify 'pytest'
+```
+
+The root and step spans include the requested model, provider, task type,
+workflow, run status, attempt number, command result, and timeout state. A
+resume or retry creates a new run span and exports only the attempts executed by
+that invocation. Set `OTEL_TRACES_EXPORTER=none` to retain local JSONL without
+remote trace export.
 
 Export a grouped SQLite report as OpenTelemetry gauges over OTLP/HTTP:
 
 ```bash
-python3 -m pip install '.[otel]'
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 aw report --group-by model,task_type --export-otel
 ```

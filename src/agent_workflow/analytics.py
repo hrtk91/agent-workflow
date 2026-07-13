@@ -303,11 +303,18 @@ class AnalyticsStore:
                         continue
                     step_name = name.removeprefix("agent_workflow.step.")
                     attrs = record.get("attributes") or {}
-                    attempt = int(attrs.get("attempt") or 0)
+                    # Accept both the original local keys and the normalized
+                    # OTel keys so old and new run directories rebuild alike.
+                    attempt = int(attrs.get("agent_workflow.step.attempt") or attrs.get("attempt") or 0)
                     if attempt < 1:
                         continue
-                    timed_out = bool(attrs.get("timed_out"))
-                    error = str(attrs.get("error") or (record.get("status") or {}).get("message") or "") or None
+                    timed_out = bool(attrs.get("agent_workflow.step.timed_out", attrs.get("timed_out")))
+                    error = str(
+                        attrs.get("error.message")
+                        or attrs.get("error")
+                        or (record.get("status") or {}).get("message")
+                        or ""
+                    ) or None
                     status_code = str((record.get("status") or {}).get("code") or "")
                     status = trace_attempt_status(step_name, status_code, timed_out, error)
                     self._upsert_attempt_values(
@@ -319,7 +326,7 @@ class AnalyticsStore:
                         started_at=nanos_to_iso(record.get("start_time_unix_nano")),
                         finished_at=nanos_to_iso(record.get("end_time_unix_nano")),
                         duration=float(record["duration_ms"]) / 1000 if record.get("duration_ms") is not None else None,
-                        exit_code=integer_or_none(attrs.get("exit_code")),
+                        exit_code=integer_or_none(attrs.get("process.exit.code", attrs.get("exit_code"))),
                         timed_out=timed_out,
                         error=error,
                     )

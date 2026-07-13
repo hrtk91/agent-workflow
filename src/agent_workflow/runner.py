@@ -18,7 +18,7 @@ from typing import Sequence
 from agent_workflow.analytics import AnalyticsStore
 from agent_workflow.notify.discord import render_llm_notification
 from agent_workflow.state import RunState, StepState
-from agent_workflow.tracing import TraceRecorder, trace_enabled_hint
+from agent_workflow.tracing import TraceRecorder
 
 STEPS = ["load_task", "create_worktree", "run_executor", "run_qc", "write_summary"]
 FAILURE_NOTIFY_STATUSES = {"blocked", "failed", "interrupted", "qc_failed", "timed_out"}
@@ -524,31 +524,50 @@ class WorkflowRunner:
         self.analytics.record_state(state)
 
     def _run_from(self, state: RunState, start_index: int) -> RunState:
-        tracer = TraceRecorder(Path(state.trace_path))
-        state.status = "running"
-        self.save_state(state)
-        index = start_index
-        qc_repair_attempts = 0
-        while index < len(state.steps):
-            step = state.steps[index]
-            if step.status == "succeeded":
-                index += 1
-                continue
-            ok = self._run_step(state, step, tracer)
-            if not ok:
-                if step.name == "run_qc" and qc_repair_attempts < QC_REPAIR_MAX_ATTEMPTS:
-                    qc_repair_attempts += 1
-                    self._prepare_qc_repair_loop(state, qc_repair_attempts)
-                    index = STEPS.index("run_executor")
+        """Execute remaining steps under one run trace and flush it on exit."""
+
+        tracer = TraceRecorder(
+            Path(state.trace_path),
+            run_attributes={
+                "run_id": state.run_id,
+                "repo_path": state.repo_path,
+                "workflow": state.workflow,
+                "provider": state.provider or "",
+                "model": state.model or "",
+                "task_type": state.task_type,
+                "purpose": state.purpose,
+                "executor_bin": state.executor_bin,
+            },
+        )
+        try:
+            state.status = "running"
+            self.save_state(state)
+            index = start_index
+            qc_repair_attempts = 0
+            while index < len(state.steps):
+                step = state.steps[index]
+                if step.status == "succeeded":
+                    index += 1
                     continue
-                self._finalize_failed_summary(state)
-                return state
-            index += 1
-        state.status = "succeeded"
-        state.current_step = None
-        self._write_summary(state)
-        self.save_state(state)
-        return state
+                ok = self._run_step(state, step, tracer)
+                if not ok:
+                    if step.name == "run_qc" and qc_repair_attempts < QC_REPAIR_MAX_ATTEMPTS:
+                        qc_repair_attempts += 1
+                        self._prepare_qc_repair_loop(state, qc_repair_attempts)
+                        index = STEPS.index("run_executor")
+                        continue
+                    self._finalize_failed_summary(state)
+                    return state
+                index += 1
+            state.status = "succeeded"
+            state.current_step = None
+            self._write_summary(state)
+            self.save_state(state)
+            return state
+        finally:
+            # A workflow CLI is short lived; finish the root span and force all
+            # step attempts to OTLP before the process exits.
+            tracer.close(state.status)
 
     def _prepare_qc_repair_loop(self, state: RunState, attempt: int) -> None:
         qc_step = state.step("run_qc")
@@ -585,6 +604,8 @@ class WorkflowRunner:
                 f.write("\n```\n")
 
     def _run_step(self, state: RunState, step: StepState, tracer: TraceRecorder) -> bool:
+        """Execute and persist one step attempt inside its local/remote span."""
+
         step.status = "running"
         step.attempts += 1
         step.started_at = utc_now()
@@ -614,7 +635,6 @@ class WorkflowRunner:
                 purpose=state.purpose,
                 executor_bin=state.executor_bin,
                 attempt=step.attempts,
-                otel_hint=trace_enabled_hint(),
             ) as span:
                 try:
                     getattr(self, f"_step_{step.name}")(state, step, span)

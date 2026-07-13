@@ -75,9 +75,9 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertIn("- takt_phase_usage: `", summary_text)
         trace_rows = [json.loads(line) for line in Path(state["trace_path"]).read_text().splitlines()]
         self.assertEqual(["OK"] * 5, [row["status"]["code"] for row in trace_rows])
-        self.assertEqual({"gpt-test"}, {row["attributes"]["model"] for row in trace_rows})
-        self.assertEqual({"bug_fix"}, {row["attributes"]["task_type"] for row in trace_rows})
-        self.assertEqual({"workflow"}, {row["attributes"]["purpose"] for row in trace_rows})
+        self.assertEqual({"gpt-test"}, {row["attributes"]["gen_ai.request.model"] for row in trace_rows})
+        self.assertEqual({"bug_fix"}, {row["attributes"]["agent_workflow.task.type"] for row in trace_rows})
+        self.assertEqual({"workflow"}, {row["attributes"]["agent_workflow.run.purpose"] for row in trace_rows})
 
         conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
         row = conn.execute("select status, summary_path from jobs where run_id = ?", (state["run_id"],)).fetchone()
