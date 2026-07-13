@@ -1,13 +1,12 @@
-"""task identityとGit変更量をrun artifactから取得する。"""
+"""task packet入力量とGit変更量を計測する。"""
 
 from __future__ import annotations
 
 import hashlib
-import json
 import subprocess
 from pathlib import Path
 
-from agent_workflow.analytics.constants import TASK_IDENTITY_NAME, TASK_PACKET_NAMES
+from agent_workflow.analytics.constants import TASK_PACKET_NAMES
 from agent_workflow.state import RunState
 
 
@@ -36,35 +35,6 @@ def task_packet_identity(task_dir: Path) -> tuple[str | None, int | None]:
         digest.update(name.encode("utf-8") + b"\0" + data + b"\0")
     # [2] task生成前など入力が存在しない状態をnullで表す。
     return (digest.hexdigest(), total) if found else (None, None)
-
-
-def durable_task_packet_identity(state: RunState) -> tuple[str | None, int | None]:
-    """QCがcontext.mdを変更する前のtask識別子を永続化して再利用する。
-
-    処理フロー:
-    - [1] 保存済みtask-identity.jsonがあれば検証して返す。
-    - [2] 現在のtask packetを計算し、初回値だけをartifactへ保存する。
-    """
-
-    # [1] live taskの現在値より、run開始時に固定したartifactを常に優先する。
-    identity_path = Path(state.run_dir) / TASK_IDENTITY_NAME
-    if identity_path.is_file():
-        try:
-            data = json.loads(identity_path.read_text(encoding="utf-8"))
-            sha256 = str(data["sha256"])
-            size = int(data["bytes"])
-            return sha256, size
-        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
-            return None, None
-    # [2] 入力が揃った最初の時点でhashとbyte数を固定する。
-    sha256, size = task_packet_identity(Path(state.task_dir))
-    if sha256 is None or size is None:
-        return None, None
-    identity_path.write_text(
-        json.dumps({"bytes": size, "sha256": sha256}, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    return sha256, size
 
 
 def collect_change_stats(state: RunState) -> tuple[int, int, int] | None:

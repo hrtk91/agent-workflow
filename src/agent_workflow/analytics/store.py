@@ -7,9 +7,9 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-from agent_workflow.analytics.artifacts import collect_change_stats, durable_task_packet_identity
 from agent_workflow.analytics.attempts import qc_outcomes, upsert_step_attempt
 from agent_workflow.analytics.constants import TERMINAL_RUN_STATUSES
+from agent_workflow.analytics.measurements import collect_change_stats, task_packet_identity
 from agent_workflow.analytics.normalization import duration_seconds, run_finished_at
 from agent_workflow.analytics.reporting import build_empty_report, build_report
 from agent_workflow.analytics.schema import initialize_schema
@@ -39,7 +39,7 @@ class AnalyticsStore:
         """
 
         # [1] 比較的遅いfilesystem/Git処理で並列workerのwrite transactionを占有しない。
-        task_sha256, task_bytes = durable_task_packet_identity(state)
+        task_sha256, task_bytes = task_packet_identity(Path(state.task_dir))
         change_stats = collect_change_stats(state) if state.status in TERMINAL_RUN_STATUSES else None
 
         with self._db() as conn:

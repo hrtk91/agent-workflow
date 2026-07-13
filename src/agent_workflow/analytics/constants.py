@@ -13,4 +13,3 @@ GROUP_FIELDS = {
 }
 
 TASK_PACKET_NAMES = ("task.md", "acceptance.md", "constraints.md", "context.md")
-TASK_IDENTITY_NAME = "task-identity.json"

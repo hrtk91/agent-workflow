@@ -56,7 +56,6 @@ Step state is stored in:
 ~/.local/state/agent-workflow/
   jobs.sqlite
   runs/<run-id>/state.json
-  runs/<run-id>/task-identity.json
   runs/<run-id>/summary.md
   runs/<run-id>/trace.jsonl
   runs/<run-id>/logs/*.log
