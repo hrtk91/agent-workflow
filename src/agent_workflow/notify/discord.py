@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agent_workflow.notify.provider import NotificationProvider, notification_provider_from_env
+from agent_workflow.notify.provider import NotificationProvider, notification_provider
 from agent_workflow.state import RunState, StepState
 
 
@@ -172,7 +172,7 @@ def render_llm_notification(
     """
     try:
         context = _collect_notification_context(state)
-        selected_provider = provider or notification_provider_from_env()
+        selected_provider = provider or notification_provider()
         if selected_provider is None:
             return None
         output = selected_provider.generate(_build_llm_prompt(context))

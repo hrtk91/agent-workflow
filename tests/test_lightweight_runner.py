@@ -1040,6 +1040,20 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertFalse(runner._active_worker_job_timed_out(fresh_child))
         self.assertFalse(runner._active_worker_job_timed_out(disabled_child))
 
+    def test_worker_child_receives_active_config_file(self) -> None:
+        runner = WorkflowRunner(self.state_dir)
+        config_path = self.root / "config.toml"
+        process = mock.Mock()
+        with (
+            mock.patch.dict(os.environ, {"AGENT_WORKFLOW_CONFIG_FILE": str(config_path)}),
+            mock.patch("agent_workflow.runner.subprocess.Popen", return_value=process) as popen,
+        ):
+            spawned = runner._spawn_claimed_job("job-1", None, {"failed"}, None)
+
+        self.assertIs(process, spawned)
+        args = popen.call_args.args[0]
+        self.assertEqual(str(config_path), args[args.index("--config-file") + 1])
+
     def test_worker_times_out_active_child_and_marks_queue_failed(self) -> None:
         runner = WorkflowRunner(self.state_dir)
         job_id = runner.enqueue(

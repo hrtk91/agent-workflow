@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -10,10 +11,11 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from agent_workflow.config import NotificationProviderSettings, default_settings, save_settings
 from agent_workflow.notify.provider import (
     CodexNotificationProvider,
     CommandNotificationProvider,
-    notification_provider_from_env,
+    notification_provider,
 )
 
 
@@ -37,16 +39,17 @@ class NotificationProviderTest(unittest.TestCase):
         self.assertNotEqual(Path.cwd(), Path(run.call_args.kwargs["cwd"]))
 
     def test_named_provider_uses_provider_specific_command(self) -> None:
-        with mock.patch.dict(
-            os.environ,
-            {
-                "AGENT_WORKFLOW_NOTIFICATION_PROVIDER": "claude",
-                "AGENT_WORKFLOW_NOTIFICATION_CLAUDE_COMMAND": "claude --print",
-                "AGENT_WORKFLOW_NOTIFICATION_TIMEOUT_SECONDS": "30",
-            },
-            clear=True,
-        ):
-            provider = notification_provider_from_env()
+        settings = default_settings()
+        settings.notification.provider = "claude"
+        settings.notification.providers["claude"] = NotificationProviderSettings(
+            kind="command",
+            command=("claude", "--print"),
+            timeout_seconds=30,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = save_settings(settings, Path(temp_dir) / "config.toml")
+            with mock.patch.dict(os.environ, {}, clear=True):
+                provider = notification_provider(config_path)
 
         self.assertIsInstance(provider, CommandNotificationProvider)
         assert isinstance(provider, CommandNotificationProvider)

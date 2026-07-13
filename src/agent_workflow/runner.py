@@ -1168,12 +1168,19 @@ class WorkflowRunner:
             sys.executable,
             "-m",
             "agent_workflow",
-            "--state-dir",
-            str(self.state_dir),
-            "run-claimed",
-            "--job-id",
-            job_id,
         ]
+        config_file = os.environ.get("AGENT_WORKFLOW_CONFIG_FILE")
+        if config_file:
+            args.extend(["--config-file", str(Path(config_file).expanduser().absolute())])
+        args.extend(
+            [
+                "--state-dir",
+                str(self.state_dir),
+                "run-claimed",
+                "--job-id",
+                job_id,
+            ]
+        )
         if notify_command:
             args.extend(["--notify-command", notify_command])
         if notify_statuses is None:

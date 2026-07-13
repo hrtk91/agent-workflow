@@ -5,6 +5,13 @@ import os
 import sys
 from pathlib import Path
 
+from agent_workflow.config import (
+    CONFIG_FILE_ENV,
+    default_config_path,
+    initialize_settings,
+    load_settings,
+    render_settings,
+)
 from agent_workflow.merge import MergeBlocked, MergeGateConfig, run_merge_approved, run_merge_gate
 from agent_workflow.repair import REPAIR_ACTIONS, REPAIR_CATEGORIES, REPAIR_RISKS, RepairDraftInput, RepairManager
 from agent_workflow.runner import (
@@ -20,6 +27,7 @@ from agent_workflow.runner import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="aw", description="Lightweight resumable agent workflow runner")
     parser.add_argument("--state-dir", type=Path, default=default_state_dir())
+    parser.add_argument("--config-file", type=Path, default=default_config_path())
     sub = parser.add_subparsers(dest="command", required=True)
 
     run = sub.add_parser("run", help="start a new task run")
@@ -77,6 +85,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     cleanup = sub.add_parser("cleanup", help="remove a run worktree")
     cleanup.add_argument("--run-id", required=True)
+
+    config = sub.add_parser("config", help="inspect and initialize agent-workflow settings")
+    config_sub = config.add_subparsers(dest="config_command", required=True)
+    config_sub.add_parser("path", help="print the active config file path")
+    config_sub.add_parser("show", help="print the effective config as TOML")
+    config_init = config_sub.add_parser("init", help="write the default config file")
+    config_init.add_argument("--force", action="store_true")
 
     repair = sub.add_parser("repair", help="create and validate workflow repair drafts")
     repair_sub = repair.add_subparsers(dest="repair_command", required=True)
@@ -253,9 +268,21 @@ def run_exit_code(status: str, notify_error: str = "") -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    runner = WorkflowRunner(args.state_dir)
+    config_path = args.config_file.expanduser().absolute()
+    os.environ[CONFIG_FILE_ENV] = str(config_path)
 
     try:
+        if args.command == "config":
+            if args.config_command == "path":
+                print(config_path)
+                return 0
+            if args.config_command == "show":
+                print(render_settings(load_settings(config_path)), end="")
+                return 0
+            if args.config_command == "init":
+                print(initialize_settings(config_path, force=args.force))
+                return 0
+        runner = WorkflowRunner(args.state_dir)
         if args.command == "run":
             state = runner.run_new(config_from_args(args))
             notify_error = notify_result_if_requested(runner, state, args)

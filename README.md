@@ -123,24 +123,42 @@ are sent only for `blocked`, `failed`, `qc_failed`, and `timed_out`; use
 `--notify-statuses all` when a worker should also report successful runs.
 
 The internal Discord summary is mechanical until a matching notification is
-sent. At send time, the notification adapter generates the final text with an
-isolated Codex invocation. Configure another subscription-backed CLI through a
-named command that reads the prompt from stdin and writes the notification to
-stdout:
+sent. At send time, the notification adapter generates the final text with the
+provider selected in `~/.config/agent-workflow/config.toml`. Create and inspect
+the settings with:
 
 ```bash
-export AGENT_WORKFLOW_NOTIFICATION_PROVIDER=claude
-export AGENT_WORKFLOW_NOTIFICATION_CLAUDE_COMMAND='claude --print'
+aw config init
+aw config show
 ```
 
-The provider name is arbitrary, so the same interface can wrap Grok or another
-CLI. Codex is the default. Its model, reasoning effort, and timeout can be set
-with `AGENT_WORKFLOW_NOTIFICATION_CODEX_MODEL`,
-`AGENT_WORKFLOW_NOTIFICATION_CODEX_REASONING_EFFORT`, and
-`AGENT_WORKFLOW_NOTIFICATION_TIMEOUT_SECONDS`. Codex runs in a temporary empty
-directory with a read-only sandbox, no inherited shell environment, no loaded
-user rules or configuration, and no persisted session. Custom provider commands
-must provide their own equivalent isolation.
+Codex is the default. Add named provider tables for subscription-backed CLIs
+such as Claude or Grok. The command reads the prompt from stdin and writes the
+notification to stdout:
+
+```toml
+[notification]
+provider = "claude"
+
+[notification.providers.codex]
+kind = "codex"
+command = ["codex", "exec"]
+timeout_seconds = 120
+model = "gpt-5.6-luna"
+reasoning_effort = "medium"
+
+[notification.providers.claude]
+kind = "command"
+command = ["claude", "--print"]
+timeout_seconds = 120
+```
+
+Pass `--config-file <path>` before the subcommand to use another file.
+`AGENT_WORKFLOW_NOTIFICATION_*` environment variables override the loaded file
+for one process. Codex runs in a temporary empty directory with a read-only
+sandbox, no inherited shell environment, no loaded user rules or configuration,
+and no persisted session. Custom provider commands must provide their own
+equivalent isolation.
 
 Enable diagnosis-loop dispatch when the worker should enqueue a diagnosis task
 after a normal workflow reaches a terminal failure:
