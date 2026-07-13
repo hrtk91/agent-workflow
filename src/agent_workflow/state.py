@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+WORKFLOW_STEPS = ("load_task", "create_worktree", "run_executor", "run_qc", "write_summary")
+
 
 @dataclass
 class StepState:
@@ -15,6 +17,8 @@ class StepState:
     exit_code: int | None = None
     timed_out: bool = False
     error: str | None = None
+    stdout_path: str | None = None
+    stderr_path: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "StepState":
@@ -40,7 +44,6 @@ class RunState:
     repair_for_run_id: str | None = None
     worktree_path: str | None = None
     summary_path: str = ""
-    trace_path: str = ""
     current_step: str | None = None
     created_at: str = ""
     updated_at: str = ""
@@ -51,6 +54,8 @@ class RunState:
         data = dict(data)
         if "takt_bin" in data and "executor_bin" not in data:
             data["executor_bin"] = data.pop("takt_bin")
+        # trace.jsonlを持つ旧state snapshotはDB migration時に読み捨てる。
+        data.pop("trace_path", None)
         data["steps"] = [StepState.from_dict(item) for item in data.get("steps", [])]
         return cls(**data)
 

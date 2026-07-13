@@ -1,7 +1,6 @@
 """SQLite analyticsの公開API。
 
-既存の ``agent_workflow.analytics`` importを維持しながら、保存・集計・
-入力および変更量計測の実装を責務別moduleへ分離する。
+raw run factsのread-only集計と表示helperを公開する。
 """
 
 from agent_workflow.analytics.measurements import (
@@ -30,15 +29,17 @@ from agent_workflow.analytics.reporting import (
     rounded_median,
     wilson_interval,
 )
-from agent_workflow.analytics.store import AnalyticsStore
+from agent_workflow.analytics.reporter import AnalyticsReporter
+from agent_workflow.analytics.run_detail import build_run_detail, render_run_detail
 
 __all__ = [
-    "AnalyticsStore",
+    "AnalyticsReporter",
     "GROUP_FIELDS",
     "TASK_PACKET_NAMES",
     "TERMINAL_RUN_STATUSES",
     "TERMINAL_STEP_STATUSES",
     "collect_change_stats",
+    "build_run_detail",
     "display_dimension",
     "duration_seconds",
     "excluded_metric_path",
@@ -47,6 +48,7 @@ __all__ = [
     "format_number",
     "format_rate",
     "rate",
+    "render_run_detail",
     "render_text_report",
     "rounded_median",
     "run_finished_at",

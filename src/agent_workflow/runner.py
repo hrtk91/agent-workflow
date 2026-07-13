@@ -10,17 +10,17 @@ import subprocess
 import sys
 import time
 import configparser
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
-from agent_workflow.analytics import AnalyticsStore
 from agent_workflow.notify.discord import render_llm_notification
-from agent_workflow.state import RunState, StepState
+from agent_workflow.state import WORKFLOW_STEPS, RunState, StepState
+from agent_workflow.storage import RunStore
 from agent_workflow.tracing import TraceRecorder
 
-STEPS = ["load_task", "create_worktree", "run_executor", "run_qc", "write_summary"]
+STEPS = list(WORKFLOW_STEPS)
 FAILURE_NOTIFY_STATUSES = {"blocked", "failed", "interrupted", "qc_failed", "timed_out"}
 AUTO_REPAIR_MAX_ATTEMPTS = 2
 QC_REPAIR_MAX_ATTEMPTS = 5
@@ -80,9 +80,9 @@ class WorkflowRunner:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
+        self.run_store = RunStore(self.state_dir)
+        self.run_store.initialize()
         self._init_db()
-        self.analytics = AnalyticsStore(self.db_path)
-        self.analytics.initialize()
 
     def run_new(self, config: RunnerConfig) -> RunState:
         config = self._normalize_config(config)
@@ -93,7 +93,6 @@ class WorkflowRunner:
         run_id = new_run_id()
         run_dir = self.runs_dir / run_id
         task_dir = run_dir / "task"
-        trace_path = run_dir / "trace.jsonl"
         summary_path = run_dir / "summary.md"
         now = utc_now()
         state = RunState(
@@ -113,7 +112,6 @@ class WorkflowRunner:
             purpose=config.purpose,
             repair_for_run_id=config.repair_for_run_id,
             summary_path=str(summary_path),
-            trace_path=str(trace_path),
             created_at=now,
             updated_at=now,
             steps=[StepState(name=name) for name in STEPS],
@@ -362,7 +360,7 @@ class WorkflowRunner:
                 rows = conn.execute(
                     f"""
                     select run_id
-                    from jobs
+                    from runs
                     where status in ({','.join('?' for _ in FAILURE_NOTIFY_STATUSES)})
                       and updated_at >= ?
                     order by updated_at desc
@@ -374,7 +372,7 @@ class WorkflowRunner:
                 rows = conn.execute(
                     f"""
                     select run_id
-                    from jobs
+                    from runs
                     where status in ({','.join('?' for _ in FAILURE_NOTIFY_STATUSES)})
                     order by updated_at desc
                     limit ?
@@ -388,7 +386,7 @@ class WorkflowRunner:
                 continue
             try:
                 state = self.load_state(run_id)
-            except (FileNotFoundError, json.JSONDecodeError):
+            except FileNotFoundError:
                 continue
             if state.purpose in {"repair", "repair_action"}:
                 continue
@@ -400,12 +398,12 @@ class WorkflowRunner:
     def recover_stale_running(self, error: str) -> int:
         recovered = 0
         with self._db() as conn:
-            rows = conn.execute("select run_id from jobs where status = 'running'").fetchall()
+            rows = conn.execute("select run_id from runs where status = 'running'").fetchall()
         for row in rows:
             run_id = str(row[0])
             try:
                 state = self.load_state(run_id)
-            except (FileNotFoundError, json.JSONDecodeError):
+            except FileNotFoundError:
                 continue
             state.status = "failed"
             if state.current_step:
@@ -447,6 +445,8 @@ class WorkflowRunner:
             step.exit_code = None
             step.timed_out = False
             step.error = None
+            step.stdout_path = None
+            step.stderr_path = None
         self.save_state(state)
         return self._run_from(state, index)
 
@@ -461,7 +461,7 @@ class WorkflowRunner:
                 "select job_id, status, coalesce(run_id, ''), coalesce(summary_path, ''), config_json from queue order by created_at desc limit 100"
             ).fetchall()
             run_rows = conn.execute(
-                "select run_id, status, coalesce(current_step, ''), summary_path from jobs order by created_at desc limit 100"
+                "select run_id, status, coalesce(current_step, ''), summary_path from runs order by created_at desc limit 100"
             ).fetchall()
         visible_queue_rows = []
         for row in queue_rows:
@@ -530,41 +530,34 @@ class WorkflowRunner:
         return ""
 
     def load_state(self, run_id: str) -> RunState:
-        path = self.runs_dir / run_id / "state.json"
-        return RunState.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        return self.run_store.load(run_id)
 
     def save_state(self, state: RunState) -> None:
-        """run状態をartifact・運用index・分析DBへ同じ順序で永続化する。
+        """run本体・current steps・attempt履歴をSQLiteへ永続化する。
 
         処理フロー:
-        - [1] 更新時刻を確定してstate.jsonへ書き込む。
-        - [2] jobs tableの最新状態indexを更新する。
-        - [3] 同じstateを正規化したanalytics tableへ反映する。
+        - [1] run全体で共有する更新時刻を確定する。
+        - [2] RunStoreの単一transactionへ状態保存を委譲する。
         """
 
-        # [1] 後続の2つのDB更新と同じupdated_atを持つstate artifactを先に確定する。
+        # [1] run・step・attemptが同じ時点のsnapshotになる時刻を作る。
         state.updated_at = utc_now()
-        state.run_path.mkdir(parents=True, exist_ok=True)
-        (state.run_path / "state.json").write_text(json.dumps(asdict(state), indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        # [2] status表示やworker回復が参照する軽量な運用indexを更新する。
-        self._upsert_job(state)
-        # [3] run/attempt分析値を同じjobs.sqlite内へ正規化して保存する。
-        self.analytics.record_state(state)
+        # [2] filesystemへ可変stateを複製せず、SQLiteだけを正本にする。
+        self.run_store.save(state)
 
     def _run_from(self, state: RunState, start_index: int) -> RunState:
-        """指定位置から残りstepを実行し、run traceを終了時にflushする。
+        """指定位置から残りstepを実行し、optional OTLP traceをflushする。
 
         処理フロー:
-        - [1] run属性を持つlocal/remote trace sessionを開始する。
+        - [1] run属性を持つoptional OTLP trace sessionを開始する。
         - [2] runをrunningとして保存し、未完了stepを順番に実行する。
         - [3] QC失敗時は上限内でexecutorへ戻し、上限到達時は失敗を確定する。
         - [4] 全step成功時はsummaryとterminal stateを保存する。
-        - [5] return・失敗・例外の全経路でrun traceをflushして閉じる。
+        - [5] return・失敗・例外の全経路でOTLP sessionをflushして閉じる。
         """
 
         # [1] resume/retryを含む今回の呼び出し単位で親run spanを作る。
         tracer = TraceRecorder(
-            Path(state.trace_path),
             run_attributes={
                 "run_id": state.run_id,
                 "repo_path": state.repo_path,
@@ -605,7 +598,7 @@ class WorkflowRunner:
             self.save_state(state)
             return state
         finally:
-            # [5] 短命CLIが終了する前に親spanを閉じ、全step attemptをOTLPへflushする。
+            # [5] 短命CLIが終了する前に親spanを閉じ、OTLP有効時だけflushする。
             tracer.close(state.status)
 
     def _prepare_qc_repair_loop(self, state: RunState, attempt: int) -> None:
@@ -616,14 +609,18 @@ class WorkflowRunner:
         executor_step.error = None
         executor_step.exit_code = None
         executor_step.timed_out = False
+        executor_step.stdout_path = None
+        executor_step.stderr_path = None
         qc_step.status = "pending"
+        qc_step.stdout_path = None
+        qc_step.stderr_path = None
         state.status = "running"
         state.current_step = "run_executor"
         self.save_state(state)
 
     def _append_qc_repair_context(self, state: RunState, attempt: int, error: str) -> None:
         task_dir = Path(state.task_dir)
-        log_path = Path(state.run_dir) / "logs" / "run_qc.log"
+        log_path = Path(state.run_dir) / "logs" / "run_qc.stdout.log"
         excerpt = ""
         if log_path.is_file():
             lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -662,6 +659,8 @@ class WorkflowRunner:
         step.exit_code = None
         step.timed_out = False
         step.error = None
+        step.stdout_path = None
+        step.stderr_path = None
         state.current_step = step.name
         self.save_state(state)
         # [2] process signalを通常のstep失敗処理へ合流できる例外に変換する。
@@ -674,7 +673,7 @@ class WorkflowRunner:
         signal.signal(signal.SIGINT, interrupt_handler)
         signal.signal(signal.SIGTERM, interrupt_handler)
         try:
-            # [3] model/task typeを含む共通属性でlocal/remote step spanを開始する。
+            # [3] model/task typeを含む共通属性でoptional OTLP step spanを開始する。
             with tracer.span(
                 f"agent_workflow.step.{step.name}",
                 run_id=state.run_id,
@@ -761,6 +760,8 @@ class WorkflowRunner:
         result = run_logged(args, Path(state.worktree_path or state.repo_path), Path(state.run_dir) / "logs", "run_executor", state.timeout_seconds)
         step.exit_code = result.exit_code
         step.timed_out = result.timed_out
+        step.stdout_path = result.stdout_path
+        step.stderr_path = result.stderr_path
         attrs = result.attrs()
         snapshot = self._snapshot_executor_observability(state, started_at - 2)
         if snapshot:
@@ -775,6 +776,8 @@ class WorkflowRunner:
         result = run_logged(["bash", "-lc", state.verify_command], Path(state.worktree_path or state.repo_path), Path(state.run_dir) / "logs", "run_qc", state.timeout_seconds)
         step.exit_code = result.exit_code
         step.timed_out = result.timed_out
+        step.stdout_path = result.stdout_path
+        step.stderr_path = result.stderr_path
         span["attributes"] = {**span["attributes"], **result.attrs()}
         if result.timed_out:
             raise StepFailure("timed_out", "timed_out", "QC command timed out", result.exit_code, True)
@@ -809,7 +812,6 @@ class WorkflowRunner:
             f"- updated_at: `{state.updated_at}`",
             f"- elapsed_seconds: `{elapsed}`",
             f"- timeout_seconds: `{format_seconds(state.timeout_seconds)}`",
-            f"- trace: `{state.trace_path}`",
             "",
             "## steps",
         ]
@@ -883,7 +885,7 @@ class WorkflowRunner:
         return RunnerConfig(
             state_dir=self.state_dir,
             repo_path=repo,
-            task_text=render_repair_action_task(failed_state, draft),
+            task_text=render_repair_action_task(failed_state, draft, self.state_dir),
             workflow=failed_state.workflow,
             verify_command=verify_command,
             timeout_seconds=failed_state.timeout_seconds,
@@ -1147,19 +1149,6 @@ class WorkflowRunner:
         with self._db() as conn:
             conn.execute(
                 """
-                create table if not exists jobs (
-                  run_id text primary key,
-                  status text not null,
-                  current_step text,
-                  repo_path text not null,
-                  summary_path text not null,
-                  created_at text not null,
-                  updated_at text not null
-                )
-                """
-            )
-            conn.execute(
-                """
                 create table if not exists queue (
                   job_id text primary key,
                   status text not null,
@@ -1171,22 +1160,6 @@ class WorkflowRunner:
                   updated_at text not null
                 )
                 """
-            )
-
-    def _upsert_job(self, state: RunState) -> None:
-        with self._db() as conn:
-            conn.execute(
-                """
-                insert into jobs(run_id, status, current_step, repo_path, summary_path, created_at, updated_at)
-                values(?, ?, ?, ?, ?, ?, ?)
-                on conflict(run_id) do update set
-                  status=excluded.status,
-                  current_step=excluded.current_step,
-                  repo_path=excluded.repo_path,
-                  summary_path=excluded.summary_path,
-                  updated_at=excluded.updated_at
-                """,
-                (state.run_id, state.status, state.current_step, state.repo_path, state.summary_path, state.created_at, state.updated_at),
             )
 
     def _db(self) -> sqlite3.Connection:
@@ -1331,10 +1304,7 @@ class WorkflowRunner:
             return str(config.repo_path.expanduser())
 
     def _run_purpose(self, run_id: str) -> str:
-        try:
-            return self.load_state(run_id).purpose
-        except (FileNotFoundError, json.JSONDecodeError, TypeError):
-            return "workflow"
+        return self.run_store.purpose(run_id)
 
     def _finish_queue_job(self, job_id: str, status: str, run_id: str, summary_path: str, error: str) -> None:
         with self._db() as conn:
@@ -1364,7 +1334,7 @@ class WorkflowRunner:
             row = conn.execute(
                 """
                 select run_id
-                from jobs
+                from runs
                 where status = 'running'
                   and repo_path = ?
                   and created_at >= ?
@@ -1377,7 +1347,7 @@ class WorkflowRunner:
             return
         try:
             state = self.load_state(str(row[0]))
-        except (FileNotFoundError, json.JSONDecodeError):
+        except FileNotFoundError:
             return
         state.status = "failed"
         if state.current_step:
@@ -1624,14 +1594,23 @@ def render_auto_repair_verify_command(state_dir: Path, failed_run_id: str) -> st
 
 
 def render_auto_repair_task(failed_state: RunState, state_dir: Path) -> str:
+    """failed runのDB reportを起点にdiagnosis taskを組み立てる。
+
+    処理フロー:
+    - [1] failed step・artifact path・read-only report commandを確定する。
+    - [2] repair draft作成までの制約をexecutor向けtask textへ埋め込む。
+    """
+
+    # [1] state fileの代わりに同じstate dirを読むreport commandを調査入口にする。
     step = current_or_failed_step(failed_state)
     step_line = f"{step.name} status={step.status} attempts={step.attempts}" if step else "unknown"
     summary = failed_state.summary_path
-    trace = failed_state.trace_path
     logs = str(Path(failed_state.run_dir) / "logs")
     worktree = failed_state.worktree_path or ""
     state_arg = shlex.quote(str(state_dir))
     command_prefix = f"{shlex.quote(sys.executable)} -m agent_workflow --state-dir {state_arg}"
+    report_command = f"{command_prefix} report --run-id {failed_state.run_id} --format json"
+    # [2] 診断結果をfree-form回答で終えず、validated draftへ接続する指示を返す。
     return f"""Diagnose and draft a repair for agent-workflow run {failed_state.run_id}.
 
 Failed run:
@@ -1641,12 +1620,12 @@ Failed run:
 - repo: {failed_state.repo_path}
 - worktree: {worktree}
 - summary: {summary}
-- trace_jsonl: {trace}
+- run_report: {report_command}
 - logs_dir: {logs}
 
 Your job is to recover the workflow loop, not to manually finish the product task.
 
-Read the summary, trace, executor logs, QC logs, and any copied executor observability. Classify the failure using the repair CLI choices and create a validated repair draft. Use the typed CLI as the output tool; do not leave an unvalidated free-form answer.
+Read the DB-backed run report, summary, executor logs, QC logs, and any copied executor observability. Classify the failure using the repair CLI choices and create a validated repair draft. Use the typed CLI as the output tool; do not leave an unvalidated free-form answer.
 
 Create concise Markdown files for:
 - diagnosis.md: what failed, the likely cause, and the next repair action.
@@ -1673,13 +1652,31 @@ Rules:
 """
 
 
-def render_repair_action_task(failed_state: RunState, draft: dict[str, str]) -> str:
+def render_repair_action_task(
+    failed_state: RunState,
+    draft: dict[str, str],
+    state_dir: Path,
+) -> str:
+    """validated draftとfailed run reportから実装修復taskを組み立てる。
+
+    処理フロー:
+    - [1] draft metadata・QC・read-only report commandを確定する。
+    - [2] 実装とQC完了を要求するrepair-action task textへ埋め込む。
+    """
+
+    # [1] repair executorがcustom state dirでも同じfailed runを参照できるcommandを作る。
     draft_dir = draft.get("draft_dir", "")
     title = draft.get("title") or "validated repair action"
     category = draft.get("category", "")
     risk = draft.get("risk", "")
     proposed_action = draft.get("proposed_action", "")
     verify_command = draft.get("verify_command") or failed_state.verify_command
+    state_arg = shlex.quote(str(state_dir))
+    report_command = (
+        f"{shlex.quote(sys.executable)} -m agent_workflow --state-dir {state_arg} "
+        f"report --run-id {failed_state.run_id} --format json"
+    )
+    # [2] diagnosisだけで完了扱いにせず、修復適用とQC greenを完了条件にする。
     return f"""Execute the validated repair action for agent-workflow run {failed_state.run_id}.
 
 Repair draft:
@@ -1697,7 +1694,7 @@ Failed run:
 - status: {failed_state.status}
 - worktree: {failed_state.worktree_path or ""}
 - summary: {failed_state.summary_path}
-- trace_jsonl: {failed_state.trace_path}
+- run_report: {report_command}
 
 Your job is to perform the repair, not just describe it.
 

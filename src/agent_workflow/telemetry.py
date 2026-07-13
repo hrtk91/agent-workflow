@@ -139,18 +139,6 @@ class OtelTraceSession:
         # [3] 各step attemptを親spanへ接続するcontextを固定する。
         self.root_context = trace_api.set_span_in_context(self.root_span)
 
-    @property
-    def trace_id(self) -> str:
-        """Return the remote root trace ID in the JSONL-compatible format."""
-
-        return format(self.root_span.get_span_context().trace_id, "032x")
-
-    @property
-    def root_span_id(self) -> str:
-        """Return the remote root span ID in the JSONL-compatible format."""
-
-        return format(self.root_span.get_span_context().span_id, "016x")
-
     def start_step(self, name: str, attributes: Mapping[str, object]) -> Any:
         """Start a child span beneath the run span."""
 
@@ -171,13 +159,13 @@ class OtelTraceSession:
 
         処理フロー:
         - [1] command結果を含む最終属性を反映する。
-        - [2] local JSONLと同じstatusを設定する。
+        - [2] workflowのstep結果に対応するOTel statusを設定する。
         - [3] 子spanを終了してexport待ちqueueへ渡す。
         """
 
         # [1] span開始後に判明したexit codeやtimeoutも含めて上書きする。
         span.set_attributes(normalize_telemetry_attributes(attributes))
-        # [2] local recordとremote spanの成否を同じ判定に揃える。
+        # [2] step結果の成否をcollector上でも同じ判定に揃える。
         span.set_status(self._status(status_code, status_message))
         # [3] BatchSpanProcessorが送信できる完了spanにする。
         span.end()
@@ -288,7 +276,7 @@ def load_otlp_trace_runtime(run_attributes: dict[str, object]) -> OtelTraceSessi
     - [4] run専用provider・processor・tracerを組み立ててsessionを返す。
     """
 
-    # [1] 明示無効化またはendpoint未設定ならlocal JSONLだけを使用する。
+    # [1] 明示無効化またはendpoint未設定ならtrace記録をno-opにする。
     if os.environ.get("OTEL_TRACES_EXPORTER", "otlp").lower() == "none":
         return None
     endpoint = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")

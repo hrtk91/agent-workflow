@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from agent_workflow.analytics import AnalyticsStore, render_text_report
+from agent_workflow.analytics import AnalyticsReporter, render_run_detail, render_text_report
 from agent_workflow.config import (
     CONFIG_FILE_ENV,
     default_config_path,
@@ -83,6 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--include-repair", action="store_true", help="include internal repair-diagnosis jobs in recent status output")
 
     report = sub.add_parser("report", help="report QC success and run metrics from SQLite")
+    report.add_argument("--run-id", help="show one run's current steps and complete attempt history")
     report.add_argument("--group-by", default="model", help="comma-separated dimensions: model, provider, task_type, workflow, repo, status")
     report.add_argument("--repo", type=Path, help="filter by repository path")
     report.add_argument("--since", help="include runs created at or after this ISO date/time")
@@ -297,11 +298,21 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
         if args.command == "report":
             # report 処理フロー:
-            # [1] group/filter引数を正規化し、SQLiteの集計payloadを読み取る。
-            # [2] 指定時だけ同じpayloadをOTLP metricsへ送信する。
-            # [3] JSONまたはterminal tableとして標準出力へ表示する。
+            # [1] SQLiteをread-onlyで開き、run詳細または集計payloadを読み取る。
+            # [2] 集計時だけ、明示指定に応じて同じpayloadをOTLP metricsへ送信する。
+            # [3] JSONまたはterminal向けtextとして標準出力へ表示する。
             # [1] runnerを初期化せず、report専用のread-only query経路を使う。
-            analytics = AnalyticsStore(args.state_dir.expanduser() / "jobs.sqlite")
+            analytics = AnalyticsReporter(args.state_dir.expanduser() / "jobs.sqlite")
+            if args.run_id:
+                if args.export_otel:
+                    raise ValueError("--export-otel cannot be used with --run-id")
+                report_data = analytics.run_detail(args.run_id)
+                print(
+                    json.dumps(report_data, indent=2, sort_keys=True)
+                    if args.format == "json"
+                    else render_run_detail(report_data)
+                )
+                return 0
             group_by = [field.strip() for field in args.group_by.split(",") if field.strip()]
             repo_path = str(args.repo.expanduser().resolve()) if args.repo else None
             report_data = analytics.report(

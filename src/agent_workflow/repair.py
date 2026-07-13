@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import configparser
-import json
+import shlex
 import shutil
 import sqlite3
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from agent_workflow.runner import FAILURE_NOTIFY_STATUSES, new_run_id, utc_now
+from agent_workflow.storage import RunStore
 
 REPAIR_CATEGORIES = {
     "dependency_missing",
@@ -71,11 +73,12 @@ class RepairDraft:
 class RepairManager:
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = state_dir.expanduser()
-        self.runs_dir = self.state_dir / "runs"
         self.repairs_dir = self.state_dir / "repairs"
         self.db_path = self.state_dir / "jobs.sqlite"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.repairs_dir.mkdir(parents=True, exist_ok=True)
+        self.run_store = RunStore(self.state_dir)
+        self.run_store.initialize()
         self._init_db()
 
     def draft(self, draft_input: RepairDraftInput, allow_duplicate: bool = False) -> RepairDraft:
@@ -110,7 +113,11 @@ class RepairManager:
             "retry_original": str(bool(draft_input.retry_original)).lower(),
             "created_at": now,
             "updated_at": now,
-            "failed_run_state": str(self._state_path(draft_input.failed_run_id)),
+            "failed_run_report": (
+                f"{shlex.quote(sys.executable)} -m agent_workflow "
+                f"--state-dir {shlex.quote(str(self.state_dir))} report "
+                f"--run-id {draft_input.failed_run_id} --format json"
+            ),
             "diagnosis": "diagnosis.md",
             "evidence": "evidence.md",
             "notify_before": "notify-before.md",
@@ -187,20 +194,20 @@ class RepairManager:
             rows = conn.execute(
                 f"""
                 select
-                  jobs.run_id,
-                  jobs.status,
-                  coalesce(jobs.current_step, '') as current_step,
-                  jobs.summary_path,
+                  runs.run_id,
+                  runs.status,
+                  coalesce(runs.current_step, '') as current_step,
+                  runs.summary_path,
                   coalesce(repairs.repair_status, '') as repair_status
-                from jobs
+                from runs
                 left join (
                   select failed_run_id, group_concat(draft_id || ':' || status, ',') as repair_status
                   from repair_drafts
                   group by failed_run_id
-                ) repairs on repairs.failed_run_id = jobs.run_id
-                where jobs.status in ({','.join('?' for _ in FAILURE_NOTIFY_STATUSES)})
+                ) repairs on repairs.failed_run_id = runs.run_id
+                where runs.status in ({','.join('?' for _ in FAILURE_NOTIFY_STATUSES)})
                 {repair_filter}
-                order by jobs.created_at desc
+                order by runs.created_at desc
                 limit ?
                 """,
                 params,
@@ -255,11 +262,10 @@ class RepairManager:
             raise ValueError(f"unknown proposed_action {proposed_action}; expected one of {', '.join(sorted(REPAIR_ACTIONS))}")
 
     def _validate_failed_run(self, run_id: str) -> None:
-        state_path = self._state_path(run_id)
-        if not state_path.exists():
-            raise ValueError(f"failed run state does not exist: {state_path}")
-        data = json.loads(state_path.read_text(encoding="utf-8"))
-        status = str(data.get("status") or "")
+        try:
+            status = self.run_store.load(run_id).status
+        except FileNotFoundError as exc:
+            raise ValueError(f"failed run does not exist: {run_id}") from exc
         if status not in FAILURE_NOTIFY_STATUSES:
             raise ValueError(f"run {run_id} is {status}, expected one of {', '.join(sorted(FAILURE_NOTIFY_STATUSES))}")
 
@@ -325,15 +331,8 @@ class RepairManager:
         conn.execute("pragma journal_mode=wal")
         return conn
 
-    def _state_path(self, run_id: str) -> Path:
-        return self.runs_dir / run_id / "state.json"
-
     def _run_purpose(self, run_id: str) -> str:
-        try:
-            data = json.loads(self._state_path(run_id).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return "workflow"
-        return str(data.get("purpose") or "workflow")
+        return self.run_store.purpose(run_id)
 
     def _write_config(self, draft_dir: Path, config: configparser.ConfigParser) -> None:
         with (draft_dir / "repair.ini").open("w", encoding="utf-8") as f:
