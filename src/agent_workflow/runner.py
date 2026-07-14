@@ -574,7 +574,6 @@ class WorkflowRunner:
             state.status = "running"
             self.save_state(state)
             index = start_index
-            qc_repair_attempts = 0
             while index < len(state.steps):
                 step = state.steps[index]
                 if step.status == "succeeded":
@@ -583,9 +582,9 @@ class WorkflowRunner:
                 ok = self._run_step(state, step, tracer)
                 if not ok:
                     # [3] QCだけは修正loopへ戻し、その他の失敗または上限到達を確定する。
-                    if step.name == "run_qc" and qc_repair_attempts < QC_REPAIR_MAX_ATTEMPTS:
-                        qc_repair_attempts += 1
-                        self._prepare_qc_repair_loop(state, qc_repair_attempts)
+                    if step.name == "run_qc" and state.qc_repair_attempts < QC_REPAIR_MAX_ATTEMPTS:
+                        state.qc_repair_attempts += 1
+                        self._prepare_qc_repair_loop(state, state.qc_repair_attempts)
                         index = STEPS.index("run_executor")
                         continue
                     self._finalize_failed_summary(state)
@@ -616,6 +615,7 @@ class WorkflowRunner:
         qc_step.stderr_path = None
         state.status = "running"
         state.current_step = "run_executor"
+        # Persist attempt budget before re-entering executor so resume shares the same limit.
         self.save_state(state)
 
     def _append_qc_repair_context(self, state: RunState, attempt: int, error: str) -> None:
@@ -812,6 +812,7 @@ class WorkflowRunner:
             f"- updated_at: `{state.updated_at}`",
             f"- elapsed_seconds: `{elapsed}`",
             f"- timeout_seconds: `{format_seconds(state.timeout_seconds)}`",
+            f"- qc_repair_attempts: `{state.qc_repair_attempts}/{QC_REPAIR_MAX_ATTEMPTS}`",
             "",
             "## steps",
         ]

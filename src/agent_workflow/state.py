@@ -45,6 +45,9 @@ class RunState:
     worktree_path: str | None = None
     summary_path: str = ""
     current_step: str | None = None
+    # Number of QC→executor repair loops already started for this run.
+    # Persisted so resume/retry share the same run-level budget (max QC_REPAIR_MAX_ATTEMPTS).
+    qc_repair_attempts: int = 0
     created_at: str = ""
     updated_at: str = ""
     steps: list[StepState] = field(default_factory=list)
@@ -56,6 +59,7 @@ class RunState:
             data["executor_bin"] = data.pop("takt_bin")
         # trace.jsonlを持つ旧state snapshotはDB migration時に読み捨てる。
         data.pop("trace_path", None)
+        data.setdefault("qc_repair_attempts", 0)
         data["steps"] = [StepState.from_dict(item) for item in data.get("steps", [])]
         return cls(**data)
 

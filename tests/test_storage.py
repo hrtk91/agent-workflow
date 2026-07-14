@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from agent_workflow.storage import RunStore
+from agent_workflow.state import RunState
 
 
 class RunStoreMigrationTest(unittest.TestCase):
@@ -38,6 +39,7 @@ class RunStoreMigrationTest(unittest.TestCase):
             loaded = store.load(run_id)
             self.assertEqual("succeeded", loaded.status)
             self.assertEqual("gpt-state", loaded.model)
+            self.assertEqual(0, loaded.qc_repair_attempts)
             self.assertEqual(2, loaded.step("run_qc").attempts)
             with sqlite3.connect(state_dir / "jobs.sqlite") as conn:
                 tables = {
@@ -70,6 +72,24 @@ class RunStoreMigrationTest(unittest.TestCase):
             self.assertEqual(0, store.initialize())
             self.assertEqual("succeeded", store.load(run_id).status)
             self.assertTrue(state_path.exists())
+
+    def test_qc_repair_attempts_round_trip_through_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            run_dir = state_dir / "runs" / "run-with-budget"
+            task_dir = run_dir / "task"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.md").write_text("task\n", encoding="utf-8")
+            store = RunStore(state_dir)
+            store.initialize()
+            state = self._legacy_state(state_dir, "run-with-budget")
+            state["status"] = "running"
+            state["qc_repair_attempts"] = 4
+            loaded = RunState.from_dict(state)
+            store.save(loaded)
+
+            restored = store.load("run-with-budget")
+            self.assertEqual(4, restored.qc_repair_attempts)
 
     @staticmethod
     def _legacy_state(state_dir: Path, run_id: str) -> dict[str, object]:

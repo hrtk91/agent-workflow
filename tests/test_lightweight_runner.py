@@ -392,10 +392,114 @@ class LightweightRunnerTest(unittest.TestCase):
         state = self._state(Path(result.stdout.strip()))
         attempts = {step["name"]: step["attempts"] for step in state["steps"]}
         self.assertEqual("qc_failed", state["status"])
+        self.assertEqual(5, state["qc_repair_attempts"])
         self.assertEqual(6, attempts["run_executor"])
         self.assertEqual(6, attempts["run_qc"])
+        summary_text = Path(state["summary_path"]).read_text()
+        self.assertIn("qc_repair_attempts: `5/5`", summary_text)
         context = Path(state["task_dir"], "context.md").read_text()
         self.assertIn("QC repair loop 5/5", context)
+
+    def test_qc_repair_budget_is_shared_across_resume(self) -> None:
+        """Run-level QC repair budget must not reset when resume re-enters the loop."""
+        first = self._aw(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Implement but never create the QC marker.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+            check=False,
+        )
+        state = self._state(Path(first.stdout.strip()))
+        self.assertEqual(5, state["qc_repair_attempts"])
+
+        # Simulate resume after the budget is exhausted: re-run executor+QC only.
+        resumed_state = RunStore(self.state_dir).load(str(state["run_id"]))
+        for step in resumed_state.steps:
+            if step.name in {"run_executor", "run_qc", "write_summary"}:
+                step.status = "pending"
+                step.error = None
+                step.exit_code = None
+                step.timed_out = False
+        resumed_state.status = "qc_failed"
+        resumed_state.current_step = "run_executor"
+        RunStore(self.state_dir).save(resumed_state)
+
+        resumed = self._aw("resume", "--run-id", str(state["run_id"]), check=False)
+        self.assertEqual(1, resumed.returncode)
+        resumed_state = self._state(Path(resumed.stdout.strip()))
+        attempts = {step["name"]: step["attempts"] for step in resumed_state["steps"]}
+        self.assertEqual("qc_failed", resumed_state["status"])
+        self.assertEqual(5, resumed_state["qc_repair_attempts"])
+        # Budget exhausted: one more executor+QC pair, no additional repair loop.
+        self.assertEqual(7, attempts["run_executor"])
+        self.assertEqual(7, attempts["run_qc"])
+        context = Path(str(resumed_state["task_dir"]), "context.md").read_text(encoding="utf-8")
+        self.assertNotIn("QC repair loop 6/", context)
+
+    def test_qc_repair_budget_allows_only_remaining_loops_after_resume(self) -> None:
+        """A mid-run saved attempt count continues with the remaining budget only."""
+        first = self._aw(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Implement but never create the QC marker.",
+            "--verify-command",
+            "test -f qc-pass",
+            "--executor-bin",
+            str(self.fake_takt),
+            check=False,
+        )
+        state = self._state(Path(first.stdout.strip()))
+
+        # Pretend the process died after 4 repair loops had already been started.
+        resumed_state = RunStore(self.state_dir).load(str(state["run_id"]))
+        resumed_state.qc_repair_attempts = 4
+        for step in resumed_state.steps:
+            if step.name in {"run_executor", "run_qc", "write_summary"}:
+                step.status = "pending"
+                step.error = None
+                step.exit_code = None
+                step.timed_out = False
+            if step.name in {"run_executor", "run_qc"}:
+                step.attempts = 5
+        resumed_state.status = "interrupted"
+        resumed_state.current_step = "run_executor"
+        RunStore(self.state_dir).save(resumed_state)
+
+        resumed = self._aw("resume", "--run-id", str(state["run_id"]), check=False)
+        self.assertEqual(1, resumed.returncode)
+        resumed_state = self._state(Path(resumed.stdout.strip()))
+        attempts = {step["name"]: step["attempts"] for step in resumed_state["steps"]}
+        self.assertEqual("qc_failed", resumed_state["status"])
+        self.assertEqual(5, resumed_state["qc_repair_attempts"])
+        # Remaining budget: one more loop (5th) then a final failing QC.
+        self.assertEqual(7, attempts["run_executor"])
+        self.assertEqual(7, attempts["run_qc"])
+        context = Path(str(resumed_state["task_dir"]), "context.md").read_text(encoding="utf-8")
+        self.assertIn("QC repair loop 5/5", context)
+
+    def test_run_state_defaults_missing_qc_repair_attempts(self) -> None:
+        state = RunState.from_dict(
+            {
+                "run_id": "legacy",
+                "status": "queued",
+                "repo_path": "/tmp/repo",
+                "run_dir": "/tmp/run",
+                "task_dir": "/tmp/task",
+                "workflow": "default",
+                "verify_command": "true",
+                "timeout_seconds": 1,
+                "executor_bin": "takt",
+                "steps": [],
+            }
+        )
+        self.assertEqual(0, state.qc_repair_attempts)
 
     def test_timeout_is_available_from_run_report(self) -> None:
         result = self._aw(

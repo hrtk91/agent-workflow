@@ -72,8 +72,11 @@ artifacts, but they are no longer read after the migration completes.
 Executor success is not workflow success. The run is only `succeeded` after the
 explicit QC command passes. If QC fails, the runner returns to the executor and
 adds the QC failure context to the task up to five times; the workflow is still
-`qc_failed` if QC is not green after that loop. Timeouts become `timed_out`;
-missing task text or policy stops become `blocked`.
+`qc_failed` if QC is not green after that loop. The QC→executor repair budget is
+stored as `runs.qc_repair_attempts` in the canonical SQLite state, so `aw resume`
+and `aw retry` share the same run-level limit instead of resetting it in process
+memory. Timeouts become `timed_out`; missing task text or policy stops become
+`blocked`.
 
 ## Queue
 
