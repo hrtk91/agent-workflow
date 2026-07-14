@@ -85,10 +85,10 @@ class RunStore:
                 insert into runs(
                   run_id, status, repo_path, workflow, verify_command, timeout_seconds,
                   executor_bin, provider, model, task_type, base_ref, purpose,
-                  repair_for_run_id, worktree_path, current_step, summary_path,
+                  repair_for_run_id, worktree_path, current_step, summary_path, qc_repair_attempts,
                   created_at, updated_at, finished_at, elapsed_seconds,
                   task_sha256, task_bytes, changed_files, additions, deletions
-                ) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(run_id) do update set
                   status=excluded.status,
                   repo_path=excluded.repo_path,
@@ -105,6 +105,7 @@ class RunStore:
                   worktree_path=excluded.worktree_path,
                   current_step=excluded.current_step,
                   summary_path=excluded.summary_path,
+                  qc_repair_attempts=excluded.qc_repair_attempts,
                   updated_at=excluded.updated_at,
                   finished_at=excluded.finished_at,
                   elapsed_seconds=excluded.elapsed_seconds,
@@ -131,6 +132,7 @@ class RunStore:
                     state.worktree_path,
                     state.current_step,
                     state.summary_path,
+                    state.qc_repair_attempts,
                     state.created_at,
                     state.updated_at,
                     finished_at,
@@ -195,6 +197,7 @@ class RunStore:
             worktree_path=str(row["worktree_path"]) if row["worktree_path"] is not None else None,
             summary_path=str(row["summary_path"] or run_dir / "summary.md"),
             current_step=str(row["current_step"]) if row["current_step"] is not None else None,
+            qc_repair_attempts=int(row["qc_repair_attempts"] or 0),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
             steps=steps,
