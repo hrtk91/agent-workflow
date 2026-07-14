@@ -27,134 +27,146 @@ from agent_workflow.runner import (
 from agent_workflow.telemetry import export_report_to_otel
 
 
+class JapaneseArgumentParser(argparse.ArgumentParser):
+    """argparseの自動生成部分も日本語で表示するパーサー。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._positionals.title = "位置引数"
+        self._optionals.title = "オプション"
+        for action in self._actions:
+            if action.dest == "help":
+                action.help = "このヘルプを表示して終了する"
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="aw", description="Lightweight resumable agent workflow runner")
-    parser.add_argument("--state-dir", type=Path, default=default_state_dir())
-    parser.add_argument("--config-file", type=Path, default=default_config_path())
+    parser = JapaneseArgumentParser(prog="aw", description="ローカルのエージェントワークフローを中断後も再開できる軽量ランナー")
+    parser.add_argument("--state-dir", type=Path, default=default_state_dir(), help="run状態を保存するディレクトリ")
+    parser.add_argument("--config-file", type=Path, default=default_config_path(), help="使用する設定ファイル")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    run = sub.add_parser("run", help="start a new task run")
+    run = sub.add_parser("run", help="新しいタスク実行を開始する")
     add_run_args(run)
 
-    enqueue = sub.add_parser("enqueue", help="queue a task run and return immediately")
+    enqueue = sub.add_parser("enqueue", help="タスク実行をキューに追加してすぐ戻る")
     add_run_args(enqueue)
 
-    tick = sub.add_parser("tick", help="run queued jobs once and exit")
-    tick.add_argument("--max-runs", type=int, default=1)
+    tick = sub.add_parser("tick", help="キューのジョブを1回実行して終了する")
+    tick.add_argument("--max-runs", type=int, default=1, help="1回のtickで実行するジョブ数")
     tick.add_argument(
         "--isolate-job-failures",
         action="store_true",
-        help="exit successfully when queued jobs fail but aw records the failure; notification or aw infrastructure errors still fail",
+        help="キューのジョブが失敗してもawが状態を記録できれば成功終了する（通知またはaw基盤の失敗は失敗終了）",
     )
     add_notify_args(tick)
     add_auto_repair_args(tick)
 
-    worker = sub.add_parser("worker", help="run queued jobs in a loop")
-    worker.add_argument("--interval-seconds", type=float, default=60)
-    worker.add_argument("--max-runs-per-tick", type=int, default=1)
-    worker.add_argument("--parallelism", type=int, default=1, help="maximum claimed jobs to run concurrently")
-    worker.add_argument("--repo-parallelism", type=int, default=1, help="maximum concurrent jobs per repo path; 0 disables this limit")
-    worker.add_argument("--inline", action="store_true", help="run jobs inside the worker process instead of child processes")
-    worker.add_argument("--no-recover-stale-running", action="store_true", help="do not mark pre-existing running jobs as failed on worker startup")
+    worker = sub.add_parser("worker", help="キューのジョブを繰り返し実行する")
+    worker.add_argument("--interval-seconds", type=float, default=60, help="ジョブがないときのtick間隔（秒）")
+    worker.add_argument("--max-runs-per-tick", type=int, default=1, help="1回のtickで実行するジョブ数")
+    worker.add_argument("--parallelism", type=int, default=1, help="同時に実行するclaim済みジョブの最大数")
+    worker.add_argument("--repo-parallelism", type=int, default=1, help="リポジトリごとの同時実行数（0で制限なし）")
+    worker.add_argument("--inline", action="store_true", help="子プロセスではなくworkerプロセス内でジョブを実行する")
+    worker.add_argument("--no-recover-stale-running", action="store_true", help="worker起動時に既存のrunningジョブを失敗扱いにしない")
     worker.add_argument("--stop-when-idle", action="store_true", help=argparse.SUPPRESS)
     add_notify_args(worker)
     add_auto_repair_args(worker)
 
-    run_claimed = sub.add_parser("run-claimed", help=argparse.SUPPRESS)
+    run_claimed = sub.add_parser("run-claimed", help="内部用のclaim済みジョブを実行する")
     run_claimed.add_argument("--job-id", required=True)
     add_notify_args(run_claimed)
     add_auto_repair_args(run_claimed)
 
-    resume = sub.add_parser("resume", help="resume a failed or interrupted run")
-    resume.add_argument("--run-id", required=True)
-    resume.add_argument("--verify-command")
-    resume.add_argument("--timeout-seconds", type=float)
+    resume = sub.add_parser("resume", help="失敗または中断したrunを再開する")
+    resume.add_argument("--run-id", required=True, help="再開するrunのID")
+    resume.add_argument("--verify-command", help="QCコマンドを上書きする")
+    resume.add_argument("--timeout-seconds", type=float, help="タイムアウト秒数を上書きする")
     add_notify_args(resume)
 
-    retry = sub.add_parser("retry", help="retry one step and all downstream steps")
-    retry.add_argument("--run-id", required=True)
-    retry.add_argument("--step", required=True)
-    retry.add_argument("--verify-command")
-    retry.add_argument("--timeout-seconds", type=float)
+    retry = sub.add_parser("retry", help="指定したstepと後続stepを再試行する")
+    retry.add_argument("--run-id", required=True, help="再試行するrunのID")
+    retry.add_argument("--step", required=True, help="再試行するstep名")
+    retry.add_argument("--verify-command", help="QCコマンドを上書きする")
+    retry.add_argument("--timeout-seconds", type=float, help="タイムアウト秒数を上書きする")
     add_notify_args(retry)
 
-    status = sub.add_parser("status", help="show run status")
-    status.add_argument("--run-id")
-    status.add_argument("--include-repair", action="store_true", help="include internal repair-diagnosis jobs in recent status output")
+    status = sub.add_parser("status", help="runの状態を表示する")
+    status.add_argument("--run-id", help="指定したrunだけを表示する")
+    status.add_argument("--include-repair", action="store_true", help="内部の修復診断ジョブを最近の状態表示に含める")
 
-    report = sub.add_parser("report", help="report QC success and run metrics from SQLite")
-    report.add_argument("--run-id", help="show one run's current steps and complete attempt history")
-    report.add_argument("--group-by", default="model", help="comma-separated dimensions: model, provider, task_type, workflow, repo, status")
-    report.add_argument("--repo", type=Path, help="filter by repository path")
-    report.add_argument("--since", help="include runs created at or after this ISO date/time")
-    report.add_argument("--format", choices=["text", "json"], default="text")
-    report.add_argument("--export-otel", action="store_true", help="export the grouped report as OTLP/HTTP gauges")
-    report.add_argument("--include-repair", action="store_true", help="include repair and repair-action runs")
+    report = sub.add_parser("report", help="SQLiteからQC結果とrunメトリクスを集計する")
+    report.add_argument("--run-id", help="1つのrunの現在のstepと全試行履歴を表示する")
+    report.add_argument("--group-by", default="model", help="カンマ区切りの集計軸: model, provider, task_type, workflow, repo, status")
+    report.add_argument("--repo", type=Path, help="リポジトリパスで絞り込む")
+    report.add_argument("--since", help="このISO日時以降に作成されたrunを含める")
+    report.add_argument("--format", choices=["text", "json"], default="text", help="出力形式（textまたはjson）")
+    report.add_argument("--export-otel", action="store_true", help="集計レポートをOTLP/HTTP gaugeとしてエクスポートする")
+    report.add_argument("--include-repair", action="store_true", help="repairとrepair-actionのrunを含める")
 
-    summary = sub.add_parser("summary", help="print summary path")
-    summary.add_argument("--run-id", required=True)
-    summary.add_argument("--discord", action="store_true", help="print Hermes Discord summary path")
+    summary = sub.add_parser("summary", help="summaryのパスを表示する")
+    summary.add_argument("--run-id", required=True, help="表示するrunのID")
+    summary.add_argument("--discord", action="store_true", help="Hermes向けDiscord summaryのパスを表示する")
 
-    cleanup = sub.add_parser("cleanup", help="remove a run worktree")
-    cleanup.add_argument("--run-id", required=True)
+    cleanup = sub.add_parser("cleanup", help="runのworktreeを削除する")
+    cleanup.add_argument("--run-id", required=True, help="worktreeを削除するrunのID")
 
-    config = sub.add_parser("config", help="inspect and initialize agent-workflow settings")
+    config = sub.add_parser("config", help="agent-workflowの設定を確認・初期化する")
     config_sub = config.add_subparsers(dest="config_command", required=True)
-    config_sub.add_parser("path", help="print the active config file path")
-    config_sub.add_parser("show", help="print the effective config as TOML")
-    config_init = config_sub.add_parser("init", help="write the default config file")
+    config_sub.add_parser("path", help="現在使用している設定ファイルのパスを表示する")
+    config_sub.add_parser("show", help="有効な設定をTOMLで表示する")
+    config_init = config_sub.add_parser("init", help="デフォルト設定ファイルを書き出す")
     config_init.add_argument("--force", action="store_true")
 
-    repair = sub.add_parser("repair", help="create and validate workflow repair drafts")
+    repair = sub.add_parser("repair", help="ワークフロー修復draftを作成・検証する")
     repair_sub = repair.add_subparsers(dest="repair_command", required=True)
-    repair_draft = repair_sub.add_parser("draft", help="write a validated repair draft artifact")
-    repair_draft.add_argument("--failed-run-id", required=True)
-    repair_draft.add_argument("--title", required=True)
-    repair_draft.add_argument("--category", choices=sorted(REPAIR_CATEGORIES), required=True)
-    repair_draft.add_argument("--risk", choices=sorted(REPAIR_RISKS), required=True)
-    repair_draft.add_argument("--proposed-action", choices=sorted(REPAIR_ACTIONS), required=True)
-    repair_draft.add_argument("--diagnosis-file", type=Path, required=True)
-    repair_draft.add_argument("--evidence-file", type=Path, required=True)
-    repair_draft.add_argument("--notify-before-file", type=Path, required=True)
-    repair_draft.add_argument("--verify-command")
-    repair_draft.add_argument("--retry-original", action="store_true")
-    repair_draft.add_argument("--environment")
-    repair_draft.add_argument("--healthcheck-command")
-    repair_draft.add_argument("--rollback-plan-file", type=Path)
-    repair_draft.add_argument("--allow-duplicate", action="store_true")
+    repair_draft = repair_sub.add_parser("draft", help="検証済みの修復draft成果物を書き出す")
+    repair_draft.add_argument("--failed-run-id", required=True, help="失敗したrunのID")
+    repair_draft.add_argument("--title", required=True, help="修復draftのタイトル")
+    repair_draft.add_argument("--category", choices=sorted(REPAIR_CATEGORIES), required=True, help="修復の分類")
+    repair_draft.add_argument("--risk", choices=sorted(REPAIR_RISKS), required=True, help="修復のリスク")
+    repair_draft.add_argument("--proposed-action", choices=sorted(REPAIR_ACTIONS), required=True, help="提案する修復アクション")
+    repair_draft.add_argument("--diagnosis-file", type=Path, required=True, help="診断Markdownファイル")
+    repair_draft.add_argument("--evidence-file", type=Path, required=True, help="証拠Markdownファイル")
+    repair_draft.add_argument("--notify-before-file", type=Path, required=True, help="実行前通知Markdownファイル")
+    repair_draft.add_argument("--verify-command", help="修復後の検証コマンド")
+    repair_draft.add_argument("--retry-original", action="store_true", help="元のrunを再試行する修復として扱う")
+    repair_draft.add_argument("--environment", help="修復対象の環境")
+    repair_draft.add_argument("--healthcheck-command", help="修復後のhealthcheckコマンド")
+    repair_draft.add_argument("--rollback-plan-file", type=Path, help="ロールバック計画Markdownファイル")
+    repair_draft.add_argument("--allow-duplicate", action="store_true", help="重複するdraftの作成を許可する")
 
-    repair_validate = repair_sub.add_parser("validate", help="validate an existing repair draft")
+    repair_validate = repair_sub.add_parser("validate", help="既存の修復draftを検証する")
     target = repair_validate.add_mutually_exclusive_group(required=True)
-    target.add_argument("--draft-id")
-    target.add_argument("--draft-dir", type=Path)
+    target.add_argument("--draft-id", help="検証するdraftのID")
+    target.add_argument("--draft-dir", type=Path, help="検証するdraftディレクトリ")
 
-    watchdog = sub.add_parser("watchdog", help="inspect workflow failures that need repair triage")
+    watchdog = sub.add_parser("watchdog", help="修復の切り分けが必要なワークフロー失敗を確認する")
     watchdog_sub = watchdog.add_subparsers(dest="watchdog_command", required=True)
-    watchdog_scan = watchdog_sub.add_parser("scan", help="list failed runs without a repair draft")
-    watchdog_scan.add_argument("--limit", type=int, default=20)
-    watchdog_scan.add_argument("--include-repaired", action="store_true")
+    watchdog_scan = watchdog_sub.add_parser("scan", help="修復draftがない失敗runを一覧表示する")
+    watchdog_scan.add_argument("--limit", type=int, default=20, help="表示する件数")
+    watchdog_scan.add_argument("--include-repaired", action="store_true", help="修復済みのrunも含める")
 
-    merge_gate = sub.add_parser("merge-gate", help="evaluate whether a GitHub PR can be merged")
-    merge_gate.add_argument("--repo", required=True, help="GitHub repository slug, for example owner/name")
-    merge_gate.add_argument("--pr", type=int, required=True, help="pull request number")
-    merge_gate.add_argument("--repo-path", type=Path, help="local git repository used for local QC worktree")
-    merge_gate.add_argument("--verify-command", help="local QC command to run in a detached PR-head worktree")
-    merge_gate.add_argument("--timeout-seconds", type=float, default=7200)
-    merge_gate.add_argument("--base-branch", default="main")
-    merge_gate.add_argument("--output-dir", type=Path)
-    merge_gate.add_argument("--allow-no-checks", action="store_true", help="allow approval with no GitHub checks and no local QC")
+    merge_gate = sub.add_parser("merge-gate", help="GitHub PRをマージできるか評価する")
+    merge_gate.add_argument("--repo", required=True, help="GitHubリポジトリのslug（例: owner/name）")
+    merge_gate.add_argument("--pr", type=int, required=True, help="プルリクエスト番号")
+    merge_gate.add_argument("--repo-path", type=Path, help="ローカルQC用worktreeを作るgitリポジトリ")
+    merge_gate.add_argument("--verify-command", help="PR headを分離したworktreeで実行するローカルQCコマンド")
+    merge_gate.add_argument("--timeout-seconds", type=float, default=7200, help="ローカルQCのタイムアウト秒数")
+    merge_gate.add_argument("--base-branch", default="main", help="比較するbaseブランチ")
+    merge_gate.add_argument("--output-dir", type=Path, help="decision成果物の出力先")
+    merge_gate.add_argument("--allow-no-checks", action="store_true", help="GitHub checksもローカルQCもない場合の承認を許可する")
     merge_gate.add_argument("--keep-worktree", action="store_true")
 
-    merge = sub.add_parser("merge", help="merge a PR from a MERGE_APPROVED decision file")
-    merge.add_argument("--decision", type=Path, required=True)
-    merge.add_argument("--execute", action="store_true", help="execute gh pr merge; default is dry-run")
-    merge.add_argument("--max-age-seconds", type=int, default=int(os.environ.get("HERMES_MERGE_DECISION_MAX_AGE_SECONDS", "86400")))
-    merge.add_argument("--method", choices=["merge", "squash", "rebase"], default="squash")
-    merge.add_argument("--keep-branch", action="store_true")
-    merge.add_argument("--repo-path", type=Path, help="local git repository used to re-run QC when the live PR has no checks")
-    merge.add_argument("--verify-command", help="local QC command to re-run at the live PR head when no checks are reported")
-    merge.add_argument("--timeout-seconds", type=float, default=7200)
-    merge.add_argument("--allow-no-checks", action="store_true", help="explicitly allow a live PR with no GitHub checks and skip local QC re-check")
+    merge = sub.add_parser("merge", help="MERGE_APPROVEDのdecisionファイルを使ってPRをマージする")
+    merge.add_argument("--decision", type=Path, required=True, help="MERGE_APPROVEDのdecisionファイル")
+    merge.add_argument("--execute", action="store_true", help="gh pr mergeを実行する（デフォルトはdry-run）")
+    merge.add_argument("--max-age-seconds", type=int, default=int(os.environ.get("HERMES_MERGE_DECISION_MAX_AGE_SECONDS", "86400")), help="decisionを有効とする最大経過秒数")
+    merge.add_argument("--method", choices=["merge", "squash", "rebase"], default="squash", help="GitHubで使うマージ方法")
+    merge.add_argument("--keep-branch", action="store_true", help="マージ後もブランチを削除しない")
+    merge.add_argument("--repo-path", type=Path, help="live PRにchecksがない場合にQCを再実行するローカルgitリポジトリ")
+    merge.add_argument("--verify-command", help="checksがない場合にlive PR headで再実行するローカルQCコマンド")
+    merge.add_argument("--timeout-seconds", type=float, default=7200, help="ローカルQCのタイムアウト秒数")
+    merge.add_argument("--allow-no-checks", action="store_true", help="GitHub checksがないlive PRを明示的に許可し、ローカルQCの再確認を省略する")
 
     return parser
 
@@ -171,7 +183,7 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--executor-bin", default="takt")
     parser.add_argument("--provider")
     parser.add_argument("--model")
-    parser.add_argument("--task-type", default="unspecified", help="task classification used by analytics reports")
+    parser.add_argument("--task-type", default="unspecified", help="分析レポートで使うタスク分類")
     parser.add_argument("--base-ref")
     parser.add_argument("--keep-worktree", action="store_true", default=True)
     add_notify_args(parser)
@@ -180,12 +192,12 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
 def add_notify_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--notify-command",
-        help="shell command template after a terminal run; placeholders: {job_id} {run_id} {status} {summary} {discord_summary}",
+        help="終端状態になったrunの後に実行するshellコマンドのテンプレート。プレースホルダー: {job_id} {run_id} {status} {summary} {discord_summary}",
     )
     parser.add_argument(
         "--notify-statuses",
         default=",".join(sorted(FAILURE_NOTIFY_STATUSES)),
-        help="comma-separated statuses to notify, or 'all'; default: failure statuses only",
+        help="通知するstatusをカンマ区切りで指定するか'all'を指定する。デフォルトは失敗系statusのみ",
     )
 
 
@@ -193,24 +205,24 @@ def add_auto_repair_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--auto-repair",
         action="store_true",
-        help="enqueue a repair-diagnosis job when a normal workflow run reaches a terminal failure",
+        help="通常のワークフローrunが終端失敗したとき、修復診断ジョブをキューへ追加する",
     )
-    parser.add_argument("--repair-workflow", default="default", help="workflow for auto-repair diagnosis jobs")
-    parser.add_argument("--repair-verify-command", help="verifier for auto-repair diagnosis jobs")
-    parser.add_argument("--repair-timeout-seconds", type=float, help="timeout for auto-repair diagnosis jobs")
-    parser.add_argument("--repair-executor-bin", help="executor binary for auto-repair diagnosis jobs")
-    parser.add_argument("--repair-provider", help="executor provider for auto-repair diagnosis jobs")
-    parser.add_argument("--repair-model", help="executor model for auto-repair diagnosis jobs")
+    parser.add_argument("--repair-workflow", default="default", help="auto-repair診断ジョブで使うworkflow")
+    parser.add_argument("--repair-verify-command", help="auto-repair診断ジョブの検証コマンド")
+    parser.add_argument("--repair-timeout-seconds", type=float, help="auto-repair診断ジョブのタイムアウト")
+    parser.add_argument("--repair-executor-bin", help="auto-repair診断ジョブで使うexecutor binary")
+    parser.add_argument("--repair-provider", help="auto-repair診断ジョブで使うexecutor provider")
+    parser.add_argument("--repair-model", help="auto-repair診断ジョブで使うexecutor model")
     parser.add_argument(
         "--repair-scan-existing",
         action="store_true",
-        help="also backfill existing failed runs; disabled by default to avoid notification storms",
+        help="既存の失敗runも補完する。通知の大量発生を避けるため、デフォルトでは無効",
     )
     parser.add_argument(
         "--repair-scan-existing-max-age-seconds",
         type=float,
         default=AUTO_REPAIR_SCAN_EXISTING_MAX_AGE_SECONDS,
-        help=f"only backfill failed runs updated within this many seconds; default: {AUTO_REPAIR_SCAN_EXISTING_MAX_AGE_SECONDS}",
+        help=f"この秒数以内に更新された失敗runだけを補完する。デフォルト: {AUTO_REPAIR_SCAN_EXISTING_MAX_AGE_SECONDS}",
     )
 
 
@@ -335,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
             state = runner.run_new(config_from_args(args))
             notify_error = notify_result_if_requested(runner, state, args)
             if notify_error:
-                print(f"agent-workflow: notification failed: {notify_error}", file=sys.stderr)
+                print(f"agent-workflow: 通知に失敗しました: {notify_error}", file=sys.stderr)
             print(state.summary_path)
             return run_exit_code(state.status, notify_error)
         if args.command == "enqueue":
@@ -388,14 +400,14 @@ def main(argv: list[str] | None = None) -> int:
             state = runner.resume(args.run_id, verify_command=args.verify_command, timeout_seconds=args.timeout_seconds)
             notify_error = notify_result_if_requested(runner, state, args)
             if notify_error:
-                print(f"agent-workflow: notification failed: {notify_error}", file=sys.stderr)
+                print(f"agent-workflow: 通知に失敗しました: {notify_error}", file=sys.stderr)
             print(state.summary_path)
             return run_exit_code(state.status, notify_error)
         if args.command == "retry":
             state = runner.retry(args.run_id, args.step, verify_command=args.verify_command, timeout_seconds=args.timeout_seconds)
             notify_error = notify_result_if_requested(runner, state, args)
             if notify_error:
-                print(f"agent-workflow: notification failed: {notify_error}", file=sys.stderr)
+                print(f"agent-workflow: 通知に失敗しました: {notify_error}", file=sys.stderr)
             print(state.summary_path)
             return run_exit_code(state.status, notify_error)
         if args.command == "status":
@@ -475,7 +487,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
     except MergeBlocked as exc:
-        print(f"agent-workflow: merge blocked: {exc}", file=sys.stderr)
+        print(f"agent-workflow: マージがブロックされました: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
         print(f"agent-workflow: {exc}", file=sys.stderr)

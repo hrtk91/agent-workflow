@@ -1,7 +1,7 @@
 [project]
 name = "agent-workflow"
 version = "0.1.0"
-description = "Lightweight resumable runner for local agent workflows"
+description = "ローカルのエージェントワークフロー向けの再開可能な軽量ランナー"
 requires-python = ">=3.11"
 
 [project.optional-dependencies]
