@@ -68,6 +68,8 @@ MENU_ITEMS = (
     ("quit", "終了"),
 )
 COMMAND_HELP = "filter all|running|queued|attention|succeeded / refresh / detail / logs / help / quit"
+MAX_LOG_TAIL_BYTES = 64 * 1024
+MAX_LOG_LINE_CHARS = 4_096
 
 
 @dataclass(frozen=True)
@@ -118,6 +120,7 @@ class TuiApp:
         self.snapshot = PipelineSnapshot.empty()
         self.filter_name = "all"
         self.selected_index = 0
+        self.list_offset = 0
         self.view = "dashboard"
         self.menu_index = 0
         self.command_buffer = ""
@@ -190,14 +193,23 @@ class TuiApp:
         list_top = 3
         list_bottom = max(list_top + 2, height // 2)
         left_width = max(28, min(42, width // 3))
+        list_capacity = max(0, list_bottom - list_top)
+        self._ensure_selection_visible(list_capacity)
         if width > left_width + 2:
             try:
                 screen.vline(list_top, left_width, curses.ACS_VLINE, max(1, list_bottom - list_top))
             except curses.error:
                 pass
-        self._add(screen, 2, 0, "一覧", left_width - 1, curses.A_UNDERLINE)
-        for row, item in enumerate(items[: max(0, list_bottom - list_top)]):
-            attr = curses.A_REVERSE if row == self.selected_index else 0
+        list_label = "一覧"
+        if len(items) > list_capacity:
+            first = self.list_offset + 1
+            last = min(len(items), self.list_offset + list_capacity)
+            list_label += f" ({first}-{last}/{len(items)})"
+        self._add(screen, 2, 0, list_label, left_width - 1, curses.A_UNDERLINE)
+        visible_items = items[self.list_offset : self.list_offset + list_capacity]
+        for row, item in enumerate(visible_items):
+            absolute_index = self.list_offset + row
+            attr = curses.A_REVERSE if absolute_index == self.selected_index else 0
             self._add(screen, list_top + row, 0, self._item_line(item), left_width - 1, attr)
         if not items:
             self._add(screen, list_top, 0, "表示対象はありません", left_width - 1)
@@ -210,10 +222,14 @@ class TuiApp:
         elif selected.run is not None:
             self._draw_pipeline(screen, selected.run, right_x, 4, right_width)
         else:
-            self._add(screen, 4, right_x, "このjobはまだrun開始前です。", right_width)
-            self._add(screen, 6, right_x, f"job: {selected.item_id}", right_width)
-            self._add(screen, 7, right_x, f"repo: {selected.repo_path}", right_width)
-            self._add(screen, 8, right_x, f"workflow: {selected.workflow}", right_width)
+            self._add(screen, 4, right_x, f"job status: {status_label(selected.status)}", right_width)
+            if selected.job and selected.job.error:
+                self._add(screen, 5, right_x, f"error: {selected.job.error}", right_width)
+            elif selected.status == "queued":
+                self._add(screen, 5, right_x, "このjobはまだrun開始前です。", right_width)
+            self._add(screen, 7, right_x, f"job: {selected.item_id}", right_width)
+            self._add(screen, 8, right_x, f"repo: {selected.repo_path}", right_width)
+            self._add(screen, 9, right_x, f"workflow: {selected.workflow}", right_width)
 
         message_y = max(list_bottom + 1, height - 2)
         self._add(screen, message_y, 0, self.message, width - 1, curses.A_DIM)
@@ -385,6 +401,7 @@ class TuiApp:
         if command.name == "filter":
             self.filter_name = command.args[0]
             self.selected_index = 0
+            self.list_offset = 0
             self.message = f"絞り込みを変更しました: {FILTER_LABELS[self.filter_name]}"
         elif command.name == "refresh":
             self.refresh()
@@ -409,6 +426,17 @@ class TuiApp:
 
     def _clamp_selection(self) -> None:
         self.selected_index = min(self.selected_index, max(0, len(self.items) - 1))
+
+    def _ensure_selection_visible(self, capacity: int) -> None:
+        item_count = len(self.items)
+        if capacity <= 0 or item_count == 0:
+            self.list_offset = 0
+            return
+        self.list_offset = min(self.list_offset, max(0, item_count - capacity))
+        if self.selected_index < self.list_offset:
+            self.list_offset = self.selected_index
+        elif self.selected_index >= self.list_offset + capacity:
+            self.list_offset = self.selected_index - capacity + 1
 
     def _item_line(self, item: PipelineItem) -> str:
         identifier = item.item_id[-20:]
@@ -454,12 +482,27 @@ def current_step(run: PipelineRun) -> PipelineStep | None:
 
 
 def tail_lines(path: Path, limit: int) -> list[str]:
+    if limit <= 0:
+        return []
     try:
         if not path.is_file():
             return ["(ファイルがありません)"]
-        return path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:] or ["(空)"]
+        with path.open("rb") as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            offset = max(0, size - MAX_LOG_TAIL_BYTES)
+            stream.seek(offset)
+            data = stream.read(size - offset)
+        lines = data.decode("utf-8", errors="replace").splitlines()[-limit:]
+        return [truncate_log_line(line) for line in lines] or ["(空)"]
     except OSError as exc:
         return [f"(読み込み失敗: {exc})"]
+
+
+def truncate_log_line(line: str) -> str:
+    if len(line) <= MAX_LOG_LINE_CHARS:
+        return line
+    return line[: MAX_LOG_LINE_CHARS - 1] + "…"
 
 
 def status_label(status: str) -> str:

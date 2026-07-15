@@ -14,6 +14,8 @@ from agent_workflow.state import WORKFLOW_STEPS
 
 PIPELINE_FILTERS = ("all", "running", "queued", "attention", "succeeded")
 ATTENTION_STATUSES = frozenset({"blocked", "failed", "interrupted", "qc_failed", "timed_out"})
+# queueのrunningはworkerのclaim状態であり、live pipelineはruns側に表示する。
+VISIBLE_JOB_STATUSES = frozenset({"queued"}) | ATTENTION_STATUSES
 
 
 @dataclass(frozen=True)
@@ -122,35 +124,48 @@ class PipelineSnapshotReader:
         limit: int,
         include_repair: bool,
     ) -> tuple[PipelineJob, ...]:
-        rows = conn.execute(
-            """
-            select job_id, status, run_id, summary_path, error, config_json, created_at, updated_at
-            from queue
-            order by created_at desc
-            limit ?
-            """,
-            (limit,),
-        ).fetchall()
         jobs: list[PipelineJob] = []
-        for row in rows:
-            config = parse_config(str(row[5]))
-            purpose = str(config.get("purpose") or "workflow")
-            if not include_repair and purpose in {"repair", "repair_action"}:
-                continue
-            jobs.append(
-                PipelineJob(
-                    job_id=str(row[0]),
-                    status=str(row[1]),
-                    run_id=str(row[2]) if row[2] else None,
-                    repo_path=str(config.get("repo_path") or ""),
-                    workflow=str(config.get("workflow") or "default"),
-                    purpose=purpose,
-                    summary_path=str(row[3]) if row[3] else None,
-                    error=str(row[4]) if row[4] else None,
-                    created_at=str(row[6]),
-                    updated_at=str(row[7]),
+        offset = 0
+        batch_size = min(max(limit, 100), 1000)
+        while len(jobs) < limit:
+            rows = conn.execute(
+                """
+                select job_id, status, run_id, summary_path, error, config_json, created_at, updated_at
+                from queue
+                order by created_at desc
+                limit ? offset ?
+                """,
+                (batch_size, offset),
+            ).fetchall()
+            if not rows:
+                break
+            offset += len(rows)
+            for row in rows:
+                status = str(row[1])
+                if status not in VISIBLE_JOB_STATUSES:
+                    continue
+                config = parse_config(str(row[5]))
+                purpose = str(config.get("purpose") or "workflow")
+                if not include_repair and purpose in {"repair", "repair_action"}:
+                    continue
+                jobs.append(
+                    PipelineJob(
+                        job_id=str(row[0]),
+                        status=status,
+                        run_id=str(row[2]) if row[2] else None,
+                        repo_path=str(config.get("repo_path") or ""),
+                        workflow=str(config.get("workflow") or "default"),
+                        purpose=purpose,
+                        summary_path=str(row[3]) if row[3] else None,
+                        error=str(row[4]) if row[4] else None,
+                        created_at=str(row[6]),
+                        updated_at=str(row[7]),
+                    )
                 )
-            )
+                if len(jobs) >= limit:
+                    break
+            if len(rows) < batch_size:
+                break
         return tuple(jobs)
 
     def _read_runs(
@@ -160,17 +175,18 @@ class PipelineSnapshotReader:
         include_repair: bool,
     ) -> tuple[PipelineRun, ...]:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
+        query = """
             select run_id, status, repo_path, workflow, purpose, current_step,
                    summary_path, qc_repair_attempts, created_at, updated_at
             from runs
-            order by updated_at desc
-            limit ?
-            """,
-            (limit,),
-        ).fetchall()
-        selected = [row for row in rows if include_repair or str(row["purpose"]) not in {"repair", "repair_action"}]
+        """
+        params: list[Any] = []
+        if not include_repair:
+            query += " where purpose not in (?, ?)"
+            params.extend(("repair", "repair_action"))
+        query += " order by updated_at desc limit ?"
+        params.append(limit)
+        selected = conn.execute(query, params).fetchall()
         if not selected:
             return ()
         run_ids = [str(row["run_id"]) for row in selected]
@@ -226,13 +242,16 @@ class PipelineSnapshotReader:
 
 
 def pipeline_items(snapshot: PipelineSnapshot, filter_name: str = "all") -> tuple[PipelineItem, ...]:
-    """run開始前のjobと、既存runを同じ一覧へ並べる。"""
+    """run開始前のjobと、既存runを重複させず同じ一覧へ並べる。"""
 
     if filter_name not in PIPELINE_FILTERS:
         raise ValueError(f"unknown pipeline filter: {filter_name}")
     items: list[PipelineItem] = []
+    run_ids = {run.run_id for run in snapshot.runs}
     for job in snapshot.jobs:
-        if job.status not in {"queued", "running"}:
+        if job.run_id and job.run_id in run_ids:
+            continue
+        if job.status not in VISIBLE_JOB_STATUSES:
             continue
         item = PipelineItem(
             item_id=job.job_id,

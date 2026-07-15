@@ -10,9 +10,16 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from agent_workflow.pipeline import PipelineSnapshotReader, pipeline_items
+from agent_workflow.pipeline import (
+    PipelineJob,
+    PipelineRun,
+    PipelineSnapshot,
+    PipelineSnapshotReader,
+    default_steps,
+    pipeline_items,
+)
 from agent_workflow.runner import RunnerConfig, WorkflowRunner
-from agent_workflow.tui import TuiCommand, parse_command
+from agent_workflow.tui import MAX_LOG_LINE_CHARS, TuiApp, TuiCommand, parse_command, tail_lines
 
 
 class PipelineSnapshotTest(unittest.TestCase):
@@ -81,6 +88,145 @@ class PipelineSnapshotTest(unittest.TestCase):
 
         self.assertEqual((), snapshot.jobs)
         self.assertEqual((), snapshot.runs)
+
+    def test_pipeline_items_keeps_failed_jobs_and_deduplicates_running_jobs(self) -> None:
+        now = "2026-07-15T00:00:00+00:00"
+        snapshot = PipelineSnapshot(
+            generated_at=now,
+            jobs=(
+                PipelineJob(
+                    job_id="failed-job",
+                    status="failed",
+                    run_id=None,
+                    repo_path="/repo",
+                    workflow="default",
+                    purpose="workflow",
+                    summary_path=None,
+                    error="spawn failed",
+                    created_at=now,
+                    updated_at=now,
+                ),
+                PipelineJob(
+                    job_id="running-job",
+                    status="running",
+                    run_id=None,
+                    repo_path="/repo",
+                    workflow="default",
+                    purpose="workflow",
+                    summary_path=None,
+                    error=None,
+                    created_at=now,
+                    updated_at=now,
+                ),
+            ),
+            runs=(
+                PipelineRun(
+                    run_id="run-1",
+                    status="running",
+                    repo_path="/repo",
+                    workflow="default",
+                    purpose="workflow",
+                    current_step="run_executor",
+                    summary_path="/summary.md",
+                    qc_repair_attempts=0,
+                    created_at=now,
+                    updated_at=now,
+                    steps=tuple(default_steps()),
+                ),
+            ),
+        )
+
+        self.assertEqual(["failed-job", "run-1"], [item.item_id for item in pipeline_items(snapshot)])
+        self.assertEqual(["failed-job"], [item.item_id for item in pipeline_items(snapshot, "attention")])
+        self.assertEqual(["run-1"], [item.item_id for item in pipeline_items(snapshot, "running")])
+
+    def test_reader_applies_limit_after_hiding_repair_rows(self) -> None:
+        normal_job_id = self.runner.enqueue(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.root / "repo",
+                task_text="normal task",
+                verify_command="true",
+            )
+        )
+        repair_job_id = self.runner.enqueue(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.root / "repo",
+                task_text="repair task",
+                verify_command="true",
+                purpose="repair",
+            )
+        )
+        self._insert_run("normal-run", purpose="workflow")
+        self._insert_run("repair-run", purpose="repair")
+        with sqlite3.connect(self.state_dir / "jobs.sqlite") as conn:
+            conn.execute(
+                "update queue set created_at = ? where job_id = ?",
+                ("2026-07-15T00:02:00+00:00", repair_job_id),
+            )
+            conn.execute(
+                "update queue set created_at = ? where job_id = ?",
+                ("2026-07-15T00:01:00+00:00", normal_job_id),
+            )
+            conn.execute(
+                "update runs set updated_at = ? where purpose = 'repair'",
+                ("2026-07-15T00:02:00+00:00",),
+            )
+            conn.execute(
+                "update runs set updated_at = ? where run_id = 'normal-run'",
+                ("2026-07-15T00:01:00+00:00",),
+            )
+
+        snapshot = PipelineSnapshotReader(self.state_dir / "jobs.sqlite").snapshot(limit=1)
+
+        self.assertEqual([normal_job_id], [job.job_id for job in snapshot.jobs])
+        self.assertEqual(["normal-run"], [run.run_id for run in snapshot.runs])
+
+    def test_tail_lines_bounds_large_log_lines(self) -> None:
+        path = self.root / "large.log"
+        path.write_text("x" * (MAX_LOG_LINE_CHARS * 4), encoding="utf-8")
+
+        lines = tail_lines(path, 12)
+
+        self.assertEqual(1, len(lines))
+        self.assertEqual(MAX_LOG_LINE_CHARS, len(lines[0]))
+        self.assertTrue(lines[0].endswith("…"))
+
+    def test_tui_selection_moves_a_viewport_with_the_selected_item(self) -> None:
+        now = "2026-07-15T00:00:00+00:00"
+        app = TuiApp(
+            PipelineSnapshotReader(self.root / "missing.sqlite"),
+            refresh_seconds=1.0,
+            include_repair=False,
+        )
+        app.snapshot = PipelineSnapshot(
+            generated_at=now,
+            jobs=(),
+            runs=tuple(
+                PipelineRun(
+                    run_id=f"run-{index}",
+                    status="succeeded",
+                    repo_path="/repo",
+                    workflow="default",
+                    purpose="workflow",
+                    current_step=None,
+                    summary_path="/summary.md",
+                    qc_repair_attempts=0,
+                    created_at=now,
+                    updated_at=now,
+                    steps=tuple(default_steps()),
+                )
+                for index in range(8)
+            ),
+        )
+        app.selected_index = 7
+
+        app._ensure_selection_visible(3)
+        self.assertEqual(5, app.list_offset)
+        app.selected_index = 2
+        app._ensure_selection_visible(3)
+        self.assertEqual(2, app.list_offset)
 
     def _insert_run(self, run_id: str, *, purpose: str) -> None:
         now = "2026-07-15T00:00:00+00:00"
