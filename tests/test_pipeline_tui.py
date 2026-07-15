@@ -175,7 +175,24 @@ class PipelineSnapshotTest(unittest.TestCase):
         app._open_artifact("trace")
         self.assertIn("trace line", app.content_lines)
 
+        app.view = "dashboard"
+        app.dashboard_panel = "pipeline"
+        app.selected_index = next(index for index, item in enumerate(app.items) if item.item_id == "run-workspace")
+        app._open_dashboard_logs()
+        self.assertEqual("dashboard", app.view)
+        self.assertEqual("logs", app.dashboard_panel)
+        self.assertIn("selected log line", app.content_lines)
+        app._handle_dashboard_input(ord("l"))
+        self.assertEqual("pipeline", app.dashboard_panel)
+        app._handle_dashboard_input(ord("l"))
+        self.assertEqual("logs", app.dashboard_panel)
+        app._open_selected_item()
+        app._open_artifact("summary")
+        self.assertIn("summary line", app.content_lines)
+
         app.selected_index = next(index for index, item in enumerate(app.items) if item.item_id == job_id)
+        app._sync_dashboard_drilldown()
+        self.assertIsNone(app.detail)
         app._open_selected_item()
         self.assertEqual("job", app.view)
 

@@ -90,7 +90,7 @@ MENU_ITEMS = (
     ("refresh", "今すぐ更新"),
     ("detail", "選択中run/jobを開く"),
     ("attempts", "選択stepの試行履歴"),
-    ("logs", "選択step/試行のログ"),
+    ("logs", "右ペインでログを確認"),
     ("summary", "summaryを読む"),
     ("trace", "executor traceを読む"),
     ("monitor", "executor monitorを読む"),
@@ -171,6 +171,7 @@ class TuiApp:
         self.artifact_path: Path | None = None
         self.menu_offset = 0
         self._screen_height = 0
+        self.dashboard_panel = "pipeline"
 
     def run(self, screen: curses.window) -> None:
         screen.keypad(True)
@@ -211,6 +212,8 @@ class TuiApp:
                 self._clamp_detail_selection()
                 if self.view in {"logs", "artifact"}:
                     self._load_content()
+        if self.dashboard_panel == "logs" and self.view == "dashboard":
+            self._sync_dashboard_drilldown()
 
     def draw(self, screen: curses.window) -> None:
         screen.erase()
@@ -276,9 +279,12 @@ class TuiApp:
 
         right_x = left_width + 2
         right_width = max(1, width - right_x - 1)
-        self._add(screen, 2, right_x, "パイプライン", right_width, curses.A_UNDERLINE)
+        panel_title = "📝 ログドリルダウン" if self.dashboard_panel == "logs" else "パイプライン"
+        self._add(screen, 2, right_x, panel_title, right_width, curses.A_UNDERLINE)
         if selected is None:
             self._add(screen, 4, right_x, "一覧からrunまたはjobを選択してください。", right_width)
+        elif self.dashboard_panel == "logs":
+            self._draw_dashboard_logs(screen, right_x, 4, right_width, list_bottom - 4)
         elif selected.run is not None:
             self._draw_pipeline(screen, selected.run, right_x, 4, right_width)
         else:
@@ -293,7 +299,40 @@ class TuiApp:
 
         message_y = max(list_bottom + 1, height - 2)
         self._add(screen, message_y, 0, self.message, width - 1, curses.A_DIM)
-        self._add(screen, height - 1, 0, "↑↓/jk 選択  Enter 開く  l ログ  m メニュー  : コマンド  q 終了", width - 1)
+        footer = (
+            "↑↓/jk 選択  [/]:step  Tab/o/e:出力  Enter:詳細  Esc:パイプライン  q:終了"
+            if self.dashboard_panel == "logs"
+            else "↑↓/jk 選択  Enter 開く  l ログ  m メニュー  : コマンド  q 終了"
+        )
+        self._add(screen, height - 1, 0, footer, width - 1)
+
+    def _draw_dashboard_logs(self, screen: curses.window, x: int, y: int, width: int, height: int) -> None:
+        item = self.selected_item
+        if item is None or item.run is None or self.detail is None:
+            self._add(screen, y, x, "queue jobにはrunログがありません。Enterでjob詳細を開けます。", width)
+            return
+        step = self.selected_detail_step
+        if step is None:
+            self._add(screen, y, x, "ログ対象のstepがありません。", width)
+            return
+        attempt = self.selected_attempt
+        attempt_label = f"#{attempt.attempt}" if attempt else "current"
+        self._add(
+            screen,
+            y,
+            x,
+            f"{status_emoji(step.status)} {STEP_LABELS.get(step.name, step.name)} / {attempt_label} / {self.log_source}",
+            width,
+            self._status_attr(step.status) | curses.A_BOLD,
+        )
+        self._add(screen, y + 1, x, f"path: {self.selected_log_path or '(なし)'}", width, curses.A_DIM)
+        visible = max(0, height - 2)
+        lines = self.content_lines[-visible:] if visible else []
+        if not lines:
+            self._add(screen, y + 2, x, "(ログはありません。Enterで詳細ログを開けます)", width)
+            return
+        for index, line in enumerate(lines):
+            self._add(screen, y + 2 + index, x, line, width)
 
     def _draw_pipeline(self, screen: curses.window, run: PipelineRun, x: int, y: int, width: int) -> None:
         self._add(
@@ -571,14 +610,38 @@ class TuiApp:
             return True
         if key in (curses.KEY_UP, ord("k")):
             self.selected_index = max(0, self.selected_index - 1)
+            if self.dashboard_panel == "logs":
+                self._sync_dashboard_drilldown()
         elif key in (curses.KEY_DOWN, ord("j")):
             self.selected_index = min(max(0, len(self.items) - 1), self.selected_index + 1)
+            if self.dashboard_panel == "logs":
+                self._sync_dashboard_drilldown()
         elif key in (10, 13, ord("d")):
             self._open_selected_item()
         elif key == ord("l"):
-            self._open_selected_item()
-            if self.detail is not None:
-                self._open_logs()
+            if self.dashboard_panel == "logs":
+                self.dashboard_panel = "pipeline"
+                self.message = "パイプライン表示に戻りました。"
+            else:
+                self._open_dashboard_logs()
+        elif key == 27 and self.dashboard_panel == "logs":
+            self.dashboard_panel = "pipeline"
+        elif key == ord("[") and self.dashboard_panel == "logs":
+            self.detail_step_index = max(0, self.detail_step_index - 1)
+            self._select_latest_attempt()
+            self._load_content()
+        elif key == ord("]") and self.dashboard_panel == "logs":
+            self.detail_step_index = min(max(0, len(self.detail_steps) - 1), self.detail_step_index + 1)
+            self._select_latest_attempt()
+            self._load_content()
+        elif key in (9, ord("o")) and self.dashboard_panel == "logs":
+            self.log_source = "stderr" if self.log_source == "stdout" else "stdout"
+            self._load_content()
+        elif key == ord("e") and self.dashboard_panel == "logs":
+            self.log_source = "stderr"
+            self._load_content()
+        elif key == ord("a") and self.dashboard_panel == "logs":
+            self._open_attempts()
         elif key == ord("m"):
             self.view = "menu"
             self.menu_index = 0
@@ -763,9 +826,7 @@ class TuiApp:
             if self.detail is not None:
                 self._open_attempts()
         elif command.name == "logs":
-            self._open_selected_item()
-            if self.detail is not None:
-                self._open_logs()
+            self._open_dashboard_logs()
         elif command.name in {"summary", "trace", "monitor"}:
             self._open_selected_item()
             if self.detail is not None:
@@ -852,6 +913,28 @@ class TuiApp:
         self._select_latest_attempt()
         self.view = "detail"
 
+    def _open_dashboard_logs(self) -> None:
+        self.dashboard_panel = "logs"
+        self.content_offset = 0
+        self._sync_dashboard_drilldown()
+
+    def _sync_dashboard_drilldown(self) -> None:
+        item = self.selected_item
+        if item is None or item.run is None:
+            self.detail = None
+            self.content_lines = []
+            self.artifact_path = None
+            return
+        if self.detail is None or self.detail.run_id != item.run.run_id:
+            detail = self.reader.run_detail(item.run.run_id)
+            self.detail = detail
+            if detail is not None:
+                self.detail_step_index = self._initial_step_index(detail)
+                self._select_latest_attempt()
+            self.content_offset = 0
+        self._clamp_detail_selection()
+        self._load_content()
+
     def _open_attempts(self) -> None:
         if self.detail is None:
             self._open_selected_item()
@@ -878,7 +961,7 @@ class TuiApp:
         self._load_content()
 
     def _load_content(self) -> None:
-        if self.view == "logs":
+        if self.view == "logs" or (self.view == "dashboard" and self.dashboard_panel == "logs"):
             path = Path(self.selected_log_path) if self.selected_log_path else None
             self.content_lines = tail_file_lines(path, limit=MAX_CONTENT_LINES)
             return
