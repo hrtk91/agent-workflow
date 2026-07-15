@@ -49,6 +49,17 @@ STATUS_SYMBOLS = {
     "blocked": "!",
     "pending": "·",
 }
+STATUS_COLOR_PAIRS = {
+    "queued": 1,
+    "pending": 1,
+    "running": 2,
+    "succeeded": 3,
+    "failed": 4,
+    "qc_failed": 4,
+    "blocked": 4,
+    "timed_out": 5,
+    "interrupted": 6,
+}
 STEP_LABELS = {
     "load_task": "task",
     "create_worktree": "worktree",
@@ -121,6 +132,7 @@ class TuiApp:
         self.filter_name = "all"
         self.selected_index = 0
         self.list_offset = 0
+        self.colors_enabled = False
         self.view = "dashboard"
         self.menu_index = 0
         self.command_buffer = ""
@@ -210,7 +222,7 @@ class TuiApp:
         for row, item in enumerate(visible_items):
             absolute_index = self.list_offset + row
             attr = curses.A_REVERSE if absolute_index == self.selected_index else 0
-            self._add(screen, list_top + row, 0, self._item_line(item), left_width - 1, attr)
+            self._draw_item(screen, list_top + row, item, left_width - 1, attr)
         if not items:
             self._add(screen, list_top, 0, "表示対象はありません", left_width - 1)
 
@@ -236,23 +248,49 @@ class TuiApp:
         self._add(screen, height - 1, 0, "↑↓/jk 選択  Enter 詳細  m メニュー  : コマンド  q 終了", width - 1)
 
     def _draw_pipeline(self, screen: curses.window, run: PipelineRun, x: int, y: int, width: int) -> None:
-        self._add(screen, y, x, f"{run.run_id}  {status_label(run.status)}", width, curses.A_BOLD)
+        self._add(
+            screen,
+            y,
+            x,
+            f"{run.run_id}  {status_label(run.status)}",
+            width,
+            curses.A_BOLD | self._status_attr(run.status),
+        )
         self._add(screen, y + 1, x, f"repo: {run.repo_path}", width)
         self._add(screen, y + 2, x, f"workflow: {run.workflow}  QC修復: {run.qc_repair_attempts}", width)
-        pipeline_line = " ─ ".join(
-            f"{STEP_LABELS.get(step.name, step.name)} {status_symbol(step.status)}"
-            for step in run.steps
-        )
-        self._add(screen, y + 4, x, pipeline_line, width, curses.A_BOLD)
+        self._draw_pipeline_flow(screen, run, x, y + 4, width)
+        active_step_name = active_step(run)
         for index, step in enumerate(run.steps):
-            detail = f"{status_symbol(step.status)} {STEP_LABELS.get(step.name, step.name)}: {status_label(step.status)}"
+            is_active = step.name == active_step_name
+            marker = "▶" if is_active else status_symbol(step.status)
+            detail = f"{marker} {STEP_LABELS.get(step.name, step.name)}: {status_label(step.status)}"
             if step.attempts:
                 detail += f"  試行={step.attempts}"
             if step.duration_seconds is not None:
                 detail += f"  {step.duration_seconds:.1f}s"
             if step.error:
                 detail += f"  {step.error}"
-            self._add(screen, y + 6 + index, x, detail, width)
+            attr = self._status_attr(step.status) | (curses.A_BOLD if is_active else 0)
+            self._add(screen, y + 6 + index, x, detail, width, attr)
+
+    def _draw_pipeline_flow(self, screen: curses.window, run: PipelineRun, x: int, y: int, width: int) -> None:
+        active_step_name = active_step(run)
+        cursor = x
+        right_edge = x + width
+        for index, step in enumerate(run.steps):
+            label = STEP_LABELS.get(step.name, step.name)
+            segment = f" {label} {status_symbol(step.status)} "
+            if cursor < right_edge:
+                is_active = step.name == active_step_name
+                attr = self._status_attr(step.status) | (curses.A_BOLD if is_active else 0)
+                if is_active:
+                    attr |= curses.A_REVERSE
+                self._add(screen, y, cursor, segment, right_edge - cursor, attr)
+            cursor += len(segment)
+            if index < len(run.steps) - 1:
+                connector = " → "
+                self._add(screen, y, cursor, connector, max(0, right_edge - cursor), curses.A_DIM)
+                cursor += len(connector)
 
     def _draw_detail(self, screen: curses.window) -> None:
         height, width = screen.getmaxyx()
@@ -446,15 +484,35 @@ class TuiApp:
             current = f" / {STEP_LABELS.get(item.run.current_step, item.run.current_step)}"
         return f"{status_symbol(item.status)} {kind} {identifier} {status_label(item.status)}{current}"
 
-    @staticmethod
-    def _init_colors() -> None:
+    def _draw_item(self, screen: curses.window, y: int, item: PipelineItem, width: int, attr: int) -> None:
+        line = self._item_line(item)
+        symbol = status_symbol(item.status)
+        self._add(screen, y, 0, symbol, 2, attr | self._status_attr(item.status))
+        self._add(screen, y, 2, line[len(symbol) + 1 :], width - 2, attr)
+
+    def _init_colors(self) -> None:
         if not curses.has_colors():
             return
-        curses.start_color()
         try:
+            curses.start_color()
             curses.use_default_colors()
+            for pair, color in {
+                1: curses.COLOR_BLUE,
+                2: curses.COLOR_CYAN,
+                3: curses.COLOR_GREEN,
+                4: curses.COLOR_RED,
+                5: curses.COLOR_MAGENTA,
+                6: curses.COLOR_YELLOW,
+            }.items():
+                curses.init_pair(pair, color, -1)
+            self.colors_enabled = True
         except curses.error:
-            pass
+            self.colors_enabled = False
+
+    def _status_attr(self, status: str) -> int:
+        if not self.colors_enabled:
+            return 0
+        return curses.color_pair(STATUS_COLOR_PAIRS.get(status, 0))
 
     @staticmethod
     def _add(screen: curses.window, y: int, x: int, text: str, width: int, attr: int = 0) -> None:
@@ -479,6 +537,13 @@ def current_step(run: PipelineRun) -> PipelineStep | None:
         (step for step in run.steps if step.status != "succeeded"),
         next((step for step in reversed(run.steps) if step.stdout_path or step.stderr_path), None),
     )
+
+
+def active_step(run: PipelineRun) -> str | None:
+    for step in run.steps:
+        if step.status in ATTENTION_STATUSES or step.status == "running":
+            return step.name
+    return None
 
 
 def tail_lines(path: Path, limit: int) -> list[str]:
