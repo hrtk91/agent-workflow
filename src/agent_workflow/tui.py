@@ -60,6 +60,17 @@ STATUS_COLOR_PAIRS = {
     "timed_out": 5,
     "interrupted": 6,
 }
+STATUS_EMOJIS = {
+    "queued": "📥",
+    "pending": "⏳",
+    "running": "🚀",
+    "succeeded": "✅",
+    "failed": "❌",
+    "qc_failed": "🛑",
+    "timed_out": "⏱️",
+    "interrupted": "⏸️",
+    "blocked": "🚫",
+}
 STEP_LABELS = {
     "load_task": "task",
     "create_worktree": "worktree",
@@ -295,28 +306,36 @@ class TuiApp:
     def _draw_detail(self, screen: curses.window) -> None:
         height, width = screen.getmaxyx()
         item = self.selected_item
-        self._add(screen, 0, 0, "run詳細", width - 1, curses.A_BOLD)
+        self._add(screen, 0, 0, "📋 run詳細", width - 1, curses.A_BOLD)
         if item is None or item.run is None:
             self._add(screen, 2, 0, "選択中のrun詳細はありません。Escで戻る。", width - 1)
             return
         run = item.run
-        lines = [
-            f"run_id: {run.run_id}",
-            f"status: {run.status} ({status_label(run.status)})",
-            f"current_step: {run.current_step or '-'}",
-            f"repo: {run.repo_path}",
-            f"workflow: {run.workflow}",
-            f"summary: {run.summary_path}",
-            f"updated_at: {run.updated_at}",
-            "",
-            "steps:",
-        ]
-        lines.extend(
-            f"  {step.name}\t{step.status}\tattempts={step.attempts}\tduration={format_duration(step.duration_seconds)}"
-            for step in run.steps
+        active_step_name = active_step(run)
+        metadata = (
+            (2, f"🆔 run_id: {run.run_id}", 0),
+            (3, f"{status_emoji(run.status)} status: {run.status} ({status_label(run.status)})", self._status_attr(run.status) | curses.A_BOLD),
+            (4, f"🎯 current_step: {run.current_step or '-'}", 0),
+            (5, f"📁 repo: {run.repo_path}", 0),
+            (6, f"🔧 workflow: {run.workflow}", 0),
+            (7, f"📄 summary: {run.summary_path}", 0),
+            (8, f"🕒 updated_at: {run.updated_at}", curses.A_DIM),
         )
-        for index, line in enumerate(lines[: max(0, height - 3)]):
-            self._add(screen, 2 + index, 0, line, width - 1)
+        for row, line, attr in metadata:
+            self._add(screen, row, 0, line, width - 1, attr)
+        steps_y = 10
+        self._add(screen, steps_y, 0, "🧩 steps", width - 1, curses.A_UNDERLINE | curses.A_BOLD)
+        for index, step in enumerate(run.steps):
+            row = steps_y + 1 + index
+            if row >= height - 1:
+                break
+            is_active = step.name == active_step_name
+            marker = "▶" if is_active else status_emoji(step.status)
+            line = f"{marker} {step.name}\t{status_label(step.status)}\tattempts={step.attempts}\tduration={format_duration(step.duration_seconds)}"
+            attr = self._status_attr(step.status) | (curses.A_BOLD if is_active else 0)
+            if is_active:
+                attr |= curses.A_REVERSE
+            self._add(screen, row, 0, line, width - 1, attr)
         self._add(screen, height - 1, 0, "Esc/q:一覧へ  r:更新  l:ログ", width - 1)
 
     def _draw_logs(self, screen: curses.window) -> None:
@@ -572,6 +591,10 @@ def truncate_log_line(line: str) -> str:
 
 def status_label(status: str) -> str:
     return STATUS_LABELS.get(status, status)
+
+
+def status_emoji(status: str) -> str:
+    return STATUS_EMOJIS.get(status, "🔹")
 
 
 def status_symbol(status: str) -> str:

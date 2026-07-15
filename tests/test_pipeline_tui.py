@@ -19,7 +19,7 @@ from agent_workflow.pipeline import (
     pipeline_items,
 )
 from agent_workflow.runner import RunnerConfig, WorkflowRunner
-from agent_workflow.tui import MAX_LOG_LINE_CHARS, TuiApp, TuiCommand, parse_command, tail_lines
+from agent_workflow.tui import MAX_LOG_LINE_CHARS, TuiApp, TuiCommand, parse_command, status_emoji, tail_lines
 
 
 class PipelineSnapshotTest(unittest.TestCase):
@@ -269,6 +269,11 @@ class PipelineSnapshotTest(unittest.TestCase):
 
 
 class TuiCommandTest(unittest.TestCase):
+    def test_status_emoji_keeps_state_meaning_visible_without_color(self) -> None:
+        self.assertEqual("✅", status_emoji("succeeded"))
+        self.assertEqual("🚀", status_emoji("running"))
+        self.assertEqual("❌", status_emoji("failed"))
+
     def test_parse_command_supports_menu_commands_and_aliases(self) -> None:
         self.assertEqual(TuiCommand("filter", ("running",)), parse_command(":filter running"))
         self.assertEqual(TuiCommand("filter", ("attention",)), parse_command("f attention"))
