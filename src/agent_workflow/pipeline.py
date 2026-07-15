@@ -49,6 +49,47 @@ class PipelineRun:
 
 
 @dataclass(frozen=True)
+class PipelineAttempt:
+    step_name: str
+    attempt: int
+    status: str
+    started_at: str | None
+    finished_at: str | None
+    duration_seconds: float | None
+    exit_code: int | None
+    timed_out: bool
+    error: str | None
+    failure_category: str | None
+    stdout_path: str | None
+    stderr_path: str | None
+
+
+@dataclass(frozen=True)
+class PipelineRunDetail:
+    run_id: str
+    status: str
+    repo_path: str
+    workflow: str
+    purpose: str
+    current_step: str | None
+    summary_path: str
+    logs_dir: str
+    qc_repair_attempts: int
+    created_at: str
+    updated_at: str
+    finished_at: str | None
+    elapsed_seconds: float | None
+    provider: str | None
+    model: str | None
+    task_type: str
+    base_ref: str | None
+    worktree_path: str | None
+    timeout_seconds: float
+    steps: tuple[PipelineStep, ...]
+    attempts: tuple[PipelineAttempt, ...]
+
+
+@dataclass(frozen=True)
 class PipelineJob:
     job_id: str
     status: str
@@ -117,6 +158,72 @@ class PipelineSnapshotReader:
         except (OSError, sqlite3.Error):
             return PipelineSnapshot.empty()
         return PipelineSnapshot(generated_at=utc_now(), jobs=jobs, runs=runs)
+
+    def run_detail(self, run_id: str) -> PipelineRunDetail | None:
+        """1 runのcurrent state・attempt履歴をread-onlyで取得する。"""
+
+        if not self.db_path.is_file():
+            return None
+        try:
+            with self._read_db() as conn:
+                conn.row_factory = sqlite3.Row
+                run_row = conn.execute("select * from runs where run_id = ?", (run_id,)).fetchone()
+                if run_row is None:
+                    return None
+                table_names = {
+                    str(row[0])
+                    for row in conn.execute("select name from sqlite_master where type = 'table'").fetchall()
+                }
+                step_rows = (
+                    conn.execute(
+                        "select * from run_steps where run_id = ? order by position",
+                        (run_id,),
+                    ).fetchall()
+                    if "run_steps" in table_names
+                    else []
+                )
+                attempt_rows = (
+                    conn.execute(
+                        "select * from step_attempts where run_id = ? order by started_at, step_name, attempt",
+                        (run_id,),
+                    ).fetchall()
+                    if "step_attempts" in table_names
+                    else []
+                )
+        except (OSError, sqlite3.Error):
+            return None
+
+        summary_path = str(run_row["summary_path"] or "")
+        created_at = str(run_row["created_at"])
+        finished_at = str(run_row["finished_at"]) if run_row["finished_at"] else None
+        elapsed = run_row["elapsed_seconds"]
+        if elapsed is None:
+            elapsed = duration_seconds(created_at, finished_at or (None if str(run_row["status"]) == "running" else str(run_row["updated_at"])))
+        steps = tuple(step_from_row(row) for row in step_rows) or tuple(default_steps())
+        attempts = tuple(attempt_from_row(row) for row in attempt_rows)
+        return PipelineRunDetail(
+            run_id=str(run_row["run_id"]),
+            status=str(run_row["status"]),
+            repo_path=str(run_row["repo_path"]),
+            workflow=str(run_row["workflow"]),
+            purpose=str(run_row["purpose"]),
+            current_step=str(run_row["current_step"]) if run_row["current_step"] else None,
+            summary_path=summary_path,
+            logs_dir=str(Path(summary_path).parent / "logs") if summary_path else "",
+            qc_repair_attempts=int(run_row["qc_repair_attempts"] or 0),
+            created_at=created_at,
+            updated_at=str(run_row["updated_at"]),
+            finished_at=finished_at,
+            elapsed_seconds=float(elapsed) if elapsed is not None else None,
+            provider=str(run_row["provider"]) if run_row["provider"] else None,
+            model=str(run_row["model"]) if run_row["model"] else None,
+            task_type=str(run_row["task_type"]),
+            base_ref=str(run_row["base_ref"]) if run_row["base_ref"] else None,
+            worktree_path=str(run_row["worktree_path"]) if run_row["worktree_path"] else None,
+            timeout_seconds=float(run_row["timeout_seconds"] or 0),
+            steps=steps,
+            attempts=attempts,
+        )
 
     def _read_jobs(
         self,
@@ -323,6 +430,28 @@ def step_from_row(row: sqlite3.Row) -> PipelineStep:
         exit_code=int(row["exit_code"]) if row["exit_code"] is not None else None,
         timed_out=bool(row["timed_out"]),
         error=str(row["error"]) if row["error"] else None,
+        stdout_path=str(row["stdout_path"]) if row["stdout_path"] else None,
+        stderr_path=str(row["stderr_path"]) if row["stderr_path"] else None,
+    )
+
+
+def attempt_from_row(row: sqlite3.Row) -> PipelineAttempt:
+    started_at = str(row["started_at"]) if row["started_at"] else None
+    finished_at = str(row["finished_at"]) if row["finished_at"] else None
+    duration = row["duration_seconds"]
+    if duration is None:
+        duration = duration_seconds(started_at, finished_at)
+    return PipelineAttempt(
+        step_name=str(row["step_name"]),
+        attempt=int(row["attempt"]),
+        status=str(row["status"]),
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_seconds=float(duration) if duration is not None else None,
+        exit_code=int(row["exit_code"]) if row["exit_code"] is not None else None,
+        timed_out=bool(row["timed_out"]),
+        error=str(row["error"]) if row["error"] else None,
+        failure_category=str(row["failure_category"]) if row["failure_category"] else None,
         stdout_path=str(row["stdout_path"]) if row["stdout_path"] else None,
         stderr_path=str(row["stderr_path"]) if row["stderr_path"] else None,
     )

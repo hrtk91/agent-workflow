@@ -229,7 +229,7 @@ aw status
 aw ui
 ```
 
-画面では、矢印キーまたは`j`／`k`でrunを選び、Enterで詳細、`m`でメニューを開きます。
+画面では、矢印キーまたは`j`／`k`でrunまたはqueue jobを選び、Enterでワークスペースを開きます。
 `:`を押すとコマンドを入力できます。
 
 stepは状態ごとに色分けし、実行中のstepを反転と太字で強調します。処理順は矢印でつなぎ、
@@ -240,14 +240,25 @@ stepは状態ごとに色分けし、実行中のstepを反転と太字で強調
 :filter running
 :refresh
 :detail
+:attempts
 :logs
+:summary
+:trace
+:monitor
 :help
 :quit
 ```
 
-メニューとコマンドパレットは同じ操作を実行します。現在のTUIは状態確認、絞り込み、
-詳細表示、ログ末尾の確認に対応しています。`resume`、`retry`、`cleanup`など状態を
-変更する操作は、誤操作を避けるためCLIから実行します。
+メニューとコマンドパレットは同じ操作を実行します。runワークスペースでは、stepを選び、
+run全体の経過時間、stepごとの開始・終了・経過時間、試行回数、exit code、失敗理由を確認できます。
+`Enter`または`a`でstepの試行履歴を開き、`l`で選択中step／試行のstdout・stderrログを確認します。
+ログ画面では`Tab`／`o`／`e`で出力を切り替え、`[`／`]`でstepを移動できます。
+`s`はsummary、`t`はexecutor trace、`m`はexecutor monitorを開きます。各成果物は表示量を制限し、
+矢印キーまたは`j`／`k`でスクロールできます。
+
+queue jobを選んだ場合は、run開始前のjobワークスペースとしてrepo、workflow、purpose、作成時刻、
+エラー、run開始状況を表示します。`resume`、`retry`、`cleanup`など状態を変更する操作は、
+誤操作を避けるためCLIから実行します。
 
 ## ローカル分析
 

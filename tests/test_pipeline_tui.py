@@ -62,6 +62,123 @@ class PipelineSnapshotTest(unittest.TestCase):
         self.assertEqual("run-1", encoded["runs"][0]["run_id"])
         self.assertIsInstance(encoded["runs"][0]["steps"], list)
 
+    def test_reader_returns_run_detail_with_attempt_history_and_artifact_paths(self) -> None:
+        self._insert_run("run-detail", purpose="workflow")
+        summary = self.root / "run-detail.md"
+        stdout = self.root / "logs" / "run_executor.stdout.log"
+        stderr = self.root / "logs" / "run_executor.stderr.log"
+        stdout.parent.mkdir(parents=True, exist_ok=True)
+        summary.write_text("# run-detail\n", encoding="utf-8")
+        stdout.write_text("executor output\n", encoding="utf-8")
+        stderr.write_text("executor error\n", encoding="utf-8")
+        with sqlite3.connect(self.state_dir / "jobs.sqlite") as conn:
+            conn.execute(
+                "update runs set status = 'failed', summary_path = ?, finished_at = ?, elapsed_seconds = ? where run_id = ?",
+                (str(summary), "2026-07-15T00:00:03+00:00", 3.0, "run-detail"),
+            )
+            conn.execute(
+                """
+                update run_steps
+                set status = 'failed', started_at = ?, finished_at = ?, exit_code = ?, error = ?, stdout_path = ?, stderr_path = ?
+                where run_id = ? and step_name = 'run_executor'
+                """,
+                (
+                    "2026-07-15T00:00:00+00:00",
+                    "2026-07-15T00:00:03+00:00",
+                    3,
+                    "executor failed",
+                    str(stdout),
+                    str(stderr),
+                    "run-detail",
+                ),
+            )
+            conn.execute(
+                """
+                insert into step_attempts(
+                  run_id, step_name, attempt, status, started_at, finished_at, duration_seconds,
+                  exit_code, timed_out, error, failure_category, stdout_path, stderr_path
+                ) values(?, 'run_executor', 1, 'failed', ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                """,
+                (
+                    "run-detail",
+                    "2026-07-15T00:00:00+00:00",
+                    "2026-07-15T00:00:03+00:00",
+                    3.0,
+                    3,
+                    "executor failed",
+                    "executor_failure",
+                    str(stdout),
+                    str(stderr),
+                ),
+            )
+
+        detail = PipelineSnapshotReader(self.state_dir / "jobs.sqlite").run_detail("run-detail")
+
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        self.assertEqual(3.0, detail.elapsed_seconds)
+        self.assertEqual("run_executor", detail.attempts[0].step_name)
+        self.assertEqual("executor_failure", detail.attempts[0].failure_category)
+        self.assertEqual(str(stdout), detail.steps[2].stdout_path)
+        self.assertEqual(str(self.root / "logs"), detail.logs_dir)
+
+    def test_tui_workspace_opens_job_step_attempt_logs_and_artifacts(self) -> None:
+        job_id = self.runner.enqueue(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.root / "repo",
+                task_text="queued task",
+                verify_command="true",
+            )
+        )
+        self._insert_run("run-workspace", purpose="workflow")
+        summary = self.root / "run-workspace.md"
+        stdout = self.root / "logs" / "run_executor.stdout.log"
+        summary.write_text("summary line\n", encoding="utf-8")
+        stdout.parent.mkdir(parents=True, exist_ok=True)
+        stdout.write_text("selected log line\n", encoding="utf-8")
+        trace = self.root / "executor_observability" / "takt" / "sample" / "trace.md"
+        trace.parent.mkdir(parents=True, exist_ok=True)
+        trace.write_text("trace line\n", encoding="utf-8")
+        with sqlite3.connect(self.state_dir / "jobs.sqlite") as conn:
+            conn.execute(
+                "update runs set summary_path = ? where run_id = ?",
+                (str(summary), "run-workspace"),
+            )
+            conn.execute(
+                "update run_steps set stdout_path = ?, attempts = 1 where run_id = ? and step_name = 'run_executor'",
+                (str(stdout), "run-workspace"),
+            )
+            conn.execute(
+                """
+                insert into step_attempts(
+                  run_id, step_name, attempt, status, started_at, finished_at, duration_seconds,
+                  exit_code, timed_out, error, failure_category, stdout_path, stderr_path
+                ) values(?, 'run_executor', 1, 'running', ?, null, null, null, 0, null, null, ?, null)
+                """,
+                ("run-workspace", "2026-07-15T00:00:00+00:00", str(stdout)),
+            )
+
+        app = TuiApp(PipelineSnapshotReader(self.state_dir / "jobs.sqlite"), refresh_seconds=1.0, include_repair=False)
+        app.snapshot = app.reader.snapshot()
+        app.selected_index = next(index for index, item in enumerate(app.items) if item.item_id == "run-workspace")
+        app._open_selected_item()
+
+        self.assertEqual("detail", app.view)
+        self.assertEqual("run_executor", app.selected_detail_step.name if app.selected_detail_step else None)
+        self.assertEqual(1, app.selected_attempt.attempt if app.selected_attempt else None)
+        app._open_logs()
+        self.assertEqual("logs", app.view)
+        self.assertIn("selected log line", app.content_lines)
+        app._open_artifact("summary")
+        self.assertIn("summary line", app.content_lines)
+        app._open_artifact("trace")
+        self.assertIn("trace line", app.content_lines)
+
+        app.selected_index = next(index for index, item in enumerate(app.items) if item.item_id == job_id)
+        app._open_selected_item()
+        self.assertEqual("job", app.view)
+
     def test_reader_hides_repair_runs_unless_requested(self) -> None:
         self.runner.enqueue(
             RunnerConfig(
@@ -278,7 +395,9 @@ class TuiCommandTest(unittest.TestCase):
         self.assertEqual(TuiCommand("filter", ("running",)), parse_command(":filter running"))
         self.assertEqual(TuiCommand("filter", ("attention",)), parse_command("f attention"))
         self.assertEqual(TuiCommand("detail"), parse_command("d"))
+        self.assertEqual(TuiCommand("attempts"), parse_command("a"))
         self.assertEqual(TuiCommand("quit"), parse_command("q"))
+        self.assertEqual(TuiCommand("monitor"), parse_command(":monitor"))
 
     def test_parse_command_rejects_unknown_or_invalid_arguments(self) -> None:
         with self.assertRaises(ValueError):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import curses
+import json
 import shlex
 import time
 from dataclasses import dataclass
@@ -12,7 +13,9 @@ from agent_workflow.pipeline import (
     ATTENTION_STATUSES,
     PIPELINE_FILTERS,
     PipelineItem,
+    PipelineAttempt,
     PipelineRun,
+    PipelineRunDetail,
     PipelineStep,
     PipelineSnapshot,
     PipelineSnapshotReader,
@@ -85,13 +88,19 @@ MENU_ITEMS = (
     ("filter attention", "要確認のrun"),
     ("filter succeeded", "成功したrun"),
     ("refresh", "今すぐ更新"),
-    ("detail", "選択中runの詳細"),
-    ("logs", "選択中runのログ末尾"),
+    ("detail", "選択中run/jobを開く"),
+    ("attempts", "選択stepの試行履歴"),
+    ("logs", "選択step/試行のログ"),
+    ("summary", "summaryを読む"),
+    ("trace", "executor traceを読む"),
+    ("monitor", "executor monitorを読む"),
     ("quit", "終了"),
 )
-COMMAND_HELP = "filter all|running|queued|attention|succeeded / refresh / detail / logs / help / quit"
+COMMAND_HELP = "filter all|running|queued|attention|succeeded / refresh / detail / attempts / logs / summary / trace / monitor / help / quit"
 MAX_LOG_TAIL_BYTES = 64 * 1024
 MAX_LOG_LINE_CHARS = 4_096
+MAX_ARTIFACT_BYTES = 128 * 1024
+MAX_CONTENT_LINES = 2_000
 
 
 @dataclass(frozen=True)
@@ -110,7 +119,10 @@ def parse_command(raw: str) -> TuiCommand:
         "f": "filter",
         "r": "refresh",
         "d": "detail",
+        "a": "attempts",
         "l": "logs",
+        "s": "summary",
+        "t": "trace",
         "h": "help",
         "q": "quit",
     }
@@ -119,7 +131,7 @@ def parse_command(raw: str) -> TuiCommand:
     if name == "filter":
         if len(args) != 1 or args[0] not in PIPELINE_FILTERS:
             raise ValueError("filterにはall、running、queued、attention、succeededのいずれかを指定してください")
-    elif name not in {"refresh", "detail", "logs", "help", "quit", "noop"}:
+    elif name not in {"refresh", "detail", "attempts", "logs", "summary", "trace", "monitor", "help", "quit", "noop"}:
         raise ValueError(f"未知のコマンドです: {tokens[0]}")
     elif args:
         raise ValueError(f"{name}には引数を指定できません")
@@ -147,8 +159,18 @@ class TuiApp:
         self.view = "dashboard"
         self.menu_index = 0
         self.command_buffer = ""
-        self.message = "r:更新  m:メニュー  ::コマンド  Enter:詳細  q:終了"
+        self.message = "r:更新  m:メニュー  ::コマンド  Enter:開く  q:終了"
         self.last_refresh = 0.0
+        self.detail: PipelineRunDetail | None = None
+        self.detail_step_index = 0
+        self.detail_attempt_index = 0
+        self.log_source = "stdout"
+        self.content_lines: list[str] = []
+        self.content_offset = 0
+        self.artifact_kind = "summary"
+        self.artifact_path: Path | None = None
+        self.menu_offset = 0
+        self._screen_height = 0
 
     def run(self, screen: curses.window) -> None:
         screen.keypad(True)
@@ -172,8 +194,8 @@ class TuiApp:
             elif self.view == "menu":
                 if self._handle_menu_input(key):
                     return
-            elif self.view in {"detail", "logs"}:
-                if self._handle_detail_input(key):
+            elif self.view in {"detail", "attempts", "logs", "artifact", "job"}:
+                if self._handle_workspace_input(key):
                     return
             elif self._handle_dashboard_input(key):
                 return
@@ -182,6 +204,13 @@ class TuiApp:
         self.snapshot = self.reader.snapshot(include_repair=self.include_repair)
         self.last_refresh = time.monotonic()
         self._clamp_selection()
+        if self.detail is not None:
+            refreshed = self.reader.run_detail(self.detail.run_id)
+            if refreshed is not None:
+                self.detail = refreshed
+                self._clamp_detail_selection()
+                if self.view in {"logs", "artifact"}:
+                    self._load_content()
 
     def draw(self, screen: curses.window) -> None:
         screen.erase()
@@ -189,8 +218,14 @@ class TuiApp:
             self._draw_dashboard(screen)
         elif self.view == "detail":
             self._draw_detail(screen)
-        else:
+        elif self.view == "attempts":
+            self._draw_attempts(screen)
+        elif self.view == "logs":
             self._draw_logs(screen)
+        elif self.view == "artifact":
+            self._draw_artifact(screen)
+        else:
+            self._draw_job_detail(screen)
         if self.view == "menu":
             self._draw_menu(screen)
         elif self.view == "command":
@@ -207,7 +242,9 @@ class TuiApp:
             screen,
             1,
             0,
-            f"queue: {len(self.snapshot.jobs)}  runs: {len(self.snapshot.runs)}  表示: {len(items)}",
+            f"queue: {len(self.snapshot.jobs)}  runs: {len(self.snapshot.runs)}  表示: {len(items)}"
+            f"  実行中: {sum(item.status == 'running' for item in items)}"
+            f"  要確認: {sum(item.status in ATTENTION_STATUSES for item in items)}",
             width - 1,
         )
         if height < 8:
@@ -256,7 +293,7 @@ class TuiApp:
 
         message_y = max(list_bottom + 1, height - 2)
         self._add(screen, message_y, 0, self.message, width - 1, curses.A_DIM)
-        self._add(screen, height - 1, 0, "↑↓/jk 選択  Enter 詳細  m メニュー  : コマンド  q 終了", width - 1)
+        self._add(screen, height - 1, 0, "↑↓/jk 選択  Enter 開く  l ログ  m メニュー  : コマンド  q 終了", width - 1)
 
     def _draw_pipeline(self, screen: curses.window, run: PipelineRun, x: int, y: int, width: int) -> None:
         self._add(
@@ -305,66 +342,214 @@ class TuiApp:
 
     def _draw_detail(self, screen: curses.window) -> None:
         height, width = screen.getmaxyx()
-        item = self.selected_item
-        self._add(screen, 0, 0, "📋 run詳細", width - 1, curses.A_BOLD)
-        if item is None or item.run is None:
-            self._add(screen, 2, 0, "選択中のrun詳細はありません。Escで戻る。", width - 1)
+        detail = self.detail
+        self._add(screen, 0, 0, "📋 runワークスペース", width - 1, curses.A_BOLD)
+        if detail is None:
+            self._add(screen, 2, 0, "run詳細を読み込めません。Escで一覧へ戻る。", width - 1)
             return
-        run = item.run
-        active_step_name = active_step(run)
-        metadata = (
-            (2, f"🆔 run_id: {run.run_id}", 0),
-            (3, f"{status_emoji(run.status)} status: {run.status} ({status_label(run.status)})", self._status_attr(run.status) | curses.A_BOLD),
-            (4, f"🎯 current_step: {run.current_step or '-'}", 0),
-            (5, f"📁 repo: {run.repo_path}", 0),
-            (6, f"🔧 workflow: {run.workflow}", 0),
-            (7, f"📄 summary: {run.summary_path}", 0),
-            (8, f"🕒 updated_at: {run.updated_at}", curses.A_DIM),
+        if height < 10:
+            self._add(screen, 2, 0, "端末の高さが足りません。ウィンドウを広げてください。", width - 1)
+            return
+
+        elapsed = format_duration(detail.elapsed_seconds)
+        self._add(
+            screen,
+            1,
+            0,
+            f"{status_emoji(detail.status)} {detail.run_id}  {status_label(detail.status)}  経過={elapsed}",
+            width - 1,
+            self._status_attr(detail.status) | curses.A_BOLD,
         )
-        for row, line, attr in metadata:
-            self._add(screen, row, 0, line, width - 1, attr)
-        steps_y = 10
-        self._add(screen, steps_y, 0, "🧩 steps", width - 1, curses.A_UNDERLINE | curses.A_BOLD)
-        for index, step in enumerate(run.steps):
-            row = steps_y + 1 + index
-            if row >= height - 1:
-                break
-            is_active = step.name == active_step_name
-            marker = "▶" if is_active else status_emoji(step.status)
-            line = f"{marker} {step.name}\t{status_label(step.status)}\tattempts={step.attempts}\tduration={format_duration(step.duration_seconds)}"
-            attr = self._status_attr(step.status) | (curses.A_BOLD if is_active else 0)
-            if is_active:
-                attr |= curses.A_REVERSE
-            self._add(screen, row, 0, line, width - 1, attr)
-        self._add(screen, height - 1, 0, "Esc/q:一覧へ  r:更新  l:ログ", width - 1)
+        self._add(screen, 2, 0, f"📁 {detail.repo_path}  🔧 {detail.workflow}  🎯 {detail.current_step or '-'}", width - 1)
+        self._add(
+            screen,
+            3,
+            0,
+            f"model={detail.model or '(default)'}  task={detail.task_type}  QC修復={detail.qc_repair_attempts}",
+            width - 1,
+            curses.A_DIM,
+        )
+
+        section_y = 5
+        left_width = max(32, min(54, width // 2))
+        right_x = left_width + 3
+        right_width = max(1, width - right_x - 1)
+        self._add(screen, section_y, 0, "🧩 Pipeline / step選択", left_width - 1, curses.A_UNDERLINE | curses.A_BOLD)
+        self._add(screen, section_y, right_x, "🔎 選択stepの詳細", right_width, curses.A_UNDERLINE | curses.A_BOLD)
+        step_capacity = max(1, height - section_y - 3)
+        for index, step in enumerate(detail.steps[:step_capacity]):
+            row = section_y + 1 + index
+            selected = index == self.detail_step_index
+            self._draw_step_row(screen, row, 0, step, left_width - 1, selected)
+        self._draw_selected_step(screen, detail, right_x, section_y + 1, right_width, height - section_y - 3)
+        self._add(screen, height - 2, 0, self.message, width - 1, curses.A_DIM)
+        self._add(screen, height - 1, 0, "↑↓/jk:step  Enter/a:試行  l:ログ  s:summary  t:trace  m:monitor  Esc:一覧", width - 1)
+
+    def _draw_attempts(self, screen: curses.window) -> None:
+        height, width = screen.getmaxyx()
+        detail = self.detail
+        self._add(screen, 0, 0, "🧾 step試行履歴", width - 1, curses.A_BOLD)
+        if detail is None:
+            self._add(screen, 2, 0, "run詳細を読み込めません。Escで一覧へ戻る。", width - 1)
+            return
+        step = self.selected_detail_step
+        if step is None:
+            self._add(screen, 2, 0, "選択中のstepはありません。Escで戻る。", width - 1)
+            return
+        attempts = self.selected_step_attempts
+        self._add(screen, 1, 0, f"{detail.run_id} / {STEP_LABELS.get(step.name, step.name)}", width - 1, curses.A_UNDERLINE)
+        if not attempts:
+            self._add(screen, 3, 0, "このstepの試行履歴はありません。", width - 1)
+        else:
+            list_width = max(38, min(64, width // 2))
+            self._add(screen, 3, 0, "試行", list_width - 1, curses.A_UNDERLINE)
+            for index, attempt in enumerate(attempts[: max(1, height - 8)]):
+                selected = index == self.detail_attempt_index
+                line = (
+                    f"{status_emoji(attempt.status)} #{attempt.attempt}  {status_label(attempt.status)}"
+                    f"  {format_duration(attempt.duration_seconds)}"
+                )
+                if attempt.exit_code is not None:
+                    line += f"  exit={attempt.exit_code}"
+                attr = self._status_attr(attempt.status) | (curses.A_REVERSE if selected else 0)
+                self._add(screen, 4 + index, 0, line, list_width - 1, attr)
+            right_x = list_width + 2
+            self._add(screen, 3, right_x, "選択試行", max(1, width - right_x - 1), curses.A_UNDERLINE)
+            self._draw_attempt_detail(screen, attempts[self.detail_attempt_index], right_x, 4, max(1, width - right_x - 1), height - 7)
+        self._add(screen, height - 2, 0, self.message, width - 1, curses.A_DIM)
+        self._add(screen, height - 1, 0, "↑↓/jk:試行  Enter/l:ログ  s:summary  Esc:runへ", width - 1)
 
     def _draw_logs(self, screen: curses.window) -> None:
         height, width = screen.getmaxyx()
-        item = self.selected_item
-        self._add(screen, 0, 0, "ログ末尾", width - 1, curses.A_BOLD)
-        if item is None or item.run is None:
-            self._add(screen, 2, 0, "選択中のrunログはありません。Escで戻る。", width - 1)
+        detail = self.detail
+        self._add(screen, 0, 0, "📝 ログビューア", width - 1, curses.A_BOLD)
+        if detail is None:
+            self._add(screen, 2, 0, "run詳細を読み込めません。Escで一覧へ戻る。", width - 1)
             return
-        step = current_step(item.run)
+        step = self.selected_detail_step
         if step is None:
-            self._add(screen, 2, 0, "ログ対象のstepはありません。", width - 1)
+            self._add(screen, 2, 0, "ログ対象のstepはありません。Escで戻る。", width - 1)
             return
-        self._add(screen, 2, 0, f"{item.run.run_id} / {step.name}", width - 1, curses.A_UNDERLINE)
-        lines = []
-        for label, path in (("stdout", step.stdout_path), ("stderr", step.stderr_path)):
-            lines.append(f"--- {label}: {path or '(なし)'} ---")
-            if path:
-                lines.extend(tail_lines(Path(path), 12))
-        for index, line in enumerate(lines[: max(0, height - 5)]):
-            self._add(screen, 4 + index, 0, line, width - 1)
+        attempt = self.selected_attempt
+        attempt_label = f"#{attempt.attempt}" if attempt else "current"
+        path = self.selected_log_path
+        self._add(
+            screen,
+            1,
+            0,
+            f"{detail.run_id} / {STEP_LABELS.get(step.name, step.name)} / {attempt_label} / {self.log_source}",
+            width - 1,
+            curses.A_UNDERLINE,
+        )
+        self._add(screen, 2, 0, f"path: {path or '(なし)'}", width - 1, curses.A_DIM)
+        visible = max(1, height - 5)
+        max_offset = max(0, len(self.content_lines) - visible)
+        self.content_offset = min(max(0, self.content_offset), max_offset)
+        for index, line in enumerate(self.content_lines[self.content_offset : self.content_offset + visible]):
+            self._add(screen, 3 + index, 0, line, width - 1)
+        self._add(screen, height - 2, 0, self.message, width - 1, curses.A_DIM)
+        self._add(screen, height - 1, 0, "↑↓/jk:スクロール  Tab/o/e:stdout/stderr  [/]:step  a:試行  r:更新  Esc", width - 1)
+
+    def _draw_artifact(self, screen: curses.window) -> None:
+        height, width = screen.getmaxyx()
+        detail = self.detail
+        self._add(screen, 0, 0, f"📄 {artifact_label(self.artifact_kind)}", width - 1, curses.A_BOLD)
+        if detail is None:
+            self._add(screen, 2, 0, "run詳細を読み込めません。Escで一覧へ戻る。", width - 1)
+            return
+        self._add(screen, 1, 0, f"{detail.run_id} / {self.artifact_path or '(なし)'}", width - 1, curses.A_UNDERLINE)
+        visible = max(1, height - 4)
+        max_offset = max(0, len(self.content_lines) - visible)
+        self.content_offset = min(max(0, self.content_offset), max_offset)
+        for index, line in enumerate(self.content_lines[self.content_offset : self.content_offset + visible]):
+            self._add(screen, 3 + index, 0, line, width - 1)
+        self._add(screen, height - 2, 0, self.message, width - 1, curses.A_DIM)
+        self._add(screen, height - 1, 0, "↑↓/jk:スクロール  g/G:先頭/末尾  r:更新  Esc:runへ", width - 1)
+
+    def _draw_job_detail(self, screen: curses.window) -> None:
+        height, width = screen.getmaxyx()
+        item = self.selected_item
+        self._add(screen, 0, 0, "📥 queue jobワークスペース", width - 1, curses.A_BOLD)
+        if item is None or item.job is None:
+            self._add(screen, 2, 0, "選択中のjob詳細はありません。Escで一覧へ戻る。", width - 1)
+            return
+        job = item.job
+        lines = [
+            (2, f"{status_emoji(job.status)} status: {job.status} ({status_label(job.status)})", self._status_attr(job.status) | curses.A_BOLD),
+            (3, f"🆔 job_id: {job.job_id}", 0),
+            (4, f"📁 repo: {job.repo_path}", 0),
+            (5, f"🔧 workflow: {job.workflow}", 0),
+            (6, f"🎯 purpose: {job.purpose}", 0),
+            (7, f"🕒 created: {job.created_at}", curses.A_DIM),
+            (8, f"🕒 updated: {job.updated_at}", curses.A_DIM),
+            (9, f"📄 summary: {job.summary_path or '(未作成)'}", 0),
+        ]
+        for row, line, attr in lines:
+            self._add(screen, row, 0, line, width - 1, attr)
+        if job.error:
+            self._add(screen, 11, 0, f"❌ error: {job.error}", width - 1, self._status_attr("failed"))
+        elif job.run_id:
+            self._add(screen, 11, 0, f"🔗 run_id: {job.run_id}", width - 1)
+        else:
+            self._add(screen, 11, 0, "このjobはまだrun開始前です。", width - 1)
         self._add(screen, height - 1, 0, "Esc/q:一覧へ  r:更新", width - 1)
+
+    def _draw_step_row(self, screen: curses.window, row: int, x: int, step: PipelineStep, width: int, selected: bool) -> None:
+        marker = "▶" if selected else status_emoji(step.status)
+        label = STEP_LABELS.get(step.name, step.name)
+        line = f"{marker} {label}  {status_label(step.status)}  {format_duration(step.duration_seconds)}  試行={step.attempts}"
+        attr = self._status_attr(step.status) | (curses.A_REVERSE if selected else 0)
+        if selected:
+            attr |= curses.A_BOLD
+        self._add(screen, row, x, line, width, attr)
+
+    def _draw_selected_step(self, screen: curses.window, detail: PipelineRunDetail, x: int, y: int, width: int, height: int) -> None:
+        step = self.selected_detail_step
+        if step is None:
+            self._add(screen, y, x, "stepがありません。", width)
+            return
+        lines = [
+            (f"{status_emoji(step.status)} {step.name}  {status_label(step.status)}", self._status_attr(step.status) | curses.A_BOLD),
+            (f"開始: {step.started_at or '-'}", 0),
+            (f"終了: {step.finished_at or '(実行中)'}", 0),
+            (f"経過: {format_duration(step.duration_seconds)}  試行: {step.attempts}", 0),
+        ]
+        if step.exit_code is not None:
+            lines.append((f"exit: {step.exit_code}", self._status_attr(step.status)))
+        if step.timed_out:
+            lines.append(("⏱️ timed out", self._status_attr("timed_out")))
+        if step.error:
+            lines.append((f"❌ {step.error}", self._status_attr("failed")))
+        lines.append((f"試行履歴: {len(self.selected_step_attempts)}件  Enter/aで開く", curses.A_DIM))
+        lines.append((f"stdout: {'あり' if step.stdout_path else 'なし'}  stderr: {'あり' if step.stderr_path else 'なし'}", curses.A_DIM))
+        for index, (line, attr) in enumerate(lines[: max(0, height)]):
+            self._add(screen, y + index, x, line, width, attr)
+
+    def _draw_attempt_detail(self, screen: curses.window, attempt: PipelineAttempt, x: int, y: int, width: int, height: int) -> None:
+        lines = [
+            (f"{status_emoji(attempt.status)} #{attempt.attempt}  {status_label(attempt.status)}", self._status_attr(attempt.status) | curses.A_BOLD),
+            (f"開始: {attempt.started_at or '-'}", 0),
+            (f"終了: {attempt.finished_at or '(実行中)' }", 0),
+            (f"経過: {format_duration(attempt.duration_seconds)}", 0),
+            (f"exit: {attempt.exit_code if attempt.exit_code is not None else '-'}", 0),
+            (f"failure: {attempt.failure_category or '-'}", 0),
+            (f"stdout: {attempt.stdout_path or '(なし)'}", curses.A_DIM),
+            (f"stderr: {attempt.stderr_path or '(なし)'}", curses.A_DIM),
+        ]
+        if attempt.error:
+            lines.append((f"❌ {attempt.error}", self._status_attr("failed")))
+        for index, (line, attr) in enumerate(lines[: max(0, height)]):
+            self._add(screen, y + index, x, line, width, attr)
 
     def _draw_menu(self, screen: curses.window) -> None:
         height, width = screen.getmaxyx()
+        self._screen_height = height
         menu_width = min(max(42, max(len(label) for _, label in MENU_ITEMS) + 8), max(1, width - 2))
         menu_height = min(len(MENU_ITEMS) + 2, max(1, height - 2))
         x = max(0, (width - menu_width) // 2)
         y = max(0, (height - menu_height) // 2)
+        visible_count = max(0, menu_height - 2)
+        self._ensure_menu_visible(visible_count)
         try:
             screen.addstr(y, x, "┌" + "─" * max(0, menu_width - 2) + "┐")
             for row in range(1, menu_height - 1):
@@ -372,9 +557,10 @@ class TuiApp:
             screen.addstr(y + menu_height - 1, x, "└" + "─" * max(0, menu_width - 2) + "┘")
         except curses.error:
             return
-        for index, (_, label) in enumerate(MENU_ITEMS[: max(0, menu_height - 2)]):
+        for row, index in enumerate(range(self.menu_offset, min(len(MENU_ITEMS), self.menu_offset + visible_count))):
+            _, label = MENU_ITEMS[index]
             attr = curses.A_REVERSE if index == self.menu_index else 0
-            self._add(screen, y + 1 + index, x + 2, f"{index + 1}. {label}", menu_width - 4, attr)
+            self._add(screen, y + 1 + row, x + 2, f"{index + 1}. {label}", menu_width - 4, attr)
 
     def _draw_command_prompt(self, screen: curses.window) -> None:
         height, width = screen.getmaxyx()
@@ -388,12 +574,15 @@ class TuiApp:
         elif key in (curses.KEY_DOWN, ord("j")):
             self.selected_index = min(max(0, len(self.items) - 1), self.selected_index + 1)
         elif key in (10, 13, ord("d")):
-            self.view = "detail"
+            self._open_selected_item()
         elif key == ord("l"):
-            self.view = "logs"
+            self._open_selected_item()
+            if self.detail is not None:
+                self._open_logs()
         elif key == ord("m"):
             self.view = "menu"
             self.menu_index = 0
+            self.menu_offset = 0
         elif key == ord(":"):
             self.view = "command"
             self.command_buffer = ""
@@ -407,8 +596,10 @@ class TuiApp:
             self.view = "dashboard"
         elif key in (curses.KEY_UP, ord("k")):
             self.menu_index = max(0, self.menu_index - 1)
+            self._ensure_menu_visible(max(0, self._menu_visible_count()))
         elif key in (curses.KEY_DOWN, ord("j")):
             self.menu_index = min(len(MENU_ITEMS) - 1, self.menu_index + 1)
+            self._ensure_menu_visible(max(0, self._menu_visible_count()))
         elif key in (10, 13):
             return self._apply_command(MENU_ITEMS[self.menu_index][0])
         elif ord("1") <= key <= ord(str(min(9, len(MENU_ITEMS)))):
@@ -434,13 +625,115 @@ class TuiApp:
             self.command_buffer += chr(key)
         return False
 
+    def _handle_workspace_input(self, key: int) -> bool:
+        if self.view == "detail":
+            return self._handle_detail_input(key)
+        if self.view == "attempts":
+            return self._handle_attempts_input(key)
+        if self.view == "logs":
+            return self._handle_logs_input(key)
+        if self.view == "artifact":
+            return self._handle_artifact_input(key)
+        return self._handle_job_input(key)
+
     def _handle_detail_input(self, key: int) -> bool:
+        if key in (27, ord("q"), ord("Q")):
+            self.view = "dashboard"
+        elif key in (curses.KEY_UP, ord("k")):
+            self.detail_step_index = max(0, self.detail_step_index - 1)
+            self._select_latest_attempt()
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.detail_step_index = min(max(0, len(self.detail_steps) - 1), self.detail_step_index + 1)
+            self._select_latest_attempt()
+        elif key in (10, 13, ord("a")):
+            self._open_attempts()
+        elif key == ord("l"):
+            self._open_logs()
+        elif key == ord("s"):
+            self._open_artifact("summary")
+        elif key == ord("t"):
+            self._open_artifact("trace")
+        elif key == ord("m"):
+            self._open_artifact("monitor")
+        elif key == ord("r"):
+            self.refresh()
+            self.message = "run詳細を更新しました。"
+        return False
+
+    def _handle_attempts_input(self, key: int) -> bool:
+        if key in (27, ord("q"), ord("Q")):
+            self.view = "detail"
+        elif key in (curses.KEY_UP, ord("k")):
+            self.detail_attempt_index = max(0, self.detail_attempt_index - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.detail_attempt_index = min(max(0, len(self.selected_step_attempts) - 1), self.detail_attempt_index + 1)
+        elif key in (10, 13, ord("l")):
+            self._open_logs()
+        elif key == ord("s"):
+            self._open_artifact("summary")
+        elif key == ord("r"):
+            self.refresh()
+            self.message = "試行履歴を更新しました。"
+        return False
+
+    def _handle_logs_input(self, key: int) -> bool:
+        if key == 27:
+            self.view = "detail"
+        elif key in (ord("q"), ord("Q")):
+            self.view = "dashboard"
+        elif key in (curses.KEY_UP, ord("k")):
+            self.content_offset = max(0, self.content_offset - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.content_offset += 1
+        elif key in (9, ord("o")):
+            self.log_source = "stderr" if self.log_source == "stdout" else "stdout"
+            self._load_content()
+        elif key == ord("e"):
+            self.log_source = "stderr"
+            self._load_content()
+        elif key == ord("["):
+            self.detail_step_index = max(0, self.detail_step_index - 1)
+            self._select_latest_attempt()
+            self._load_content()
+        elif key == ord("]"):
+            self.detail_step_index = min(max(0, len(self.detail_steps) - 1), self.detail_step_index + 1)
+            self._select_latest_attempt()
+            self._load_content()
+        elif key == ord("a"):
+            self._open_attempts()
+        elif key == ord("g"):
+            self.content_offset = 0
+        elif key == ord("G"):
+            self.content_offset = len(self.content_lines)
+        elif key == ord("r"):
+            self.refresh()
+            self.message = "ログを更新しました。"
+        return False
+
+    def _handle_artifact_input(self, key: int) -> bool:
+        if key == 27:
+            self.view = "detail"
+        elif key in (ord("q"), ord("Q")):
+            self.view = "dashboard"
+        elif key in (curses.KEY_UP, ord("k")):
+            self.content_offset = max(0, self.content_offset - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.content_offset += 1
+        elif key == ord("g"):
+            self.content_offset = 0
+        elif key == ord("G"):
+            self.content_offset = len(self.content_lines)
+        elif key == ord("r"):
+            self._load_content()
+            self.message = f"{artifact_label(self.artifact_kind)}を更新しました。"
+        return False
+
+    def _handle_job_input(self, key: int) -> bool:
         if key in (27, ord("q"), ord("Q")):
             self.view = "dashboard"
         elif key == ord("r"):
             self.refresh()
-        elif key == ord("l"):
-            self.view = "logs"
+            self.message = "job詳細を更新しました。"
         return False
 
     def _apply_command(self, raw: str) -> bool:
@@ -464,12 +757,23 @@ class TuiApp:
             self.refresh()
             self.message = "更新しました。"
         elif command.name == "detail":
-            self.view = "detail"
+            self._open_selected_item()
+        elif command.name == "attempts":
+            self._open_selected_item()
+            if self.detail is not None:
+                self._open_attempts()
         elif command.name == "logs":
-            self.view = "logs"
+            self._open_selected_item()
+            if self.detail is not None:
+                self._open_logs()
+        elif command.name in {"summary", "trace", "monitor"}:
+            self._open_selected_item()
+            if self.detail is not None:
+                self._open_artifact(command.name)
         elif command.name == "help":
             self.message = COMMAND_HELP
-        self.view = "dashboard" if command.name not in {"detail", "logs"} else self.view
+        if command.name not in {"detail", "attempts", "logs", "summary", "trace", "monitor"}:
+            self.view = "dashboard"
         return False
 
     @property
@@ -494,6 +798,123 @@ class TuiApp:
             self.list_offset = self.selected_index
         elif self.selected_index >= self.list_offset + capacity:
             self.list_offset = self.selected_index - capacity + 1
+
+    @property
+    def detail_steps(self) -> tuple[PipelineStep, ...]:
+        return self.detail.steps if self.detail is not None else ()
+
+    @property
+    def selected_detail_step(self) -> PipelineStep | None:
+        steps = self.detail_steps
+        return steps[self.detail_step_index] if steps and self.detail_step_index < len(steps) else None
+
+    @property
+    def selected_step_attempts(self) -> tuple[PipelineAttempt, ...]:
+        step = self.selected_detail_step
+        if self.detail is None or step is None:
+            return ()
+        return tuple(attempt for attempt in self.detail.attempts if attempt.step_name == step.name)
+
+    @property
+    def selected_attempt(self) -> PipelineAttempt | None:
+        attempts = self.selected_step_attempts
+        return attempts[self.detail_attempt_index] if attempts and self.detail_attempt_index < len(attempts) else None
+
+    @property
+    def selected_log_path(self) -> str | None:
+        attempt = self.selected_attempt
+        step = self.selected_detail_step
+        if attempt is not None:
+            attempt_path = attempt.stdout_path if self.log_source == "stdout" else attempt.stderr_path
+            if attempt_path:
+                return attempt_path
+        if step is None:
+            return None
+        return step.stdout_path if self.log_source == "stdout" else step.stderr_path
+
+    def _open_selected_item(self) -> None:
+        item = self.selected_item
+        if item is None:
+            self.message = "一覧からrunまたはjobを選択してください。"
+            return
+        if item.run is None:
+            self.detail = None
+            self.view = "job"
+            return
+        detail = self.reader.run_detail(item.run.run_id)
+        if detail is None:
+            self.detail = None
+            self.message = f"run詳細を読み込めません: {item.run.run_id}"
+            self.view = "detail"
+            return
+        self.detail = detail
+        self.detail_step_index = self._initial_step_index(detail)
+        self._select_latest_attempt()
+        self.view = "detail"
+
+    def _open_attempts(self) -> None:
+        if self.detail is None:
+            self._open_selected_item()
+        if self.detail is not None:
+            self._select_latest_attempt()
+            self.view = "attempts"
+
+    def _open_logs(self) -> None:
+        if self.detail is None:
+            self._open_selected_item()
+        if self.detail is not None:
+            self.view = "logs"
+            self.content_offset = 0
+            self._load_content()
+
+    def _open_artifact(self, kind: str) -> None:
+        if self.detail is None:
+            self._open_selected_item()
+        if self.detail is None:
+            return
+        self.artifact_kind = kind
+        self.view = "artifact"
+        self.content_offset = 0
+        self._load_content()
+
+    def _load_content(self) -> None:
+        if self.view == "logs":
+            path = Path(self.selected_log_path) if self.selected_log_path else None
+            self.content_lines = tail_file_lines(path, limit=MAX_CONTENT_LINES)
+            return
+        self.artifact_path = find_artifact_path(self.detail, self.artifact_kind)
+        self.content_lines = read_artifact_lines(self.artifact_path)
+
+    def _initial_step_index(self, detail: PipelineRunDetail) -> int:
+        if detail.current_step:
+            for index, step in enumerate(detail.steps):
+                if step.name == detail.current_step:
+                    return index
+        for index, step in enumerate(detail.steps):
+            if step.status in ATTENTION_STATUSES or step.status == "running":
+                return index
+        return 0
+
+    def _select_latest_attempt(self) -> None:
+        attempts = self.selected_step_attempts
+        self.detail_attempt_index = max(0, len(attempts) - 1)
+
+    def _clamp_detail_selection(self) -> None:
+        self.detail_step_index = min(self.detail_step_index, max(0, len(self.detail_steps) - 1))
+        self.detail_attempt_index = min(self.detail_attempt_index, max(0, len(self.selected_step_attempts) - 1))
+
+    def _menu_visible_count(self) -> int:
+        return max(0, self._screen_height - 2) if hasattr(self, "_screen_height") else len(MENU_ITEMS)
+
+    def _ensure_menu_visible(self, capacity: int) -> None:
+        if capacity <= 0:
+            self.menu_offset = 0
+            return
+        self.menu_offset = min(self.menu_offset, max(0, len(MENU_ITEMS) - capacity))
+        if self.menu_index < self.menu_offset:
+            self.menu_offset = self.menu_index
+        elif self.menu_index >= self.menu_offset + capacity:
+            self.menu_offset = self.menu_index - capacity + 1
 
     def _item_line(self, item: PipelineItem) -> str:
         identifier = item.item_id[-20:]
@@ -581,6 +1002,81 @@ def tail_lines(path: Path, limit: int) -> list[str]:
         return [truncate_log_line(line) for line in lines] or ["(空)"]
     except OSError as exc:
         return [f"(読み込み失敗: {exc})"]
+
+
+def tail_file_lines(path: Path | None, limit: int) -> list[str]:
+    """ログビューア向けに、ファイル末尾を bounded read して行列へ変換する。"""
+
+    if limit <= 0:
+        return []
+    if path is None:
+        return ["(ログはありません)"]
+    try:
+        if not path.is_file():
+            return ["(ファイルがありません)"]
+        with path.open("rb") as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            offset = max(0, size - MAX_LOG_TAIL_BYTES)
+            stream.seek(offset)
+            data = stream.read(size - offset)
+        lines = data.decode("utf-8", errors="replace").splitlines()[-limit:]
+        return [truncate_log_line(line) for line in lines] or ["(空)"]
+    except OSError as exc:
+        return [f"(読み込み失敗: {exc})"]
+
+
+def read_artifact_lines(path: Path | None) -> list[str]:
+    """summary/trace/monitorを表示用にbounded readする。"""
+
+    if path is None:
+        return ["(成果物がありません)"]
+    try:
+        if not path.is_file():
+            return [f"(ファイルがありません: {path})"]
+        raw = path.read_bytes()
+        truncated = len(raw) > MAX_ARTIFACT_BYTES
+        text = raw[:MAX_ARTIFACT_BYTES].decode("utf-8", errors="replace")
+        if path.suffix == ".json" and not truncated:
+            try:
+                text = json.dumps(json.loads(text), ensure_ascii=False, indent=2, sort_keys=True)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        lines = [truncate_log_line(line) for line in text.splitlines()]
+        if truncated:
+            lines.append(f"… {MAX_ARTIFACT_BYTES} bytesまで表示。残りは省略しました")
+        return lines[:MAX_CONTENT_LINES] or ["(空)"]
+    except OSError as exc:
+        return [f"(読み込み失敗: {exc})"]
+
+
+def find_artifact_path(detail: PipelineRunDetail | None, kind: str) -> Path | None:
+    if detail is None:
+        return None
+    if kind == "summary":
+        return Path(detail.summary_path) if detail.summary_path else None
+    filename = {"trace": "trace.md", "monitor": "monitor.json"}.get(kind)
+    if filename is None:
+        return None
+    roots: list[Path] = []
+    if detail.summary_path:
+        roots.append(Path(detail.summary_path).parent / "executor_observability" / "takt")
+    if detail.worktree_path:
+        roots.append(Path(detail.worktree_path) / ".takt" / "runs")
+    candidates: list[Path] = []
+    for root in roots:
+        try:
+            candidates.extend(root.glob(f"*/{filename}"))
+        except OSError:
+            continue
+    existing = [path for path in candidates if path.is_file()]
+    if not existing:
+        return None
+    return max(existing, key=lambda path: path.stat().st_mtime)
+
+
+def artifact_label(kind: str) -> str:
+    return {"summary": "summary", "trace": "executor trace", "monitor": "executor monitor"}.get(kind, kind)
 
 
 def truncate_log_line(line: str) -> str:
