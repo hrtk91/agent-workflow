@@ -15,6 +15,7 @@ from agent_workflow.config import (
     render_settings,
 )
 from agent_workflow.merge import MergeBlocked, MergeGateConfig, run_merge_approved, run_merge_gate
+from agent_workflow.tui import run_tui
 from agent_workflow.repair import REPAIR_ACTIONS, REPAIR_CATEGORIES, REPAIR_RISKS, RepairDraftInput, RepairManager
 from agent_workflow.runner import (
     AUTO_REPAIR_SCAN_EXISTING_MAX_AGE_SECONDS,
@@ -93,6 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="runの状態を表示する")
     status.add_argument("--run-id", help="指定したrunだけを表示する")
     status.add_argument("--include-repair", action="store_true", help="内部の修復診断ジョブを最近の状態表示に含める")
+
+    ui = sub.add_parser("ui", aliases=["tui"], help="パイプラインをTUIで監視する")
+    ui.add_argument("--refresh-seconds", type=float, default=1.0, help="画面を更新する間隔（秒）")
+    ui.add_argument("--include-repair", action="store_true", help="repairとrepair-actionのrunを含める")
 
     report = sub.add_parser("report", help="SQLiteからQC結果とrunメトリクスを集計する")
     report.add_argument("--run-id", help="1つのrunの現在のstepと全試行履歴を表示する")
@@ -341,6 +346,13 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(report_data, indent=2, sort_keys=True))
             else:
                 print(render_text_report(report_data))
+            return 0
+        if args.command in {"ui", "tui"}:
+            run_tui(
+                args.state_dir,
+                refresh_seconds=args.refresh_seconds,
+                include_repair=args.include_repair,
+            )
             return 0
         runner = WorkflowRunner(args.state_dir)
         if args.command == "run":
