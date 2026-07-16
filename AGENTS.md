@@ -91,6 +91,7 @@ attempt履歴、summary、trace、monitorなどはデータとして保持して
 - 各画面は不変の`State`を持つ。`DashboardState`、`RunDetailState`、`AttemptsState`、`LogsState`、`ArtifactState`を画面Stateとして使い、ログのsource・末尾追従・offsetは`LogState`として保持する。
 - 各画面の`Behavior`は、画面専用の`EventPublisher`を内包する。EventPublisherはraw keyを意味のあるイベントへ変換し、BehaviorがイベントをState更新・画面遷移・refresh要求へ変換する。
 - attempts・logs・artifactの補助画面も同じ`State + Behavior + EventPublisher`構成にする。補助画面から親画面へ戻るときは、親Stateへ選択位置やログ状態を明示的に引き継ぐ。
+- TUI実装は`src/agent_workflow/tui/`パッケージに分ける。`app.py`は画面ホスト、`rendering.py`はcurses描画、`commands.py`はコマンド入力、`content.py`はログ／artifact読込、`constants.py`は表示定義を担当する。
 - `TuiApp`は端末イベントの受付、Contextの更新、Behavior結果の適用、描画呼び出しに限定する。画面ごとのキー解釈を`TuiApp`へ戻さない。
 - DBやログの読み取りはreaderとContextを経由する。BehaviorがSQLiteへ直接書き込んだり、runnerの状態変更を担当したりしない。
 - ログの末尾追従、stdout／stderr、スクロール位置は`LogState`で管理する。実行中のrefreshで`follow_tail`が有効なら最新位置へ追従し、履歴確認時だけ追従を解除する。
