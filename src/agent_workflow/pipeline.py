@@ -12,7 +12,8 @@ from typing import Any
 from agent_workflow.state import WORKFLOW_STEPS
 
 
-PIPELINE_FILTERS = ("all", "running", "queued", "attention", "succeeded")
+PIPELINE_FILTERS = ("all", "running", "failed", "succeeded")
+LEGACY_PIPELINE_FILTERS = ("queued", "attention")
 ATTENTION_STATUSES = frozenset({"blocked", "failed", "interrupted", "qc_failed", "timed_out"})
 # queueのrunningはworkerのclaim状態であり、live pipelineはruns側に表示する。
 VISIBLE_JOB_STATUSES = frozenset({"queued"}) | ATTENTION_STATUSES
@@ -46,6 +47,8 @@ class PipelineRun:
     created_at: str
     updated_at: str
     steps: tuple[PipelineStep, ...]
+    finished_at: str | None = None
+    elapsed_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -284,7 +287,8 @@ class PipelineSnapshotReader:
         conn.row_factory = sqlite3.Row
         query = """
             select run_id, status, repo_path, workflow, purpose, current_step,
-                   summary_path, qc_repair_attempts, created_at, updated_at
+                   summary_path, qc_repair_attempts, created_at, updated_at,
+                   finished_at, elapsed_seconds
             from runs
         """
         params: list[Any] = []
@@ -324,6 +328,13 @@ class PipelineSnapshotReader:
         for row in selected:
             run_id = str(row["run_id"])
             steps = tuple(steps_by_run.get(run_id) or default_steps())
+            finished_at = str(row["finished_at"]) if row["finished_at"] else None
+            elapsed = row["elapsed_seconds"]
+            if elapsed is None:
+                elapsed = duration_seconds(
+                    str(row["created_at"]),
+                    finished_at or (None if str(row["status"]) == "running" else str(row["updated_at"])),
+                )
             runs.append(
                 PipelineRun(
                     run_id=run_id,
@@ -337,6 +348,8 @@ class PipelineSnapshotReader:
                     created_at=str(row["created_at"]),
                     updated_at=str(row["updated_at"]),
                     steps=steps,
+                    finished_at=finished_at,
+                    elapsed_seconds=float(elapsed) if elapsed is not None else None,
                 )
             )
         return tuple(runs)
@@ -348,30 +361,36 @@ class PipelineSnapshotReader:
         return conn
 
 
-def pipeline_items(snapshot: PipelineSnapshot, filter_name: str = "all") -> tuple[PipelineItem, ...]:
+def pipeline_items(
+    snapshot: PipelineSnapshot,
+    filter_name: str = "all",
+    *,
+    include_jobs: bool = True,
+) -> tuple[PipelineItem, ...]:
     """run開始前のjobと、既存runを重複させず同じ一覧へ並べる。"""
 
-    if filter_name not in PIPELINE_FILTERS:
+    if filter_name not in (*PIPELINE_FILTERS, *LEGACY_PIPELINE_FILTERS):
         raise ValueError(f"unknown pipeline filter: {filter_name}")
     items: list[PipelineItem] = []
     run_ids = {run.run_id for run in snapshot.runs}
-    for job in snapshot.jobs:
-        if job.run_id and job.run_id in run_ids:
-            continue
-        if job.status not in VISIBLE_JOB_STATUSES:
-            continue
-        item = PipelineItem(
-            item_id=job.job_id,
-            kind="job",
-            status=job.status,
-            repo_path=job.repo_path,
-            workflow=job.workflow,
-            purpose=job.purpose,
-            updated_at=job.updated_at,
-            job=job,
-        )
-        if matches_filter(item.status, filter_name):
-            items.append(item)
+    if include_jobs:
+        for job in snapshot.jobs:
+            if job.run_id and job.run_id in run_ids:
+                continue
+            if job.status not in VISIBLE_JOB_STATUSES:
+                continue
+            item = PipelineItem(
+                item_id=job.job_id,
+                kind="job",
+                status=job.status,
+                repo_path=job.repo_path,
+                workflow=job.workflow,
+                purpose=job.purpose,
+                updated_at=job.updated_at,
+                job=job,
+            )
+            if matches_filter(item.status, filter_name):
+                items.append(item)
     for run in snapshot.runs:
         item = PipelineItem(
             item_id=run.run_id,
@@ -392,7 +411,7 @@ def pipeline_items(snapshot: PipelineSnapshot, filter_name: str = "all") -> tupl
 def matches_filter(status: str, filter_name: str) -> bool:
     if filter_name == "all":
         return True
-    if filter_name == "attention":
+    if filter_name in {"failed", "attention"}:
         return status in ATTENTION_STATUSES
     return status == filter_name
 

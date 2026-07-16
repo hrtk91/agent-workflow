@@ -26,8 +26,7 @@ from agent_workflow.pipeline import (
 FILTER_LABELS = {
     "all": "すべて",
     "running": "実行中",
-    "queued": "キュー",
-    "attention": "要確認",
+    "failed": "失敗・要確認",
     "succeeded": "成功",
 }
 STATUS_LABELS = {
@@ -84,19 +83,13 @@ STEP_LABELS = {
 MENU_ITEMS = (
     ("filter all", "すべてのrun"),
     ("filter running", "実行中のrun"),
-    ("filter queued", "キューのジョブ"),
-    ("filter attention", "要確認のrun"),
+    ("filter failed", "失敗・要確認のrun"),
     ("filter succeeded", "成功したrun"),
     ("refresh", "今すぐ更新"),
-    ("detail", "選択中run/jobを開く"),
-    ("attempts", "選択stepの試行履歴"),
-    ("logs", "右ペインでログを確認"),
-    ("summary", "summaryを読む"),
-    ("trace", "executor traceを読む"),
-    ("monitor", "executor monitorを読む"),
+    ("help", "操作ヘルプ"),
     ("quit", "終了"),
 )
-COMMAND_HELP = "filter all|running|queued|attention|succeeded / refresh / detail / attempts / logs / summary / trace / monitor / help / quit"
+COMMAND_HELP = "filter all|running|failed|succeeded / refresh / detail / help / quit"
 MAX_LOG_TAIL_BYTES = 64 * 1024
 MAX_LOG_LINE_CHARS = 4_096
 MAX_ARTIFACT_BYTES = 128 * 1024
@@ -130,7 +123,7 @@ def parse_command(raw: str) -> TuiCommand:
     args = tuple(tokens[1:])
     if name == "filter":
         if len(args) != 1 or args[0] not in PIPELINE_FILTERS:
-            raise ValueError("filterにはall、running、queued、attention、succeededのいずれかを指定してください")
+            raise ValueError("filterにはall、running、failed、succeededのいずれかを指定してください")
     elif name not in {"refresh", "detail", "attempts", "logs", "summary", "trace", "monitor", "help", "quit", "noop"}:
         raise ValueError(f"未知のコマンドです: {tokens[0]}")
     elif args:
@@ -171,7 +164,7 @@ class TuiApp:
         self.artifact_path: Path | None = None
         self.menu_offset = 0
         self._screen_height = 0
-        self.dashboard_panel = "pipeline"
+        self.detail_focus = "steps"
 
     def run(self, screen: curses.window) -> None:
         screen.keypad(True)
@@ -210,10 +203,8 @@ class TuiApp:
             if refreshed is not None:
                 self.detail = refreshed
                 self._clamp_detail_selection()
-                if self.view in {"logs", "artifact"}:
+                if self.view in {"detail", "logs", "artifact"}:
                     self._load_content()
-        if self.dashboard_panel == "logs" and self.view == "dashboard":
-            self._sync_dashboard_drilldown()
 
     def draw(self, screen: curses.window) -> None:
         screen.erase()
@@ -238,151 +229,59 @@ class TuiApp:
     def _draw_dashboard(self, screen: curses.window) -> None:
         height, width = screen.getmaxyx()
         items = self.items
-        selected = self.selected_item
-        title = f"aw pipeline  |  絞り込み: {FILTER_LABELS[self.filter_name]}  |  {self.snapshot.generated_at}"
+        all_items = pipeline_items(self.snapshot, "all", include_jobs=False)
+        title = f"aw runs  |  最終更新: {compact_timestamp(self.snapshot.generated_at)}"
         self._add(screen, 0, 0, title, width - 1, curses.A_BOLD)
         self._add(
             screen,
             1,
             0,
-            f"queue: {len(self.snapshot.jobs)}  runs: {len(self.snapshot.runs)}  表示: {len(items)}"
-            f"  実行中: {sum(item.status == 'running' for item in items)}"
-            f"  要確認: {sum(item.status in ATTENTION_STATUSES for item in items)}",
+            f"run: {len(all_items)}  実行中: {sum(item.status == 'running' for item in all_items)}"
+            f"  失敗・要確認: {sum(item.status in ATTENTION_STATUSES for item in all_items)}"
+            f"  成功: {sum(item.status == 'succeeded' for item in all_items)}",
             width - 1,
         )
         if height < 8:
             self._add(screen, 3, 0, "端末の高さが足りません。ウィンドウを広げてください。", width - 1)
             return
-        list_top = 3
-        list_bottom = max(list_top + 2, height // 2)
-        left_width = max(28, min(42, width // 3))
+        self._draw_filter_tabs(screen, 0, 2, width - 1)
+        list_top = 5
+        list_bottom = max(list_top + 1, height - 3)
         list_capacity = max(0, list_bottom - list_top)
         self._ensure_selection_visible(list_capacity)
-        if width > left_width + 2:
-            try:
-                screen.vline(list_top, left_width, curses.ACS_VLINE, max(1, list_bottom - list_top))
-            except curses.error:
-                pass
-        list_label = "一覧"
+        list_label = "run履歴"
         if len(items) > list_capacity:
             first = self.list_offset + 1
             last = min(len(items), self.list_offset + list_capacity)
             list_label += f" ({first}-{last}/{len(items)})"
-        self._add(screen, 2, 0, list_label, left_width - 1, curses.A_UNDERLINE)
+        self._add(screen, 3, 0, list_label, width - 1, curses.A_UNDERLINE)
+        self._add(screen, 4, 0, "  開始日時              経過       run                  状態       step", width - 1, curses.A_DIM)
         visible_items = items[self.list_offset : self.list_offset + list_capacity]
         for row, item in enumerate(visible_items):
             absolute_index = self.list_offset + row
             attr = curses.A_REVERSE if absolute_index == self.selected_index else 0
-            self._draw_item(screen, list_top + row, item, left_width - 1, attr)
+            self._draw_item(screen, list_top + row, item, width - 1, attr)
         if not items:
-            self._add(screen, list_top, 0, "表示対象はありません", left_width - 1)
+            self._add(screen, list_top, 0, "表示対象のrunはありません", width - 1)
 
-        right_x = left_width + 2
-        right_width = max(1, width - right_x - 1)
-        panel_title = "📝 ログドリルダウン" if self.dashboard_panel == "logs" else "パイプライン"
-        self._add(screen, 2, right_x, panel_title, right_width, curses.A_UNDERLINE)
-        if selected is None:
-            self._add(screen, 4, right_x, "一覧からrunまたはjobを選択してください。", right_width)
-        elif self.dashboard_panel == "logs":
-            self._draw_dashboard_logs(screen, right_x, 4, right_width, list_bottom - 4)
-        elif selected.run is not None:
-            self._draw_pipeline(screen, selected.run, right_x, 4, right_width)
-        else:
-            self._add(screen, 4, right_x, f"job status: {status_label(selected.status)}", right_width)
-            if selected.job and selected.job.error:
-                self._add(screen, 5, right_x, f"error: {selected.job.error}", right_width)
-            elif selected.status == "queued":
-                self._add(screen, 5, right_x, "このjobはまだrun開始前です。", right_width)
-            self._add(screen, 7, right_x, f"job: {selected.item_id}", right_width)
-            self._add(screen, 8, right_x, f"repo: {selected.repo_path}", right_width)
-            self._add(screen, 9, right_x, f"workflow: {selected.workflow}", right_width)
+        self._add(screen, height - 2, 0, self.message, width - 1, curses.A_DIM)
+        self._add(screen, height - 1, 0, "↑↓/jk:選択  Enter/l:詳細  f:filter  m:menu  ::コマンド  q:終了", width - 1)
 
-        message_y = max(list_bottom + 1, height - 2)
-        self._add(screen, message_y, 0, self.message, width - 1, curses.A_DIM)
-        footer = (
-            "↑↓/jk 選択  [/]:step  Tab/o/e:出力  Enter:詳細  Esc:パイプライン  q:終了"
-            if self.dashboard_panel == "logs"
-            else "↑↓/jk 選択  Enter 開く  l ログ  m メニュー  : コマンド  q 終了"
-        )
-        self._add(screen, height - 1, 0, footer, width - 1)
-
-    def _draw_dashboard_logs(self, screen: curses.window, x: int, y: int, width: int, height: int) -> None:
-        item = self.selected_item
-        if item is None or item.run is None or self.detail is None:
-            self._add(screen, y, x, "queue jobにはrunログがありません。Enterでjob詳細を開けます。", width)
-            return
-        step = self.selected_detail_step
-        if step is None:
-            self._add(screen, y, x, "ログ対象のstepがありません。", width)
-            return
-        attempt = self.selected_attempt
-        attempt_label = f"#{attempt.attempt}" if attempt else "current"
-        self._add(
-            screen,
-            y,
-            x,
-            f"{status_emoji(step.status)} {STEP_LABELS.get(step.name, step.name)} / {attempt_label} / {self.log_source}",
-            width,
-            self._status_attr(step.status) | curses.A_BOLD,
-        )
-        self._add(screen, y + 1, x, f"path: {self.selected_log_path or '(なし)'}", width, curses.A_DIM)
-        visible = max(0, height - 2)
-        lines = self.content_lines[-visible:] if visible else []
-        if not lines:
-            self._add(screen, y + 2, x, "(ログはありません。Enterで詳細ログを開けます)", width)
-            return
-        for index, line in enumerate(lines):
-            self._add(screen, y + 2 + index, x, line, width)
-
-    def _draw_pipeline(self, screen: curses.window, run: PipelineRun, x: int, y: int, width: int) -> None:
-        self._add(
-            screen,
-            y,
-            x,
-            f"{run.run_id}  {status_label(run.status)}",
-            width,
-            curses.A_BOLD | self._status_attr(run.status),
-        )
-        self._add(screen, y + 1, x, f"repo: {run.repo_path}", width)
-        self._add(screen, y + 2, x, f"workflow: {run.workflow}  QC修復: {run.qc_repair_attempts}", width)
-        self._draw_pipeline_flow(screen, run, x, y + 4, width)
-        active_step_name = active_step(run)
-        for index, step in enumerate(run.steps):
-            is_active = step.name == active_step_name
-            marker = "▶" if is_active else status_symbol(step.status)
-            detail = f"{marker} {STEP_LABELS.get(step.name, step.name)}: {status_label(step.status)}"
-            if step.attempts:
-                detail += f"  試行={step.attempts}"
-            if step.duration_seconds is not None:
-                detail += f"  {step.duration_seconds:.1f}s"
-            if step.error:
-                detail += f"  {step.error}"
-            attr = self._status_attr(step.status) | (curses.A_BOLD if is_active else 0)
-            self._add(screen, y + 6 + index, x, detail, width, attr)
-
-    def _draw_pipeline_flow(self, screen: curses.window, run: PipelineRun, x: int, y: int, width: int) -> None:
-        active_step_name = active_step(run)
+    def _draw_filter_tabs(self, screen: curses.window, x: int, y: int, width: int) -> None:
         cursor = x
-        right_edge = x + width
-        for index, step in enumerate(run.steps):
-            label = STEP_LABELS.get(step.name, step.name)
-            segment = f" {label} {status_symbol(step.status)} "
-            if cursor < right_edge:
-                is_active = step.name == active_step_name
-                attr = self._status_attr(step.status) | (curses.A_BOLD if is_active else 0)
-                if is_active:
-                    attr |= curses.A_REVERSE
-                self._add(screen, y, cursor, segment, right_edge - cursor, attr)
-            cursor += len(segment)
-            if index < len(run.steps) - 1:
-                connector = " → "
-                self._add(screen, y, cursor, connector, max(0, right_edge - cursor), curses.A_DIM)
-                cursor += len(connector)
+        for filter_name in PIPELINE_FILTERS:
+            label = f" {FILTER_LABELS[filter_name]} "
+            remaining = width - (cursor - x)
+            if remaining <= 0:
+                break
+            attr = curses.A_REVERSE if filter_name == self.filter_name else curses.A_DIM
+            self._add(screen, y, cursor, label, remaining, attr)
+            cursor += len(label) + 1
 
     def _draw_detail(self, screen: curses.window) -> None:
         height, width = screen.getmaxyx()
         detail = self.detail
-        self._add(screen, 0, 0, "📋 runワークスペース", width - 1, curses.A_BOLD)
+        self._add(screen, 0, 0, "📋 run詳細", width - 1, curses.A_BOLD)
         if detail is None:
             self._add(screen, 2, 0, "run詳細を読み込めません。Escで一覧へ戻る。", width - 1)
             return
@@ -399,12 +298,18 @@ class TuiApp:
             width - 1,
             self._status_attr(detail.status) | curses.A_BOLD,
         )
-        self._add(screen, 2, 0, f"📁 {detail.repo_path}  🔧 {detail.workflow}  🎯 {detail.current_step or '-'}", width - 1)
+        self._add(
+            screen,
+            2,
+            0,
+            f"開始: {compact_timestamp(detail.created_at)}  終了: {compact_timestamp(detail.finished_at)}",
+            width - 1,
+        )
         self._add(
             screen,
             3,
             0,
-            f"model={detail.model or '(default)'}  task={detail.task_type}  QC修復={detail.qc_repair_attempts}",
+            f"📁 {detail.repo_path}  🔧 {detail.workflow}  🎯 {detail.current_step or '-'}",
             width - 1,
             curses.A_DIM,
         )
@@ -413,16 +318,52 @@ class TuiApp:
         left_width = max(32, min(54, width // 2))
         right_x = left_width + 3
         right_width = max(1, width - right_x - 1)
-        self._add(screen, section_y, 0, "🧩 Pipeline / step選択", left_width - 1, curses.A_UNDERLINE | curses.A_BOLD)
-        self._add(screen, section_y, right_x, "🔎 選択stepの詳細", right_width, curses.A_UNDERLINE | curses.A_BOLD)
+        left_attr = curses.A_UNDERLINE | curses.A_BOLD
+        right_attr = curses.A_UNDERLINE | curses.A_BOLD
+        if self.detail_focus == "steps":
+            left_attr |= curses.A_REVERSE
+        else:
+            right_attr |= curses.A_REVERSE
+        self._add(screen, section_y, 0, "🧩 Pipeline / step", left_width - 1, left_attr)
+        self._add(screen, section_y, right_x, "📝 選択stepのログ", right_width, right_attr)
         step_capacity = max(1, height - section_y - 3)
         for index, step in enumerate(detail.steps[:step_capacity]):
             row = section_y + 1 + index
             selected = index == self.detail_step_index
             self._draw_step_row(screen, row, 0, step, left_width - 1, selected)
-        self._draw_selected_step(screen, detail, right_x, section_y + 1, right_width, height - section_y - 3)
+        self._draw_detail_logs(screen, right_x, section_y + 1, right_width, height - section_y - 3)
         self._add(screen, height - 2, 0, self.message, width - 1, curses.A_DIM)
-        self._add(screen, height - 1, 0, "↑↓/jk:step  Enter/a:試行  l:ログ  s:summary  t:trace  m:monitor  Esc:一覧", width - 1)
+        footer = (
+            "↑↓/jk:step  l:ログへ  h:一覧へ  Enter/a:試行  Esc:一覧"
+            if self.detail_focus == "steps"
+            else "↑↓/jk:スクロール  h:stepへ  Tab/o/e:stdout/stderr  r:更新  Esc:一覧"
+        )
+        self._add(screen, height - 1, 0, footer, width - 1)
+
+    def _draw_detail_logs(self, screen: curses.window, x: int, y: int, width: int, height: int) -> None:
+        step = self.selected_detail_step
+        if step is None:
+            self._add(screen, y, x, "ログ対象のstepはありません。", width)
+            return
+        attempt = self.selected_attempt
+        attempt_label = f"#{attempt.attempt}" if attempt else "current"
+        self._add(
+            screen,
+            y,
+            x,
+            f"{status_emoji(step.status)} {STEP_LABELS.get(step.name, step.name)} / {attempt_label} / {self.log_source}",
+            width,
+            self._status_attr(step.status) | curses.A_BOLD,
+        )
+        self._add(screen, y + 1, x, f"path: {self.selected_log_path or '(なし)'}", width, curses.A_DIM)
+        visible = max(1, height - 2)
+        max_offset = max(0, len(self.content_lines) - visible)
+        self.content_offset = min(max(0, self.content_offset), max_offset)
+        if not self.content_lines:
+            self._add(screen, y + 2, x, "(ログはありません)", width)
+            return
+        for index, line in enumerate(self.content_lines[self.content_offset : self.content_offset + visible]):
+            self._add(screen, y + 2 + index, x, line, width)
 
     def _draw_attempts(self, screen: curses.window) -> None:
         height, width = screen.getmaxyx()
@@ -537,32 +478,12 @@ class TuiApp:
         marker = "▶" if selected else status_emoji(step.status)
         label = STEP_LABELS.get(step.name, step.name)
         line = f"{marker} {label}  {status_label(step.status)}  {format_duration(step.duration_seconds)}  試行={step.attempts}"
+        if step.error:
+            line += f"  {step.error}"
         attr = self._status_attr(step.status) | (curses.A_REVERSE if selected else 0)
         if selected:
             attr |= curses.A_BOLD
         self._add(screen, row, x, line, width, attr)
-
-    def _draw_selected_step(self, screen: curses.window, detail: PipelineRunDetail, x: int, y: int, width: int, height: int) -> None:
-        step = self.selected_detail_step
-        if step is None:
-            self._add(screen, y, x, "stepがありません。", width)
-            return
-        lines = [
-            (f"{status_emoji(step.status)} {step.name}  {status_label(step.status)}", self._status_attr(step.status) | curses.A_BOLD),
-            (f"開始: {step.started_at or '-'}", 0),
-            (f"終了: {step.finished_at or '(実行中)'}", 0),
-            (f"経過: {format_duration(step.duration_seconds)}  試行: {step.attempts}", 0),
-        ]
-        if step.exit_code is not None:
-            lines.append((f"exit: {step.exit_code}", self._status_attr(step.status)))
-        if step.timed_out:
-            lines.append(("⏱️ timed out", self._status_attr("timed_out")))
-        if step.error:
-            lines.append((f"❌ {step.error}", self._status_attr("failed")))
-        lines.append((f"試行履歴: {len(self.selected_step_attempts)}件  Enter/aで開く", curses.A_DIM))
-        lines.append((f"stdout: {'あり' if step.stdout_path else 'なし'}  stderr: {'あり' if step.stderr_path else 'なし'}", curses.A_DIM))
-        for index, (line, attr) in enumerate(lines[: max(0, height)]):
-            self._add(screen, y + index, x, line, width, attr)
 
     def _draw_attempt_detail(self, screen: curses.window, attempt: PipelineAttempt, x: int, y: int, width: int, height: int) -> None:
         lines = [
@@ -610,38 +531,12 @@ class TuiApp:
             return True
         if key in (curses.KEY_UP, ord("k")):
             self.selected_index = max(0, self.selected_index - 1)
-            if self.dashboard_panel == "logs":
-                self._sync_dashboard_drilldown()
         elif key in (curses.KEY_DOWN, ord("j")):
             self.selected_index = min(max(0, len(self.items) - 1), self.selected_index + 1)
-            if self.dashboard_panel == "logs":
-                self._sync_dashboard_drilldown()
-        elif key in (10, 13, ord("d")):
+        elif key in (10, 13, ord("d"), ord("l")):
             self._open_selected_item()
-        elif key == ord("l"):
-            if self.dashboard_panel == "logs":
-                self.dashboard_panel = "pipeline"
-                self.message = "パイプライン表示に戻りました。"
-            else:
-                self._open_dashboard_logs()
-        elif key == 27 and self.dashboard_panel == "logs":
-            self.dashboard_panel = "pipeline"
-        elif key == ord("[") and self.dashboard_panel == "logs":
-            self.detail_step_index = max(0, self.detail_step_index - 1)
-            self._select_latest_attempt()
-            self._load_content()
-        elif key == ord("]") and self.dashboard_panel == "logs":
-            self.detail_step_index = min(max(0, len(self.detail_steps) - 1), self.detail_step_index + 1)
-            self._select_latest_attempt()
-            self._load_content()
-        elif key in (9, ord("o")) and self.dashboard_panel == "logs":
-            self.log_source = "stderr" if self.log_source == "stdout" else "stdout"
-            self._load_content()
-        elif key == ord("e") and self.dashboard_panel == "logs":
-            self.log_source = "stderr"
-            self._load_content()
-        elif key == ord("a") and self.dashboard_panel == "logs":
-            self._open_attempts()
+        elif key == ord("f"):
+            self._cycle_filter()
         elif key == ord("m"):
             self.view = "menu"
             self.menu_index = 0
@@ -653,6 +548,13 @@ class TuiApp:
             self.refresh()
             self.message = "更新しました。"
         return False
+
+    def _cycle_filter(self) -> None:
+        index = PIPELINE_FILTERS.index(self.filter_name)
+        self.filter_name = PIPELINE_FILTERS[(index + 1) % len(PIPELINE_FILTERS)]
+        self.selected_index = 0
+        self.list_offset = 0
+        self.message = f"絞り込みを変更しました: {FILTER_LABELS[self.filter_name]}"
 
     def _handle_menu_input(self, key: int) -> bool:
         if key in (27, ord("m")):
@@ -702,22 +604,42 @@ class TuiApp:
     def _handle_detail_input(self, key: int) -> bool:
         if key in (27, ord("q"), ord("Q")):
             self.view = "dashboard"
-        elif key in (curses.KEY_UP, ord("k")):
+        elif key == ord("h"):
+            if self.detail_focus == "logs":
+                self.detail_focus = "steps"
+            else:
+                self.view = "dashboard"
+        elif key == ord("l"):
+            if self.detail_focus == "steps":
+                self.detail_focus = "logs"
+        elif self.detail_focus == "steps" and key in (curses.KEY_UP, ord("k")):
             self.detail_step_index = max(0, self.detail_step_index - 1)
             self._select_latest_attempt()
-        elif key in (curses.KEY_DOWN, ord("j")):
+            self.content_offset = 0
+            self._load_content()
+        elif self.detail_focus == "steps" and key in (curses.KEY_DOWN, ord("j")):
             self.detail_step_index = min(max(0, len(self.detail_steps) - 1), self.detail_step_index + 1)
             self._select_latest_attempt()
-        elif key in (10, 13, ord("a")):
+            self.content_offset = 0
+            self._load_content()
+        elif self.detail_focus == "steps" and key in (10, 13, ord("a")):
             self._open_attempts()
-        elif key == ord("l"):
-            self._open_logs()
-        elif key == ord("s"):
-            self._open_artifact("summary")
-        elif key == ord("t"):
-            self._open_artifact("trace")
-        elif key == ord("m"):
-            self._open_artifact("monitor")
+        elif self.detail_focus == "logs" and key in (curses.KEY_UP, ord("k")):
+            self.content_offset = max(0, self.content_offset - 1)
+        elif self.detail_focus == "logs" and key in (curses.KEY_DOWN, ord("j")):
+            self.content_offset += 1
+        elif self.detail_focus == "logs" and key in (9, ord("o")):
+            self.log_source = "stderr" if self.log_source == "stdout" else "stdout"
+            self.content_offset = 0
+            self._load_content()
+        elif self.detail_focus == "logs" and key == ord("e"):
+            self.log_source = "stderr"
+            self.content_offset = 0
+            self._load_content()
+        elif self.detail_focus == "logs" and key == ord("g"):
+            self.content_offset = 0
+        elif self.detail_focus == "logs" and key == ord("G"):
+            self.content_offset = len(self.content_lines)
         elif key == ord("r"):
             self.refresh()
             self.message = "run詳細を更新しました。"
@@ -826,7 +748,9 @@ class TuiApp:
             if self.detail is not None:
                 self._open_attempts()
         elif command.name == "logs":
-            self._open_dashboard_logs()
+            self._open_selected_item()
+            if self.detail is not None:
+                self.detail_focus = "logs"
         elif command.name in {"summary", "trace", "monitor"}:
             self._open_selected_item()
             if self.detail is not None:
@@ -839,7 +763,7 @@ class TuiApp:
 
     @property
     def items(self) -> tuple[PipelineItem, ...]:
-        return pipeline_items(self.snapshot, self.filter_name)
+        return pipeline_items(self.snapshot, self.filter_name, include_jobs=False)
 
     @property
     def selected_item(self) -> PipelineItem | None:
@@ -911,28 +835,9 @@ class TuiApp:
         self.detail = detail
         self.detail_step_index = self._initial_step_index(detail)
         self._select_latest_attempt()
-        self.view = "detail"
-
-    def _open_dashboard_logs(self) -> None:
-        self.dashboard_panel = "logs"
+        self.detail_focus = "steps"
         self.content_offset = 0
-        self._sync_dashboard_drilldown()
-
-    def _sync_dashboard_drilldown(self) -> None:
-        item = self.selected_item
-        if item is None or item.run is None:
-            self.detail = None
-            self.content_lines = []
-            self.artifact_path = None
-            return
-        if self.detail is None or self.detail.run_id != item.run.run_id:
-            detail = self.reader.run_detail(item.run.run_id)
-            self.detail = detail
-            if detail is not None:
-                self.detail_step_index = self._initial_step_index(detail)
-                self._select_latest_attempt()
-            self.content_offset = 0
-        self._clamp_detail_selection()
+        self.view = "detail"
         self._load_content()
 
     def _open_attempts(self) -> None:
@@ -961,7 +866,7 @@ class TuiApp:
         self._load_content()
 
     def _load_content(self) -> None:
-        if self.view == "logs" or (self.view == "dashboard" and self.dashboard_panel == "logs"):
+        if self.view in {"detail", "logs"}:
             path = Path(self.selected_log_path) if self.selected_log_path else None
             self.content_lines = tail_file_lines(path, limit=MAX_CONTENT_LINES)
             return
@@ -1001,11 +906,15 @@ class TuiApp:
 
     def _item_line(self, item: PipelineItem) -> str:
         identifier = item.item_id[-20:]
-        kind = "job" if item.kind == "job" else "run"
-        current = ""
-        if item.run and item.run.current_step:
-            current = f" / {STEP_LABELS.get(item.run.current_step, item.run.current_step)}"
-        return f"{status_symbol(item.status)} {kind} {identifier} {status_label(item.status)}{current}"
+        if item.run is None:
+            return f"{status_symbol(item.status)} {compact_timestamp(item.updated_at)}  {identifier}  {status_label(item.status)}"
+        step = current_step(item.run)
+        step_label = STEP_LABELS.get(step.name, step.name) if step is not None else "-"
+        return (
+            f"{status_symbol(item.status)} {compact_timestamp(item.run.created_at)}"
+            f"  {format_duration(item.run.elapsed_seconds):>8}  {identifier:<20}"
+            f"  {status_label(item.status):<8}  {step_label}"
+        )
 
     def _draw_item(self, screen: curses.window, y: int, item: PipelineItem, width: int, attr: int) -> None:
         line = self._item_line(item)
@@ -1060,13 +969,6 @@ def current_step(run: PipelineRun) -> PipelineStep | None:
         (step for step in run.steps if step.status != "succeeded"),
         next((step for step in reversed(run.steps) if step.stdout_path or step.stderr_path), None),
     )
-
-
-def active_step(run: PipelineRun) -> str | None:
-    for step in run.steps:
-        if step.status in ATTENTION_STATUSES or step.status == "running":
-            return step.name
-    return None
 
 
 def tail_lines(path: Path, limit: int) -> list[str]:
@@ -1178,6 +1080,12 @@ def status_emoji(status: str) -> str:
 
 def status_symbol(status: str) -> str:
     return STATUS_SYMBOLS.get(status, "?")
+
+
+def compact_timestamp(value: str | None) -> str:
+    if not value:
+        return "-"
+    return value.replace("T", " ", 1)[:19]
 
 
 def format_duration(value: float | None) -> str:

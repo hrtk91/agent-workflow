@@ -54,6 +54,8 @@ class PipelineSnapshotTest(unittest.TestCase):
         run = snapshot.runs[0]
         self.assertEqual("run_executor", run.current_step)
         self.assertEqual("running", run.steps[2].status)
+        self.assertEqual("2026-07-15T00:00:00+00:00", run.created_at)
+        self.assertIsNotNone(run.elapsed_seconds)
         self.assertGreaterEqual(run.steps[2].duration_seconds or 0, 1.0)
         self.assertEqual("run-1", pipeline_items(snapshot, "running")[0].item_id)
         self.assertEqual(job_id, pipeline_items(snapshot, "queued")[0].item_id)
@@ -122,7 +124,7 @@ class PipelineSnapshotTest(unittest.TestCase):
         self.assertEqual(str(stdout), detail.steps[2].stdout_path)
         self.assertEqual(str(self.root / "logs"), detail.logs_dir)
 
-    def test_tui_workspace_opens_job_step_attempt_logs_and_artifacts(self) -> None:
+    def test_tui_run_detail_uses_step_and_log_focuses(self) -> None:
         job_id = self.runner.enqueue(
             RunnerConfig(
                 state_dir=self.state_dir,
@@ -176,25 +178,25 @@ class PipelineSnapshotTest(unittest.TestCase):
         self.assertIn("trace line", app.content_lines)
 
         app.view = "dashboard"
-        app.dashboard_panel = "pipeline"
+        app.detail = None
         app.selected_index = next(index for index, item in enumerate(app.items) if item.item_id == "run-workspace")
-        app._open_dashboard_logs()
-        self.assertEqual("dashboard", app.view)
-        self.assertEqual("logs", app.dashboard_panel)
+        app._handle_dashboard_input(ord("l"))
+        self.assertEqual("detail", app.view)
+        self.assertEqual("steps", app.detail_focus)
         self.assertIn("selected log line", app.content_lines)
-        app._handle_dashboard_input(ord("l"))
-        self.assertEqual("pipeline", app.dashboard_panel)
-        app._handle_dashboard_input(ord("l"))
-        self.assertEqual("logs", app.dashboard_panel)
-        app._open_selected_item()
+        self.assertNotIn(job_id, [item.item_id for item in app.items])
+        app._handle_detail_input(ord("l"))
+        self.assertEqual("logs", app.detail_focus)
+        app._handle_detail_input(ord("j"))
+        self.assertEqual(1, app.content_offset)
+        app._handle_detail_input(ord("h"))
+        self.assertEqual("steps", app.detail_focus)
+        app._handle_detail_input(ord("h"))
+        self.assertEqual("dashboard", app.view)
+        app._handle_dashboard_input(10)
+        self.assertEqual("detail", app.view)
         app._open_artifact("summary")
         self.assertIn("summary line", app.content_lines)
-
-        app.selected_index = next(index for index, item in enumerate(app.items) if item.item_id == job_id)
-        app._sync_dashboard_drilldown()
-        self.assertIsNone(app.detail)
-        app._open_selected_item()
-        self.assertEqual("job", app.view)
 
     def test_reader_hides_repair_runs_unless_requested(self) -> None:
         self.runner.enqueue(
@@ -271,7 +273,9 @@ class PipelineSnapshotTest(unittest.TestCase):
         )
 
         self.assertEqual(["failed-job", "run-1"], [item.item_id for item in pipeline_items(snapshot)])
+        self.assertEqual(["failed-job"], [item.item_id for item in pipeline_items(snapshot, "failed")])
         self.assertEqual(["failed-job"], [item.item_id for item in pipeline_items(snapshot, "attention")])
+        self.assertEqual(["run-1"], [item.item_id for item in pipeline_items(snapshot, "all", include_jobs=False)])
         self.assertEqual(["run-1"], [item.item_id for item in pipeline_items(snapshot, "running")])
 
     def test_reader_applies_limit_after_hiding_repair_rows(self) -> None:
@@ -362,6 +366,29 @@ class PipelineSnapshotTest(unittest.TestCase):
         app._ensure_selection_visible(3)
         self.assertEqual(2, app.list_offset)
 
+    def test_tui_dashboard_cycles_core_filters_without_queue_jobs(self) -> None:
+        job_id = self.runner.enqueue(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.root / "repo",
+                task_text="queued task",
+                verify_command="true",
+            )
+        )
+        self._insert_run("run-filter", purpose="workflow")
+        app = TuiApp(PipelineSnapshotReader(self.state_dir / "jobs.sqlite"), refresh_seconds=1.0, include_repair=False)
+        app.snapshot = app.reader.snapshot()
+
+        self.assertEqual("all", app.filter_name)
+        self.assertNotIn(job_id, [item.item_id for item in app.items])
+        app._handle_dashboard_input(ord("f"))
+        self.assertEqual("running", app.filter_name)
+        app._handle_dashboard_input(ord("f"))
+        self.assertEqual("failed", app.filter_name)
+        self.assertEqual((), app.items)
+        app._handle_dashboard_input(ord("f"))
+        self.assertEqual("succeeded", app.filter_name)
+
     def _insert_run(self, run_id: str, *, purpose: str) -> None:
         now = "2026-07-15T00:00:00+00:00"
         with sqlite3.connect(self.state_dir / "jobs.sqlite") as conn:
@@ -410,7 +437,7 @@ class TuiCommandTest(unittest.TestCase):
 
     def test_parse_command_supports_menu_commands_and_aliases(self) -> None:
         self.assertEqual(TuiCommand("filter", ("running",)), parse_command(":filter running"))
-        self.assertEqual(TuiCommand("filter", ("attention",)), parse_command("f attention"))
+        self.assertEqual(TuiCommand("filter", ("failed",)), parse_command("f failed"))
         self.assertEqual(TuiCommand("detail"), parse_command("d"))
         self.assertEqual(TuiCommand("attempts"), parse_command("a"))
         self.assertEqual(TuiCommand("quit"), parse_command("q"))
