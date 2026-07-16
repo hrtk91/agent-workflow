@@ -13,14 +13,6 @@ from agent_workflow.pipeline import (
     PipelineStep,
     pipeline_items,
 )
-from agent_workflow.tui_components import (
-    ArtifactState,
-    AttemptsState,
-    DashboardState,
-    LogsState,
-    RunDetailState,
-)
-
 from .constants import FILTER_LABELS, MENU_ITEMS, STATUS_COLOR_PAIRS, STEP_LABELS
 from .content import (
     artifact_label,
@@ -52,13 +44,7 @@ class TuiRenderer:
             "logs": self._draw_logs,
             "artifact": self._draw_artifact,
         }
-        base_view = {
-            DashboardState: "dashboard",
-            RunDetailState: "detail",
-            AttemptsState: "attempts",
-            LogsState: "logs",
-            ArtifactState: "artifact",
-        }[type(app._screen_state)]
+        base_view = app.screen_controller.view
         base_drawer = screen_drawers[base_view]
         if app.view in {"menu", "command", "job"}:
             base_drawer = screen_drawers["detail"] if app.detail is not None else screen_drawers["dashboard"]
@@ -210,14 +196,11 @@ class TuiRenderer:
         self._add(screen, y + 1, x, f"path: {app.selected_log_path or '(なし)'}", width, curses.A_DIM)
         visible = max(1, height - 2)
         max_offset = max(0, len(app.content_lines) - visible)
-        if app.log_follow:
-            app.content_offset = max_offset
-        else:
-            app.content_offset = min(max(0, app.content_offset), max_offset)
+        display_offset = max_offset if app.log_follow else min(max(0, app.content_offset), max_offset)
         if not app.content_lines:
             self._add(screen, y + 2, x, "(ログはありません)", width)
             return
-        for index, line in enumerate(app.content_lines[app.content_offset : app.content_offset + visible]):
+        for index, line in enumerate(app.content_lines[display_offset : display_offset + visible]):
             self._add(screen, y + 2 + index, x, line, width)
 
     def _draw_attempts(self, screen: curses.window) -> None:
@@ -281,11 +264,8 @@ class TuiRenderer:
         self._add(screen, 2, 0, f"path: {path or '(なし)'}", width - 1, curses.A_DIM)
         visible = max(1, height - 5)
         max_offset = max(0, len(app.content_lines) - visible)
-        if app.log_follow:
-            app.content_offset = max_offset
-        else:
-            app.content_offset = min(max(0, app.content_offset), max_offset)
-        for index, line in enumerate(app.content_lines[app.content_offset : app.content_offset + visible]):
+        display_offset = max_offset if app.log_follow else min(max(0, app.content_offset), max_offset)
+        for index, line in enumerate(app.content_lines[display_offset : display_offset + visible]):
             self._add(screen, 3 + index, 0, line, width - 1)
         self._add(screen, height - 2, 0, app.message, width - 1, curses.A_DIM)
         self._add(screen, height - 1, 0, "↑↓/jk:スクロール  g/G:先頭/末尾  Tab/o/e:stdout/stderr  [/]:step  a:試行  r:更新  Esc", width - 1)
@@ -301,8 +281,8 @@ class TuiRenderer:
         self._add(screen, 1, 0, f"{detail.run_id} / {app.artifact_path or '(なし)'}", width - 1, curses.A_UNDERLINE)
         visible = max(1, height - 4)
         max_offset = max(0, len(app.content_lines) - visible)
-        app.content_offset = min(max(0, app.content_offset), max_offset)
-        for index, line in enumerate(app.content_lines[app.content_offset : app.content_offset + visible]):
+        display_offset = min(max(0, app.content_offset), max_offset)
+        for index, line in enumerate(app.content_lines[display_offset : display_offset + visible]):
             self._add(screen, 3 + index, 0, line, width - 1)
         self._add(screen, height - 2, 0, app.message, width - 1, curses.A_DIM)
         self._add(screen, height - 1, 0, "↑↓/jk:スクロール  g/G:先頭/末尾  r:更新  Esc:runへ", width - 1)

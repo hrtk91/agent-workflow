@@ -1,6 +1,7 @@
 """agent-workflowの標準ライブラリTUI。"""
 
-from .app import TuiApp, run_tui
+from typing import TYPE_CHECKING
+
 from .commands import TuiCommand, parse_command
 from .constants import (
     COMMAND_HELP,
@@ -30,6 +31,19 @@ from .content import (
     tail_lines,
     truncate_log_line,
 )
+
+if TYPE_CHECKING:
+    from .app import TuiApp
+
+
+def __getattr__(name: str):
+    """appを遅延importし、state単独import時の循環を避ける。"""
+
+    if name in {"TuiApp", "run_tui"}:
+        from .app import TuiApp, run_tui
+
+        return TuiApp if name == "TuiApp" else run_tui
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "COMMAND_HELP",

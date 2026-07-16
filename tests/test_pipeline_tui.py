@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock
 
 import sys
 
@@ -20,7 +21,6 @@ from agent_workflow.pipeline import (
     pipeline_items,
 )
 from agent_workflow.runner import RunnerConfig, WorkflowRunner
-from agent_workflow.tui import MAX_LOG_LINE_CHARS, TuiApp, TuiCommand, parse_command, status_emoji, tail_lines
 from agent_workflow.tui_components import (
     ArtifactBehavior,
     ArtifactState,
@@ -29,12 +29,17 @@ from agent_workflow.tui_components import (
     DashboardBehavior,
     DashboardState,
     DetailFocus,
+    LogSource,
+    LogState,
     LogsBehavior,
     LogsState,
     RunDetailBehavior,
     RunDetailState,
+    ScreenControllers,
     TuiContext,
 )
+from agent_workflow.tui import MAX_LOG_LINE_CHARS, TuiApp, TuiCommand, parse_command, status_emoji, tail_lines
+from agent_workflow.tui.state import move_selection as move_selection_state, scroll_log as scroll_log_state
 
 
 class PipelineSnapshotTest(unittest.TestCase):
@@ -295,6 +300,148 @@ class PipelineSnapshotTest(unittest.TestCase):
         self.assertFalse(scrolled.state.log.follow_tail)
         tailed = detail_behavior.handle(scrolled.state, ord("G"))
         self.assertTrue(tailed.state.log.follow_tail)
+
+    def test_screen_controllers_resolve_state_and_enforce_registered_type(self) -> None:
+        self._insert_run("run-controller", purpose="workflow")
+        context = TuiContext(
+            reader=PipelineSnapshotReader(self.state_dir / "jobs.sqlite"),
+            refresh_seconds=1.0,
+            include_repair=False,
+            filter_labels={"all": "すべて", "running": "実行中", "failed": "失敗", "succeeded": "成功"},
+        )
+        context.snapshot = context.reader.snapshot()
+        controllers = ScreenControllers(context)
+        detail = context.reader.run_detail("run-controller")
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        run_detail = RunDetailState(detail=detail)
+        attempts = controllers.attempts.behavior.open(run_detail)
+        logs = controllers.logs.behavior.open(run_detail)
+        artifact = controllers.artifact.behavior.open(run_detail, "summary")
+
+        self.assertIs(controllers.dashboard, controllers.resolve(DashboardState()))
+        self.assertIs(controllers.detail, controllers.resolve(run_detail))
+        self.assertIs(controllers.attempts, controllers.resolve(attempts))
+        self.assertIs(controllers.logs, controllers.resolve(logs))
+        self.assertIs(controllers.artifact, controllers.resolve(artifact))
+        with self.assertRaises(TypeError):
+            controllers.dashboard.handle(run_detail, ord("j"))
+
+    def test_view_setter_keeps_current_state_when_screen_cannot_open(self) -> None:
+        app = TuiApp(
+            PipelineSnapshotReader(self.root / "missing.sqlite"),
+            refresh_seconds=1.0,
+            include_repair=False,
+        )
+
+        app.view = "logs"
+        self.assertEqual("dashboard", app.view)
+        self.assertIsInstance(app._screen_state, DashboardState)
+        app.view = "detail"
+        self.assertEqual("dashboard", app.view)
+        app.view = "test-overlay"
+        self.assertEqual("test-overlay", app.view)
+        app.view = "dashboard"
+        self.assertEqual("dashboard", app.view)
+
+    def test_legacy_screen_wrappers_keep_state_specific_contract(self) -> None:
+        app = TuiApp(
+            PipelineSnapshotReader(self.root / "missing.sqlite"),
+            refresh_seconds=1.0,
+            include_repair=False,
+        )
+
+        self.assertFalse(app._handle_detail_input(ord("q")))
+        self.assertFalse(app._handle_attempts_input(ord("q")))
+        self.assertFalse(app._handle_logs_input(ord("q")))
+        self.assertFalse(app._handle_artifact_input(ord("q")))
+        self.assertEqual("dashboard", app.view)
+
+    def test_renderer_clamps_display_offset_without_mutating_screen_state(self) -> None:
+        self._insert_run("run-renderer", purpose="workflow")
+        detail = PipelineSnapshotReader(self.state_dir / "jobs.sqlite").run_detail("run-renderer")
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        parent = RunDetailState(detail=detail)
+        content_lines = tuple(f"line-{index}" for index in range(20))
+        screen = Mock()
+        screen.getmaxyx.return_value = (20, 100)
+        app = TuiApp(
+            PipelineSnapshotReader(self.state_dir / "jobs.sqlite"),
+            refresh_seconds=1.0,
+            include_repair=False,
+        )
+
+        app._screen_state = replace(
+            parent,
+            log=LogState(follow_tail=False, offset=100),
+            content_lines=content_lines,
+        )
+        app.renderer._draw_detail_logs(screen, 0, 0, 80, 10)
+        self.assertEqual(100, app.content_offset)
+
+        app._screen_state = LogsState(
+            detail=detail,
+            parent=parent,
+            step_index=0,
+            attempt_index=0,
+            log=LogState(follow_tail=False, offset=100),
+            content_lines=content_lines,
+        )
+        app.renderer._draw_logs(screen)
+        self.assertEqual(100, app.content_offset)
+
+        app._screen_state = ArtifactState(
+            detail=detail,
+            parent=parent,
+            kind="summary",
+            offset=100,
+            content_lines=content_lines,
+        )
+        app.renderer._draw_artifact(screen)
+        self.assertEqual(100, app.content_offset)
+
+    def test_state_updates_own_local_validation_and_cursor_rules(self) -> None:
+        dashboard = DashboardState().move_selection(1, item_count=2)
+        self.assertEqual(1, dashboard.selected_index)
+        self.assertEqual(0, dashboard.move_selection(1, item_count=0).selected_index)
+        self.assertIsInstance(move_selection_state(DashboardState(), 1, item_count=2), DashboardState)
+        self.assertEqual("running", DashboardState().change_filter("running").filter_name)
+
+        with self.assertRaises(ValueError):
+            DashboardState(filter_name="unknown")
+        with self.assertRaises(ValueError):
+            LogState(offset=-1)
+
+        log = LogState().scroll(1, content_length=1)
+        self.assertEqual(1, log.offset)
+        self.assertTrue(log.follow_tail)
+        paused = log.scroll(-1, content_length=2)
+        self.assertEqual(0, paused.offset)
+        self.assertFalse(paused.follow_tail)
+        self.assertEqual(LogSource.STDERR, paused.select_source(LogSource.STDERR).source)
+
+        self._insert_run("run-state", purpose="workflow")
+        detail = PipelineSnapshotReader(self.state_dir / "jobs.sqlite").run_detail("run-state")
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        state = RunDetailState(
+            detail=detail,
+            step_index=0,
+            attempt_index=1,
+            content_lines=("one", "two"),
+        )
+        moved = state.move_step(1)
+        self.assertEqual(1, moved.step_index)
+        self.assertEqual(0, moved.attempt_index)
+        self.assertTrue(moved.log.follow_tail)
+        self.assertEqual((), moved.content_lines)
+        self.assertIsInstance(scroll_log_state(state, 1), RunDetailState)
+
+        with self.assertRaises(ValueError):
+            AttemptsState(detail=detail, parent=state, step_index=-1, attempt_index=0)
+        with self.assertRaises(ValueError):
+            ArtifactState(detail=detail, parent=state, kind="summary", offset=-1)
 
     def test_auxiliary_screens_own_state_behavior_and_event_publisher(self) -> None:
         self._insert_run("run-auxiliary", purpose="workflow")

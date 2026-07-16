@@ -17,22 +17,18 @@ from agent_workflow.pipeline import (
     pipeline_items,
 )
 from agent_workflow.tui_components import (
-    ArtifactBehavior,
     ArtifactState,
-    AttemptsBehavior,
     AttemptsState,
     BehaviorResult,
-    DashboardBehavior,
     DashboardState,
     DetailFocus,
     LogSource,
-    LogsBehavior,
     LogsState,
-    RunDetailBehavior,
     RunDetailState,
+    ScreenController,
+    ScreenControllers,
     ScreenState,
     TuiContext,
-    dashboard_state_for,
     detail_state_for,
 )
 
@@ -72,11 +68,13 @@ class TuiApp:
         )
         self._screen_state: ScreenState = DashboardState()
         self._view_override: str | None = None
-        self.dashboard_behavior = DashboardBehavior(self.context)
-        self.detail_behavior = RunDetailBehavior(self.context)
-        self.attempts_behavior = AttemptsBehavior(self.context)
-        self.logs_behavior = LogsBehavior(self.context)
-        self.artifact_behavior = ArtifactBehavior(self.context)
+        self.screen_controllers = ScreenControllers(self.context)
+        # 既存のテスト・拡張向けにBehavior属性は互換維持する。
+        self.dashboard_behavior = self.screen_controllers.dashboard.behavior
+        self.detail_behavior = self.screen_controllers.detail.behavior
+        self.attempts_behavior = self.screen_controllers.attempts.behavior
+        self.logs_behavior = self.screen_controllers.logs.behavior
+        self.artifact_behavior = self.screen_controllers.artifact.behavior
         self.renderer = TuiRenderer(self)
         self.menu_index = 0
         self.command_buffer = ""
@@ -136,46 +134,27 @@ class TuiApp:
         self.context.screen_height = value
 
     @property
+    def screen_controller(self) -> ScreenController:
+        return self.screen_controllers.resolve(self._screen_state)
+
+    @property
     def view(self) -> str:
         if self._view_override is not None:
             return self._view_override
-        return {
-            DashboardState: "dashboard",
-            RunDetailState: "detail",
-            AttemptsState: "attempts",
-            LogsState: "logs",
-            ArtifactState: "artifact",
-        }[type(self._screen_state)]
+        return self.screen_controller.view
 
     @view.setter
     def view(self, value: str) -> None:
-        if value == "dashboard":
-            self._screen_state = dashboard_state_for(self._screen_state)
+        next_state = self.screen_controllers.state_for_view(
+            self._screen_state,
+            value,
+            artifact_kind=self.artifact_kind,
+        )
+        if next_state is not None:
+            self._screen_state = next_state
             self._view_override = None
-            return
-        if value == "detail":
-            self._screen_state = detail_state_for(self._screen_state)
-            self._view_override = None
-            return
-        if value == "attempts":
-            detail_state = detail_state_for(self._screen_state)
-            if detail_state.detail is not None:
-                self._screen_state = self.attempts_behavior.open(detail_state)
-                self._view_override = None
-            return
-        if value == "logs":
-            detail_state = detail_state_for(self._screen_state)
-            if detail_state.detail is not None:
-                self._screen_state = self.logs_behavior.open(detail_state)
-                self._view_override = None
-            return
-        if value == "artifact":
-            detail_state = detail_state_for(self._screen_state)
-            if detail_state.detail is not None:
-                self._screen_state = self.artifact_behavior.open(detail_state, self.artifact_kind)
-                self._view_override = None
-            return
-        self._view_override = value
+        else:
+            self._view_override = value
 
     @property
     def filter_name(self) -> str:
@@ -339,13 +318,8 @@ class TuiApp:
         self.renderer.init_colors()
         self.refresh()
         input_handlers = {
-            "dashboard": self._handle_dashboard_input,
-            "detail": self._handle_detail_input,
             "command": self._handle_command_input,
             "menu": self._handle_menu_input,
-            "attempts": self._handle_attempts_input,
-            "logs": self._handle_logs_input,
-            "artifact": self._handle_artifact_input,
             "job": self._handle_job_input,
         }
         while True:
@@ -355,31 +329,22 @@ class TuiApp:
             key = screen.getch()
             if key == -1:
                 continue
-            handler = input_handlers.get(self.view, self._handle_dashboard_input)
+            handler = input_handlers.get(self.view, self._handle_screen_input)
             if handler(key):
                 return
 
     def refresh(self) -> None:
         self.snapshot = self.reader.snapshot(include_repair=self.include_repair)
         self.last_refresh = time.monotonic()
-        refreshers = {
-            DashboardState: self.dashboard_behavior.refresh,
-            RunDetailState: self.detail_behavior.refresh,
-            AttemptsState: self.attempts_behavior.refresh,
-            LogsState: self.logs_behavior.refresh,
-            ArtifactState: self.artifact_behavior.refresh,
-        }
-        self._screen_state = refreshers[type(self._screen_state)](self._screen_state)
+        self._screen_state = self.screen_controller.refresh(self._screen_state)
         if self.detail is not None and self.view in {"detail", "logs", "artifact"}:
             self._load_content()
 
     def draw(self, screen: curses.window) -> None:
         self.renderer.draw(screen)
 
-    def _handle_dashboard_input(self, key: int) -> bool:
-        if not isinstance(self._screen_state, DashboardState):
-            return False
-        result = self.dashboard_behavior.handle(self._screen_state, key)
+    def _handle_screen_input(self, key: int) -> bool:
+        result = self.screen_controller.handle(self._screen_state, key)
         self._apply_behavior_result(result)
         if result.overlay == "menu":
             self.menu_index = 0
@@ -387,6 +352,13 @@ class TuiApp:
         elif result.overlay == "command":
             self.command_buffer = ""
         return result.quit_requested
+
+    def _handle_dashboard_input(self, key: int) -> bool:
+        """旧呼び出し元向けの互換wrapper。実処理はControllerへ委譲する。"""
+
+        if not isinstance(self._screen_state, DashboardState):
+            return False
+        return self._handle_screen_input(key)
 
     def _cycle_filter(self) -> None:
         result = self.dashboard_behavior.handle(self._screen_state, ord("f"))
@@ -401,11 +373,7 @@ class TuiApp:
             self.message = result.message
         if result.refresh_requested:
             self.refresh()
-        elif isinstance(self._screen_state, (RunDetailState, LogsState, ArtifactState)) and self.view in {
-            "detail",
-            "logs",
-            "artifact",
-        }:
+        elif self.view in {"detail", "logs", "artifact"}:
             self._load_content()
 
     def _handle_menu_input(self, key: int) -> bool:
@@ -443,42 +411,43 @@ class TuiApp:
         return False
 
     def _handle_workspace_input(self, key: int) -> bool:
-        handlers = {
-            "detail": self._handle_detail_input,
-            "attempts": self._handle_attempts_input,
-            "logs": self._handle_logs_input,
-            "artifact": self._handle_artifact_input,
-            "job": self._handle_job_input,
-        }
-        return handlers.get(self.view, self._handle_dashboard_input)(key)
+        """旧呼び出し元向けに、従来のview単位の振り分けを維持する。"""
+
+        match self.view:
+            case "dashboard":
+                return self._handle_dashboard_input(key)
+            case "detail":
+                return self._handle_detail_input(key)
+            case "attempts":
+                return self._handle_attempts_input(key)
+            case "logs":
+                return self._handle_logs_input(key)
+            case "artifact":
+                return self._handle_artifact_input(key)
+            case "job":
+                return self._handle_job_input(key)
+            case _:
+                return self._handle_dashboard_input(key)
 
     def _handle_detail_input(self, key: int) -> bool:
         if not isinstance(self._screen_state, RunDetailState):
             return False
-        result = self.detail_behavior.handle(self._screen_state, key)
-        self._apply_behavior_result(result)
-        return result.quit_requested
+        return self._handle_screen_input(key)
 
     def _handle_attempts_input(self, key: int) -> bool:
         if not isinstance(self._screen_state, AttemptsState):
             return False
-        result = self.attempts_behavior.handle(self._screen_state, key)
-        self._apply_behavior_result(result)
-        return result.quit_requested
+        return self._handle_screen_input(key)
 
     def _handle_logs_input(self, key: int) -> bool:
         if not isinstance(self._screen_state, LogsState):
             return False
-        result = self.logs_behavior.handle(self._screen_state, key)
-        self._apply_behavior_result(result)
-        return result.quit_requested
+        return self._handle_screen_input(key)
 
     def _handle_artifact_input(self, key: int) -> bool:
         if not isinstance(self._screen_state, ArtifactState):
             return False
-        result = self.artifact_behavior.handle(self._screen_state, key)
-        self._apply_behavior_result(result)
-        return result.quit_requested
+        return self._handle_screen_input(key)
 
     def _handle_job_input(self, key: int) -> bool:
         if key in (27, ord("q"), ord("Q")):
@@ -585,46 +554,42 @@ class TuiApp:
         return step.stdout_path if self.log_source == "stdout" else step.stderr_path
 
     def _open_selected_item(self) -> None:
-        if not isinstance(self._screen_state, DashboardState):
+        if self.screen_controller is not self.screen_controllers.dashboard:
             return
-        result = self.dashboard_behavior.handle(self._screen_state, ord("l"))
+        result = self.screen_controllers.dashboard.handle(self._screen_state, ord("l"))
         self._apply_behavior_result(result)
 
     def _open_attempts(self) -> None:
         if self.detail is None:
             self._open_selected_item()
-        if isinstance(self._screen_state, RunDetailState):
-            result = self.detail_behavior.handle(self._screen_state, ord("a"))
-            self._apply_behavior_result(result)
-        elif isinstance(self._screen_state, LogsState):
-            result = self.logs_behavior.handle(self._screen_state, ord("a"))
-            self._apply_behavior_result(result)
+        if self.detail is not None:
+            result = self.screen_controllers.open_attempts(self._screen_state)
+            if result.state is not self._screen_state:
+                self._apply_behavior_result(result)
 
     def _open_logs(self) -> None:
         if self.detail is None:
             self._open_selected_item()
-        if isinstance(self._screen_state, RunDetailState) and self._screen_state.detail is not None:
-            self._screen_state = self.logs_behavior.open(self._screen_state)
-            self._load_content()
-        elif isinstance(self._screen_state, AttemptsState):
-            result = self.attempts_behavior.handle(self._screen_state, ord("l"))
-            self._apply_behavior_result(result)
+        if self.detail is not None:
+            result = self.screen_controllers.open_logs(self._screen_state)
+            if result.state is not self._screen_state:
+                self._apply_behavior_result(result)
 
     def _open_artifact(self, kind: str) -> None:
         if self.detail is None:
             self._open_selected_item()
-        detail_state = detail_state_for(self._screen_state)
-        if detail_state.detail is None:
+        artifact_state = self.screen_controllers.open_artifact(self._screen_state, kind)
+        if artifact_state is None:
             return
-        self._screen_state = self.artifact_behavior.open(detail_state, kind)
+        self._screen_state = artifact_state
         self._load_content()
 
     def _load_content(self) -> None:
-        if isinstance(self._screen_state, (RunDetailState, LogsState)):
+        if self.view in {"detail", "logs"}:
             path = Path(self.selected_log_path) if self.selected_log_path else None
             self.content_lines = tail_file_lines(path, limit=MAX_CONTENT_LINES)
             return
-        if not isinstance(self._screen_state, ArtifactState):
+        if self.view != "artifact":
             return
         self.artifact_path = find_artifact_path(self.detail, self.artifact_kind)
         self.content_lines = read_artifact_lines(self.artifact_path)
