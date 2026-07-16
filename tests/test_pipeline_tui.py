@@ -22,9 +22,15 @@ from agent_workflow.pipeline import (
 from agent_workflow.runner import RunnerConfig, WorkflowRunner
 from agent_workflow.tui import MAX_LOG_LINE_CHARS, TuiApp, TuiCommand, parse_command, status_emoji, tail_lines
 from agent_workflow.tui_components import (
+    ArtifactBehavior,
+    ArtifactState,
+    AttemptsBehavior,
+    AttemptsState,
     DashboardBehavior,
     DashboardState,
     DetailFocus,
+    LogsBehavior,
+    LogsState,
     RunDetailBehavior,
     RunDetailState,
     TuiContext,
@@ -199,8 +205,10 @@ class PipelineSnapshotTest(unittest.TestCase):
         self.assertEqual(1, app.selected_attempt.attempt if app.selected_attempt else None)
         app._open_logs()
         self.assertEqual("logs", app.view)
+        self.assertIsInstance(app._screen_state, LogsState)
         self.assertIn("selected log line", app.content_lines)
         app._open_artifact("summary")
+        self.assertIsInstance(app._screen_state, ArtifactState)
         self.assertIn("summary line", app.content_lines)
         app._open_artifact("trace")
         self.assertIn("trace line", app.content_lines)
@@ -287,6 +295,43 @@ class PipelineSnapshotTest(unittest.TestCase):
         self.assertFalse(scrolled.state.log.follow_tail)
         tailed = detail_behavior.handle(scrolled.state, ord("G"))
         self.assertTrue(tailed.state.log.follow_tail)
+
+    def test_auxiliary_screens_own_state_behavior_and_event_publisher(self) -> None:
+        self._insert_run("run-auxiliary", purpose="workflow")
+        context = TuiContext(
+            reader=PipelineSnapshotReader(self.state_dir / "jobs.sqlite"),
+            refresh_seconds=1.0,
+            include_repair=False,
+            filter_labels={"all": "すべて", "running": "実行中", "failed": "失敗", "succeeded": "成功"},
+        )
+        detail = context.reader.run_detail("run-auxiliary")
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        parent = RunDetailState(detail=detail, parent=DashboardState())
+
+        attempts_behavior = AttemptsBehavior(context)
+        attempts = attempts_behavior.open(parent)
+        self.assertIsInstance(attempts, AttemptsState)
+        self.assertIsNotNone(attempts_behavior.events)
+        logs_result = attempts_behavior.handle(attempts, ord("l"))
+        self.assertIsInstance(logs_result.state, LogsState)
+
+        logs_behavior = LogsBehavior(context)
+        assert isinstance(logs_result.state, LogsState)
+        self.assertIsNotNone(logs_behavior.events)
+        detail_result = logs_behavior.handle(logs_result.state, ord("h"))
+        self.assertIsInstance(detail_result.state, RunDetailState)
+
+        artifact_behavior = ArtifactBehavior(context)
+        artifact = artifact_behavior.open(parent, "summary")
+        self.assertIsInstance(artifact, ArtifactState)
+        self.assertIsNotNone(artifact_behavior.events)
+        scrolled = artifact_behavior.handle(replace(artifact, content_lines=("one", "two")), ord("j"))
+        self.assertEqual(1, scrolled.state.offset)
+        detail_from_artifact = artifact_behavior.handle(scrolled.state, ord("h"))
+        self.assertIsInstance(detail_from_artifact.state, RunDetailState)
+        dashboard_result = artifact_behavior.handle(scrolled.state, ord("q"))
+        self.assertIsInstance(dashboard_result.state, DashboardState)
 
     def test_reader_hides_repair_runs_unless_requested(self) -> None:
         self.runner.enqueue(

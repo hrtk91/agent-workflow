@@ -58,7 +58,7 @@ attempt履歴、summary、trace、monitorなどはデータとして保持して
 次の機能は、トップ画面やrun詳細画面の主操作として増やさない。
 
 - メニューやコマンドパレットからの多機能な操作一覧。
-- attempts、summary、trace、monitorの独立画面への遷移。
+- attempts、summary、trace、monitorをトップ画面やrun詳細画面の主操作にしない。必要な補助画面は、主画面の情報設計を壊さない範囲で扱う。
 - トップ画面でのログドリルダウンと、トップ画面内での複数ペイン切り替え。
 - 状態の意味を増やすだけの色・絵文字・装飾。
 
@@ -88,8 +88,9 @@ attempt履歴、summary、trace、monitorなどはデータとして保持して
 画面の操作実装は、Reactのコンポーネント設計とElm/Reduxのイベント更新モデルを組み合わせる。
 
 - `TuiContext`はread model、reader、設定、時計など全画面で共有する依存性を持つ。選択中stepやログのスクロール位置など、画面固有の状態はContextへ入れない。
-- 各画面は不変の`State`を持つ。現在の主導線では`DashboardState`、`RunDetailState`、`LogState`を使う。
+- 各画面は不変の`State`を持つ。`DashboardState`、`RunDetailState`、`AttemptsState`、`LogsState`、`ArtifactState`を画面Stateとして使い、ログのsource・末尾追従・offsetは`LogState`として保持する。
 - 各画面の`Behavior`は、画面専用の`EventPublisher`を内包する。EventPublisherはraw keyを意味のあるイベントへ変換し、BehaviorがイベントをState更新・画面遷移・refresh要求へ変換する。
+- attempts・logs・artifactの補助画面も同じ`State + Behavior + EventPublisher`構成にする。補助画面から親画面へ戻るときは、親Stateへ選択位置やログ状態を明示的に引き継ぐ。
 - `TuiApp`は端末イベントの受付、Contextの更新、Behavior結果の適用、描画呼び出しに限定する。画面ごとのキー解釈を`TuiApp`へ戻さない。
 - DBやログの読み取りはreaderとContextを経由する。BehaviorがSQLiteへ直接書き込んだり、runnerの状態変更を担当したりしない。
 - ログの末尾追従、stdout／stderr、スクロール位置は`LogState`で管理する。実行中のrefreshで`follow_tail`が有効なら最新位置へ追従し、履歴確認時だけ追従を解除する。
