@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -202,8 +202,14 @@ class PipelineSnapshotReader:
         elapsed = run_row["elapsed_seconds"]
         if elapsed is None:
             elapsed = duration_seconds(created_at, finished_at or (None if str(run_row["status"]) == "running" else str(run_row["updated_at"])))
+        logs_dir = Path(summary_path).parent / "logs" if summary_path else None
         steps = tuple(step_from_row(row) for row in step_rows) or tuple(default_steps())
         attempts = tuple(attempt_from_row(row) for row in attempt_rows)
+        if logs_dir is not None:
+            # 実行中はrunnerがコマンド終了までDBへログパスを書けない旧runもあるため、
+            # 固定されたログ配置規約から、存在するファイルだけをread modelへ補う。
+            steps = tuple(resolve_step_log_paths(step, logs_dir) for step in steps)
+            attempts = tuple(resolve_attempt_log_paths(attempt, logs_dir) for attempt in attempts)
         return PipelineRunDetail(
             run_id=str(run_row["run_id"]),
             status=str(run_row["status"]),
@@ -212,7 +218,7 @@ class PipelineSnapshotReader:
             purpose=str(run_row["purpose"]),
             current_step=str(run_row["current_step"]) if run_row["current_step"] else None,
             summary_path=summary_path,
-            logs_dir=str(Path(summary_path).parent / "logs") if summary_path else "",
+            logs_dir=str(logs_dir) if logs_dir is not None else "",
             qc_repair_attempts=int(run_row["qc_repair_attempts"] or 0),
             created_at=created_at,
             updated_at=str(run_row["updated_at"]),
@@ -452,6 +458,34 @@ def step_from_row(row: sqlite3.Row) -> PipelineStep:
         stdout_path=str(row["stdout_path"]) if row["stdout_path"] else None,
         stderr_path=str(row["stderr_path"]) if row["stderr_path"] else None,
     )
+
+
+def resolve_step_log_paths(step: PipelineStep, logs_dir: Path) -> PipelineStep:
+    """実行中stepの未確定ログパスを、既存ファイルから補完する。"""
+
+    stdout_path = resolve_log_path(step.stdout_path, logs_dir, step.name, "stdout")
+    stderr_path = resolve_log_path(step.stderr_path, logs_dir, step.name, "stderr")
+    if stdout_path == step.stdout_path and stderr_path == step.stderr_path:
+        return step
+    return replace(step, stdout_path=stdout_path, stderr_path=stderr_path)
+
+
+def resolve_attempt_log_paths(attempt: PipelineAttempt, logs_dir: Path) -> PipelineAttempt:
+    stdout_path = resolve_log_path(attempt.stdout_path, logs_dir, attempt.step_name, "stdout")
+    stderr_path = resolve_log_path(attempt.stderr_path, logs_dir, attempt.step_name, "stderr")
+    if stdout_path == attempt.stdout_path and stderr_path == attempt.stderr_path:
+        return attempt
+    return replace(attempt, stdout_path=stdout_path, stderr_path=stderr_path)
+
+
+def resolve_log_path(current_path: str | None, logs_dir: Path, step_name: str, stream: str) -> str | None:
+    if current_path:
+        return current_path
+    candidate = logs_dir / f"{step_name}.{stream}.log"
+    try:
+        return str(candidate) if candidate.is_file() else None
+    except OSError:
+        return None
 
 
 def attempt_from_row(row: sqlite3.Row) -> PipelineAttempt:

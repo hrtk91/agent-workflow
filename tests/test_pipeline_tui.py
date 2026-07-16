@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import sys
@@ -20,6 +21,14 @@ from agent_workflow.pipeline import (
 )
 from agent_workflow.runner import RunnerConfig, WorkflowRunner
 from agent_workflow.tui import MAX_LOG_LINE_CHARS, TuiApp, TuiCommand, parse_command, status_emoji, tail_lines
+from agent_workflow.tui_components import (
+    DashboardBehavior,
+    DashboardState,
+    DetailFocus,
+    RunDetailBehavior,
+    RunDetailState,
+    TuiContext,
+)
 
 
 class PipelineSnapshotTest(unittest.TestCase):
@@ -124,6 +133,25 @@ class PipelineSnapshotTest(unittest.TestCase):
         self.assertEqual(str(stdout), detail.steps[2].stdout_path)
         self.assertEqual(str(self.root / "logs"), detail.logs_dir)
 
+    def test_reader_resolves_active_log_paths_before_step_finishes(self) -> None:
+        self._insert_run("run-live", purpose="workflow")
+        summary = self.root / "run-live.md"
+        stdout = self.root / "logs" / "run_executor.stdout.log"
+        summary.write_text("# run-live\n", encoding="utf-8")
+        stdout.parent.mkdir(parents=True, exist_ok=True)
+        stdout.write_text("live output\n", encoding="utf-8")
+        with sqlite3.connect(self.state_dir / "jobs.sqlite") as conn:
+            conn.execute(
+                "update runs set summary_path = ? where run_id = ?",
+                (str(summary), "run-live"),
+            )
+
+        detail = PipelineSnapshotReader(self.state_dir / "jobs.sqlite").run_detail("run-live")
+
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        self.assertEqual(str(stdout), detail.steps[2].stdout_path)
+
     def test_tui_run_detail_uses_step_and_log_focuses(self) -> None:
         job_id = self.runner.enqueue(
             RunnerConfig(
@@ -197,6 +225,68 @@ class PipelineSnapshotTest(unittest.TestCase):
         self.assertEqual("detail", app.view)
         app._open_artifact("summary")
         self.assertIn("summary line", app.content_lines)
+
+    def test_tui_refreshes_active_log_and_can_pause_tail_follow(self) -> None:
+        self._insert_run("run-tail", purpose="workflow")
+        summary = self.root / "run-tail.md"
+        stdout = self.root / "logs" / "run_executor.stdout.log"
+        summary.write_text("# run-tail\n", encoding="utf-8")
+        stdout.parent.mkdir(parents=True, exist_ok=True)
+        stdout.write_text("first line\n", encoding="utf-8")
+        with sqlite3.connect(self.state_dir / "jobs.sqlite") as conn:
+            conn.execute(
+                "update runs set summary_path = ? where run_id = ?",
+                (str(summary), "run-tail"),
+            )
+
+        app = TuiApp(PipelineSnapshotReader(self.state_dir / "jobs.sqlite"), refresh_seconds=1.0, include_repair=False)
+        app.snapshot = app.reader.snapshot()
+        app.selected_index = next(index for index, item in enumerate(app.items) if item.item_id == "run-tail")
+        app._open_selected_item()
+        self.assertIn("first line", app.content_lines)
+        self.assertTrue(app.log_follow)
+
+        with stdout.open("a", encoding="utf-8") as stream:
+            stream.write("second line\n")
+        app.refresh()
+        self.assertIn("second line", app.content_lines)
+
+        app._handle_detail_input(ord("l"))
+        app._handle_detail_input(ord("k"))
+        self.assertFalse(app.log_follow)
+        app.refresh()
+        self.assertFalse(app.log_follow)
+        app._handle_detail_input(ord("G"))
+        self.assertTrue(app.log_follow)
+
+    def test_screen_behavior_owns_event_publisher_and_updates_its_state(self) -> None:
+        self._insert_run("run-behavior", purpose="workflow")
+        context = TuiContext(
+            reader=PipelineSnapshotReader(self.state_dir / "jobs.sqlite"),
+            refresh_seconds=1.0,
+            include_repair=False,
+            filter_labels={"all": "すべて", "running": "実行中", "failed": "失敗", "succeeded": "成功"},
+        )
+        context.snapshot = context.reader.snapshot()
+        dashboard = DashboardBehavior(context)
+
+        self.assertIsNotNone(dashboard.events)
+        filtered = dashboard.handle(DashboardState(), ord("f"))
+        self.assertEqual("running", filtered.state.filter_name)
+        opened = dashboard.handle(filtered.state, ord("l"))
+        self.assertIsInstance(opened.state, RunDetailState)
+        assert isinstance(opened.state, RunDetailState)
+
+        detail_behavior = RunDetailBehavior(context)
+        focused = detail_behavior.handle(opened.state, ord("l"))
+        self.assertEqual(DetailFocus.LOGS, focused.state.focus)
+        scrolled = detail_behavior.handle(
+            replace(focused.state, content_lines=("one", "two")),
+            ord("k"),
+        )
+        self.assertFalse(scrolled.state.log.follow_tail)
+        tailed = detail_behavior.handle(scrolled.state, ord("G"))
+        self.assertTrue(tailed.state.log.follow_tail)
 
     def test_reader_hides_repair_runs_unless_requested(self) -> None:
         self.runner.enqueue(

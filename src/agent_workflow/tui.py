@@ -6,7 +6,7 @@ import curses
 import json
 import shlex
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from agent_workflow.pipeline import (
@@ -20,6 +20,17 @@ from agent_workflow.pipeline import (
     PipelineSnapshot,
     PipelineSnapshotReader,
     pipeline_items,
+)
+from agent_workflow.tui_components import (
+    BehaviorResult,
+    DashboardBehavior,
+    DashboardState,
+    DetailFocus,
+    LogSource,
+    RunDetailBehavior,
+    RunDetailState,
+    ScreenState,
+    TuiContext,
 )
 
 
@@ -141,30 +152,222 @@ def run_tui(state_dir: Path, *, refresh_seconds: float = 1.0, include_repair: bo
 
 class TuiApp:
     def __init__(self, reader: PipelineSnapshotReader, *, refresh_seconds: float, include_repair: bool) -> None:
-        self.reader = reader
-        self.refresh_seconds = refresh_seconds
-        self.include_repair = include_repair
-        self.snapshot = PipelineSnapshot.empty()
-        self.filter_name = "all"
-        self.selected_index = 0
-        self.list_offset = 0
-        self.colors_enabled = False
-        self.view = "dashboard"
+        self.context = TuiContext(
+            reader=reader,
+            refresh_seconds=refresh_seconds,
+            include_repair=include_repair,
+            filter_labels=FILTER_LABELS,
+        )
+        self._screen_state: ScreenState = DashboardState()
+        self._view_override: str | None = None
+        self.dashboard_behavior = DashboardBehavior(self.context)
+        self.detail_behavior = RunDetailBehavior(self.context)
         self.menu_index = 0
         self.command_buffer = ""
-        self.message = "r:更新  m:メニュー  ::コマンド  Enter:開く  q:終了"
-        self.last_refresh = 0.0
-        self.detail: PipelineRunDetail | None = None
-        self.detail_step_index = 0
-        self.detail_attempt_index = 0
-        self.log_source = "stdout"
-        self.content_lines: list[str] = []
-        self.content_offset = 0
-        self.artifact_kind = "summary"
-        self.artifact_path: Path | None = None
         self.menu_offset = 0
-        self._screen_height = 0
-        self.detail_focus = "steps"
+        self._legacy_content_lines: list[str] = []
+        self._legacy_artifact_path: Path | None = None
+
+    @property
+    def reader(self) -> PipelineSnapshotReader:
+        return self.context.reader
+
+    @property
+    def refresh_seconds(self) -> float:
+        return self.context.refresh_seconds
+
+    @property
+    def include_repair(self) -> bool:
+        return self.context.include_repair
+
+    @property
+    def snapshot(self) -> PipelineSnapshot:
+        return self.context.snapshot
+
+    @snapshot.setter
+    def snapshot(self, value: PipelineSnapshot) -> None:
+        self.context.snapshot = value
+
+    @property
+    def message(self) -> str:
+        return self.context.message
+
+    @message.setter
+    def message(self, value: str) -> None:
+        self.context.message = value
+
+    @property
+    def last_refresh(self) -> float:
+        return self.context.last_refresh
+
+    @last_refresh.setter
+    def last_refresh(self, value: float) -> None:
+        self.context.last_refresh = value
+
+    @property
+    def colors_enabled(self) -> bool:
+        return self.context.colors_enabled
+
+    @colors_enabled.setter
+    def colors_enabled(self, value: bool) -> None:
+        self.context.colors_enabled = value
+
+    @property
+    def _screen_height(self) -> int:
+        return self.context.screen_height
+
+    @_screen_height.setter
+    def _screen_height(self, value: int) -> None:
+        self.context.screen_height = value
+
+    @property
+    def view(self) -> str:
+        if self._view_override is not None:
+            return self._view_override
+        return "detail" if isinstance(self._screen_state, RunDetailState) else "dashboard"
+
+    @view.setter
+    def view(self, value: str) -> None:
+        if value == "dashboard":
+            if isinstance(self._screen_state, RunDetailState):
+                self._screen_state = self._screen_state.parent or DashboardState()
+            self._view_override = None
+            return
+        if value == "detail":
+            self._view_override = None
+            return
+        self._view_override = value
+
+    @property
+    def filter_name(self) -> str:
+        return self._screen_state.filter_name if isinstance(self._screen_state, DashboardState) else "all"
+
+    @filter_name.setter
+    def filter_name(self, value: str) -> None:
+        if isinstance(self._screen_state, DashboardState):
+            self._screen_state = replace(self._screen_state, filter_name=value)
+
+    @property
+    def selected_index(self) -> int:
+        return self._screen_state.selected_index if isinstance(self._screen_state, DashboardState) else 0
+
+    @selected_index.setter
+    def selected_index(self, value: int) -> None:
+        if isinstance(self._screen_state, DashboardState):
+            self._screen_state = replace(self._screen_state, selected_index=value)
+
+    @property
+    def list_offset(self) -> int:
+        return self._screen_state.list_offset if isinstance(self._screen_state, DashboardState) else 0
+
+    @list_offset.setter
+    def list_offset(self, value: int) -> None:
+        if isinstance(self._screen_state, DashboardState):
+            self._screen_state = replace(self._screen_state, list_offset=value)
+
+    @property
+    def detail(self) -> PipelineRunDetail | None:
+        return self._screen_state.detail if isinstance(self._screen_state, RunDetailState) else None
+
+    @detail.setter
+    def detail(self, value: PipelineRunDetail | None) -> None:
+        if isinstance(self._screen_state, RunDetailState):
+            self._screen_state = replace(self._screen_state, detail=value)
+
+    @property
+    def detail_step_index(self) -> int:
+        return self._screen_state.step_index if isinstance(self._screen_state, RunDetailState) else 0
+
+    @detail_step_index.setter
+    def detail_step_index(self, value: int) -> None:
+        if isinstance(self._screen_state, RunDetailState):
+            self._screen_state = replace(self._screen_state, step_index=value)
+
+    @property
+    def detail_attempt_index(self) -> int:
+        return self._screen_state.attempt_index if isinstance(self._screen_state, RunDetailState) else 0
+
+    @detail_attempt_index.setter
+    def detail_attempt_index(self, value: int) -> None:
+        if isinstance(self._screen_state, RunDetailState):
+            self._screen_state = replace(self._screen_state, attempt_index=value)
+
+    @property
+    def detail_focus(self) -> str:
+        return self._screen_state.focus.value if isinstance(self._screen_state, RunDetailState) else "steps"
+
+    @detail_focus.setter
+    def detail_focus(self, value: str) -> None:
+        if isinstance(self._screen_state, RunDetailState):
+            self._screen_state = replace(self._screen_state, focus=DetailFocus(value))
+
+    @property
+    def log_source(self) -> str:
+        return self._screen_state.log.source.value if isinstance(self._screen_state, RunDetailState) else "stdout"
+
+    @log_source.setter
+    def log_source(self, value: str) -> None:
+        if isinstance(self._screen_state, RunDetailState):
+            self._screen_state = replace(self._screen_state, log=replace(self._screen_state.log, source=LogSource(value)))
+
+    @property
+    def log_follow(self) -> bool:
+        return self._screen_state.log.follow_tail if isinstance(self._screen_state, RunDetailState) else True
+
+    @log_follow.setter
+    def log_follow(self, value: bool) -> None:
+        if isinstance(self._screen_state, RunDetailState):
+            self._screen_state = replace(self._screen_state, log=replace(self._screen_state.log, follow_tail=value))
+
+    @property
+    def content_lines(self) -> list[str]:
+        if isinstance(self._screen_state, RunDetailState):
+            return list(self._screen_state.content_lines)
+        return self._legacy_content_lines
+
+    @content_lines.setter
+    def content_lines(self, value: list[str]) -> None:
+        if isinstance(self._screen_state, RunDetailState):
+            self._screen_state = replace(self._screen_state, content_lines=tuple(value))
+        else:
+            self._legacy_content_lines = value
+
+    @property
+    def content_offset(self) -> int:
+        if not isinstance(self._screen_state, RunDetailState):
+            return 0
+        if self.view == "artifact":
+            return self._screen_state.artifact_offset
+        return self._screen_state.log.offset
+
+    @content_offset.setter
+    def content_offset(self, value: int) -> None:
+        if not isinstance(self._screen_state, RunDetailState):
+            return
+        if self.view == "artifact":
+            self._screen_state = replace(self._screen_state, artifact_offset=value)
+        else:
+            self._screen_state = replace(self._screen_state, log=replace(self._screen_state.log, offset=value))
+
+    @property
+    def artifact_kind(self) -> str:
+        return self._screen_state.artifact_kind if isinstance(self._screen_state, RunDetailState) else "summary"
+
+    @artifact_kind.setter
+    def artifact_kind(self, value: str) -> None:
+        if isinstance(self._screen_state, RunDetailState):
+            self._screen_state = replace(self._screen_state, artifact_kind=value)
+
+    @property
+    def artifact_path(self) -> Path | None:
+        if not isinstance(self._screen_state, RunDetailState) or self._screen_state.artifact_path is None:
+            return None
+        return Path(self._screen_state.artifact_path)
+
+    @artifact_path.setter
+    def artifact_path(self, value: Path | None) -> None:
+        if isinstance(self._screen_state, RunDetailState):
+            self._screen_state = replace(self._screen_state, artifact_path=str(value) if value else None)
 
     def run(self, screen: curses.window) -> None:
         screen.keypad(True)
@@ -175,6 +378,16 @@ class TuiApp:
             pass
         self._init_colors()
         self.refresh()
+        input_handlers = {
+            "dashboard": self._handle_dashboard_input,
+            "detail": self._handle_detail_input,
+            "command": self._handle_command_input,
+            "menu": self._handle_menu_input,
+            "attempts": self._handle_attempts_input,
+            "logs": self._handle_logs_input,
+            "artifact": self._handle_artifact_input,
+            "job": self._handle_job_input,
+        }
         while True:
             if time.monotonic() - self.last_refresh >= self.refresh_seconds:
                 self.refresh()
@@ -182,48 +395,39 @@ class TuiApp:
             key = screen.getch()
             if key == -1:
                 continue
-            if self.view == "command":
-                if self._handle_command_input(key):
-                    return
-            elif self.view == "menu":
-                if self._handle_menu_input(key):
-                    return
-            elif self.view in {"detail", "attempts", "logs", "artifact", "job"}:
-                if self._handle_workspace_input(key):
-                    return
-            elif self._handle_dashboard_input(key):
+            handler = input_handlers.get(self.view, self._handle_dashboard_input)
+            if handler(key):
                 return
 
     def refresh(self) -> None:
         self.snapshot = self.reader.snapshot(include_repair=self.include_repair)
         self.last_refresh = time.monotonic()
-        self._clamp_selection()
-        if self.detail is not None:
-            refreshed = self.reader.run_detail(self.detail.run_id)
-            if refreshed is not None:
-                self.detail = refreshed
-                self._clamp_detail_selection()
-                if self.view in {"detail", "logs", "artifact"}:
-                    self._load_content()
+        if isinstance(self._screen_state, DashboardState):
+            self._screen_state = self.dashboard_behavior.refresh(self._screen_state)
+        else:
+            self._screen_state = self.detail_behavior.refresh(self._screen_state)
+        if self.detail is not None and self.view in {"detail", "logs", "artifact"}:
+            self._load_content()
 
     def draw(self, screen: curses.window) -> None:
         screen.erase()
-        if self.view == "dashboard" or self.view in {"command", "menu"}:
-            self._draw_dashboard(screen)
-        elif self.view == "detail":
-            self._draw_detail(screen)
-        elif self.view == "attempts":
-            self._draw_attempts(screen)
-        elif self.view == "logs":
-            self._draw_logs(screen)
-        elif self.view == "artifact":
-            self._draw_artifact(screen)
-        else:
-            self._draw_job_detail(screen)
-        if self.view == "menu":
-            self._draw_menu(screen)
-        elif self.view == "command":
-            self._draw_command_prompt(screen)
+        base_drawers = {
+            "dashboard": self._draw_dashboard,
+            "detail": self._draw_detail,
+        }
+        base_drawer = base_drawers["detail" if isinstance(self._screen_state, RunDetailState) else "dashboard"]
+        base_drawer(screen)
+        overlay_drawers = {
+            "menu": self._draw_menu,
+            "command": self._draw_command_prompt,
+            "attempts": self._draw_attempts,
+            "logs": self._draw_logs,
+            "artifact": self._draw_artifact,
+            "job": self._draw_job_detail,
+        }
+        overlay_drawer = overlay_drawers.get(self.view)
+        if overlay_drawer is not None:
+            overlay_drawer(screen)
         screen.refresh()
 
     def _draw_dashboard(self, screen: curses.window) -> None:
@@ -336,7 +540,7 @@ class TuiApp:
         footer = (
             "↑↓/jk:step  l:ログへ  h:一覧へ  Enter/a:試行  Esc:一覧"
             if self.detail_focus == "steps"
-            else "↑↓/jk:スクロール  h:stepへ  Tab/o/e:stdout/stderr  r:更新  Esc:一覧"
+            else "↑↓/jk:スクロール  g/G:先頭/末尾  h:stepへ  Tab/o/e:stdout/stderr  r:更新  Esc:一覧"
         )
         self._add(screen, height - 1, 0, footer, width - 1)
 
@@ -351,14 +555,18 @@ class TuiApp:
             screen,
             y,
             x,
-            f"{status_emoji(step.status)} {STEP_LABELS.get(step.name, step.name)} / {attempt_label} / {self.log_source}",
+            f"{status_emoji(step.status)} {STEP_LABELS.get(step.name, step.name)} / {attempt_label} / {self.log_source}"
+            f"  {'📡末尾追従' if self.log_follow else '📍履歴位置'}",
             width,
             self._status_attr(step.status) | curses.A_BOLD,
         )
         self._add(screen, y + 1, x, f"path: {self.selected_log_path or '(なし)'}", width, curses.A_DIM)
         visible = max(1, height - 2)
         max_offset = max(0, len(self.content_lines) - visible)
-        self.content_offset = min(max(0, self.content_offset), max_offset)
+        if self.log_follow:
+            self.content_offset = max_offset
+        else:
+            self.content_offset = min(max(0, self.content_offset), max_offset)
         if not self.content_lines:
             self._add(screen, y + 2, x, "(ログはありません)", width)
             return
@@ -424,11 +632,14 @@ class TuiApp:
         self._add(screen, 2, 0, f"path: {path or '(なし)'}", width - 1, curses.A_DIM)
         visible = max(1, height - 5)
         max_offset = max(0, len(self.content_lines) - visible)
-        self.content_offset = min(max(0, self.content_offset), max_offset)
+        if self.log_follow:
+            self.content_offset = max_offset
+        else:
+            self.content_offset = min(max(0, self.content_offset), max_offset)
         for index, line in enumerate(self.content_lines[self.content_offset : self.content_offset + visible]):
             self._add(screen, 3 + index, 0, line, width - 1)
         self._add(screen, height - 2, 0, self.message, width - 1, curses.A_DIM)
-        self._add(screen, height - 1, 0, "↑↓/jk:スクロール  Tab/o/e:stdout/stderr  [/]:step  a:試行  r:更新  Esc", width - 1)
+        self._add(screen, height - 1, 0, "↑↓/jk:スクロール  g/G:先頭/末尾  Tab/o/e:stdout/stderr  [/]:step  a:試行  r:更新  Esc", width - 1)
 
     def _draw_artifact(self, screen: curses.window) -> None:
         height, width = screen.getmaxyx()
@@ -527,34 +738,32 @@ class TuiApp:
         self._add(screen, height - 2, 0, ":" + self.command_buffer, width - 1, curses.A_BOLD)
 
     def _handle_dashboard_input(self, key: int) -> bool:
-        if key in (ord("q"), ord("Q")):
-            return True
-        if key in (curses.KEY_UP, ord("k")):
-            self.selected_index = max(0, self.selected_index - 1)
-        elif key in (curses.KEY_DOWN, ord("j")):
-            self.selected_index = min(max(0, len(self.items) - 1), self.selected_index + 1)
-        elif key in (10, 13, ord("d"), ord("l")):
-            self._open_selected_item()
-        elif key == ord("f"):
-            self._cycle_filter()
-        elif key == ord("m"):
-            self.view = "menu"
+        if not isinstance(self._screen_state, DashboardState):
+            return False
+        result = self.dashboard_behavior.handle(self._screen_state, key)
+        self._apply_behavior_result(result)
+        if result.overlay == "menu":
             self.menu_index = 0
             self.menu_offset = 0
-        elif key == ord(":"):
-            self.view = "command"
+        elif result.overlay == "command":
             self.command_buffer = ""
-        elif key == ord("r"):
-            self.refresh()
-            self.message = "更新しました。"
-        return False
+        return result.quit_requested
 
     def _cycle_filter(self) -> None:
-        index = PIPELINE_FILTERS.index(self.filter_name)
-        self.filter_name = PIPELINE_FILTERS[(index + 1) % len(PIPELINE_FILTERS)]
-        self.selected_index = 0
-        self.list_offset = 0
-        self.message = f"絞り込みを変更しました: {FILTER_LABELS[self.filter_name]}"
+        result = self.dashboard_behavior.handle(self._screen_state, ord("f"))
+        self._apply_behavior_result(result)
+
+    def _apply_behavior_result(self, result: BehaviorResult) -> None:
+        """BehaviorのState遷移を画面hostへ反映する。"""
+
+        self._screen_state = result.state
+        self._view_override = result.overlay
+        if result.message:
+            self.message = result.message
+        if result.refresh_requested:
+            self.refresh()
+        elif isinstance(self._screen_state, RunDetailState) and self.view in {"detail", "logs"}:
+            self._load_content()
 
     def _handle_menu_input(self, key: int) -> bool:
         if key in (27, ord("m")):
@@ -591,59 +800,21 @@ class TuiApp:
         return False
 
     def _handle_workspace_input(self, key: int) -> bool:
-        if self.view == "detail":
-            return self._handle_detail_input(key)
-        if self.view == "attempts":
-            return self._handle_attempts_input(key)
-        if self.view == "logs":
-            return self._handle_logs_input(key)
-        if self.view == "artifact":
-            return self._handle_artifact_input(key)
-        return self._handle_job_input(key)
+        handlers = {
+            "detail": self._handle_detail_input,
+            "attempts": self._handle_attempts_input,
+            "logs": self._handle_logs_input,
+            "artifact": self._handle_artifact_input,
+            "job": self._handle_job_input,
+        }
+        return handlers.get(self.view, self._handle_dashboard_input)(key)
 
     def _handle_detail_input(self, key: int) -> bool:
-        if key in (27, ord("q"), ord("Q")):
-            self.view = "dashboard"
-        elif key == ord("h"):
-            if self.detail_focus == "logs":
-                self.detail_focus = "steps"
-            else:
-                self.view = "dashboard"
-        elif key == ord("l"):
-            if self.detail_focus == "steps":
-                self.detail_focus = "logs"
-        elif self.detail_focus == "steps" and key in (curses.KEY_UP, ord("k")):
-            self.detail_step_index = max(0, self.detail_step_index - 1)
-            self._select_latest_attempt()
-            self.content_offset = 0
-            self._load_content()
-        elif self.detail_focus == "steps" and key in (curses.KEY_DOWN, ord("j")):
-            self.detail_step_index = min(max(0, len(self.detail_steps) - 1), self.detail_step_index + 1)
-            self._select_latest_attempt()
-            self.content_offset = 0
-            self._load_content()
-        elif self.detail_focus == "steps" and key in (10, 13, ord("a")):
-            self._open_attempts()
-        elif self.detail_focus == "logs" and key in (curses.KEY_UP, ord("k")):
-            self.content_offset = max(0, self.content_offset - 1)
-        elif self.detail_focus == "logs" and key in (curses.KEY_DOWN, ord("j")):
-            self.content_offset += 1
-        elif self.detail_focus == "logs" and key in (9, ord("o")):
-            self.log_source = "stderr" if self.log_source == "stdout" else "stdout"
-            self.content_offset = 0
-            self._load_content()
-        elif self.detail_focus == "logs" and key == ord("e"):
-            self.log_source = "stderr"
-            self.content_offset = 0
-            self._load_content()
-        elif self.detail_focus == "logs" and key == ord("g"):
-            self.content_offset = 0
-        elif self.detail_focus == "logs" and key == ord("G"):
-            self.content_offset = len(self.content_lines)
-        elif key == ord("r"):
-            self.refresh()
-            self.message = "run詳細を更新しました。"
-        return False
+        if not isinstance(self._screen_state, RunDetailState):
+            return False
+        result = self.detail_behavior.handle(self._screen_state, key)
+        self._apply_behavior_result(result)
+        return result.quit_requested
 
     def _handle_attempts_input(self, key: int) -> bool:
         if key in (27, ord("q"), ord("Q")):
@@ -667,28 +838,34 @@ class TuiApp:
         elif key in (ord("q"), ord("Q")):
             self.view = "dashboard"
         elif key in (curses.KEY_UP, ord("k")):
-            self.content_offset = max(0, self.content_offset - 1)
+            self._scroll_log(-1)
         elif key in (curses.KEY_DOWN, ord("j")):
-            self.content_offset += 1
+            self._scroll_log(1)
         elif key in (9, ord("o")):
             self.log_source = "stderr" if self.log_source == "stdout" else "stdout"
+            self.log_follow = True
             self._load_content()
         elif key == ord("e"):
             self.log_source = "stderr"
+            self.log_follow = True
             self._load_content()
         elif key == ord("["):
             self.detail_step_index = max(0, self.detail_step_index - 1)
             self._select_latest_attempt()
+            self.log_follow = True
             self._load_content()
         elif key == ord("]"):
             self.detail_step_index = min(max(0, len(self.detail_steps) - 1), self.detail_step_index + 1)
             self._select_latest_attempt()
+            self.log_follow = True
             self._load_content()
         elif key == ord("a"):
             self._open_attempts()
         elif key == ord("g"):
+            self.log_follow = False
             self.content_offset = 0
         elif key == ord("G"):
+            self.log_follow = True
             self.content_offset = len(self.content_lines)
         elif key == ord("r"):
             self.refresh()
@@ -818,27 +995,10 @@ class TuiApp:
         return step.stdout_path if self.log_source == "stdout" else step.stderr_path
 
     def _open_selected_item(self) -> None:
-        item = self.selected_item
-        if item is None:
-            self.message = "一覧からrunまたはjobを選択してください。"
+        if not isinstance(self._screen_state, DashboardState):
             return
-        if item.run is None:
-            self.detail = None
-            self.view = "job"
-            return
-        detail = self.reader.run_detail(item.run.run_id)
-        if detail is None:
-            self.detail = None
-            self.message = f"run詳細を読み込めません: {item.run.run_id}"
-            self.view = "detail"
-            return
-        self.detail = detail
-        self.detail_step_index = self._initial_step_index(detail)
-        self._select_latest_attempt()
-        self.detail_focus = "steps"
-        self.content_offset = 0
-        self.view = "detail"
-        self._load_content()
+        result = self.dashboard_behavior.handle(self._screen_state, ord("l"))
+        self._apply_behavior_result(result)
 
     def _open_attempts(self) -> None:
         if self.detail is None:
@@ -852,6 +1012,7 @@ class TuiApp:
             self._open_selected_item()
         if self.detail is not None:
             self.view = "logs"
+            self.log_follow = True
             self.content_offset = 0
             self._load_content()
 
@@ -872,6 +1033,13 @@ class TuiApp:
             return
         self.artifact_path = find_artifact_path(self.detail, self.artifact_kind)
         self.content_lines = read_artifact_lines(self.artifact_path)
+
+    def _scroll_log(self, delta: int) -> None:
+        if delta < 0:
+            self.log_follow = False
+        self.content_offset = max(0, self.content_offset + delta)
+        if delta > 0 and self.content_offset >= max(0, len(self.content_lines) - 1):
+            self.log_follow = True
 
     def _initial_step_index(self, detail: PipelineRunDetail) -> int:
         if detail.current_step:
