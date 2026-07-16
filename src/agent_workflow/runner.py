@@ -757,11 +757,12 @@ class WorkflowRunner:
         if state.model:
             args.extend(["--model", state.model])
         started_at = time.time()
-        result = run_logged(args, Path(state.worktree_path or state.repo_path), Path(state.run_dir) / "logs", "run_executor", state.timeout_seconds)
+        log_dir = Path(state.run_dir) / "logs"
+        step.stdout_path, step.stderr_path = command_log_paths(log_dir, "run_executor")
+        self.save_state(state)
+        result = run_logged(args, Path(state.worktree_path or state.repo_path), log_dir, "run_executor", state.timeout_seconds)
         step.exit_code = result.exit_code
         step.timed_out = result.timed_out
-        step.stdout_path = result.stdout_path
-        step.stderr_path = result.stderr_path
         attrs = result.attrs()
         snapshot = self._snapshot_executor_observability(state, started_at - 2)
         if snapshot:
@@ -773,11 +774,12 @@ class WorkflowRunner:
             raise StepFailure("failed", "failed", f"executor command exited with {result.exit_code}", result.exit_code, False)
 
     def _step_run_qc(self, state: RunState, step: StepState, span: dict[str, object]) -> None:
-        result = run_logged(["bash", "-lc", state.verify_command], Path(state.worktree_path or state.repo_path), Path(state.run_dir) / "logs", "run_qc", state.timeout_seconds)
+        log_dir = Path(state.run_dir) / "logs"
+        step.stdout_path, step.stderr_path = command_log_paths(log_dir, "run_qc")
+        self.save_state(state)
+        result = run_logged(["bash", "-lc", state.verify_command], Path(state.worktree_path or state.repo_path), log_dir, "run_qc", state.timeout_seconds)
         step.exit_code = result.exit_code
         step.timed_out = result.timed_out
-        step.stdout_path = result.stdout_path
-        step.stderr_path = result.stderr_path
         span["attributes"] = {**span["attributes"], **result.attrs()}
         if result.timed_out:
             raise StepFailure("timed_out", "timed_out", "QC command timed out", result.exit_code, True)
@@ -1399,10 +1401,14 @@ class CommandResult:
         }
 
 
+def command_log_paths(log_dir: Path, name: str) -> tuple[str, str]:
+    return str(log_dir / f"{name}.stdout.log"), str(log_dir / f"{name}.stderr.log")
+
+
 def run_logged(args: Sequence[str], cwd: Path, log_dir: Path, name: str, timeout: float) -> CommandResult:
     log_dir.mkdir(parents=True, exist_ok=True)
-    stdout_path = log_dir / f"{name}.stdout.log"
-    stderr_path = log_dir / f"{name}.stderr.log"
+    stdout_path = Path(command_log_paths(log_dir, name)[0])
+    stderr_path = Path(command_log_paths(log_dir, name)[1])
     with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
         proc = subprocess.Popen(args, cwd=cwd, stdout=stdout, stderr=stderr, start_new_session=True)
         timed_out = False
