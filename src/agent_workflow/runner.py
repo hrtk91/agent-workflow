@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Sequence
 
 from agent_workflow.notify.discord import render_llm_notification
+from agent_workflow.analytics.normalization import failure_category
 from agent_workflow.state import WORKFLOW_STEPS, RunState, StepState, _coerce_candidate_chain
 from agent_workflow.storage import RunStore
 from agent_workflow.tracing import TraceRecorder
@@ -25,6 +26,12 @@ FAILURE_NOTIFY_STATUSES = {"blocked", "failed", "interrupted", "qc_failed", "tim
 AUTO_REPAIR_MAX_ATTEMPTS = 2
 QC_REPAIR_MAX_ATTEMPTS = 5
 AUTO_REPAIR_SCAN_EXISTING_MAX_AGE_SECONDS = 21600
+RECOVERABLE_CANDIDATE_FAILURE_CATEGORIES = {
+    "provider_auth",
+    "provider_rate_limit",
+    "provider_unavailable",
+    "timeout",
+}
 
 
 @dataclass
@@ -809,6 +816,15 @@ class WorkflowRunner:
         if step.name != "run_executor":
             return False
         if step.status not in {"failed", "timed_out"}:
+            return False
+        category = failure_category(
+            step_name=step.name,
+            status=step.status,
+            timed_out=step.timed_out,
+            error=step.error,
+            exit_code=step.exit_code,
+        )
+        if category not in RECOVERABLE_CANDIDATE_FAILURE_CATEGORIES:
             return False
         return state.candidate_index + 1 < len(state.candidate_chain)
 
