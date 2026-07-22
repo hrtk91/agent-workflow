@@ -183,6 +183,11 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--executor-bin", default="takt")
     parser.add_argument("--provider")
     parser.add_argument("--model")
+    parser.add_argument(
+        "--candidate",
+        action="append",
+        help="追加のprovider/model候補（形式: provider または provider:model）。複数回指定して順序を固定してください。",
+    )
     parser.add_argument("--task-type", default="unspecified", help="分析レポートで使うタスク分類")
     parser.add_argument("--base-ref")
     parser.add_argument("--keep-worktree", action="store_true", default=True)
@@ -227,6 +232,11 @@ def add_auto_repair_args(parser: argparse.ArgumentParser) -> None:
 
 
 def config_from_args(args: argparse.Namespace) -> RunnerConfig:
+    candidate_chain = parse_candidate_chain(
+        getattr(args, "candidate", None),
+        getattr(args, "provider", None),
+        getattr(args, "model", None),
+    )
     return RunnerConfig(
         state_dir=args.state_dir,
         repo_path=getattr(args, "repo", None),
@@ -239,9 +249,33 @@ def config_from_args(args: argparse.Namespace) -> RunnerConfig:
         executor_bin=getattr(args, "executor_bin", "takt"),
         provider=getattr(args, "provider", None),
         model=getattr(args, "model", None),
+        candidate_chain=candidate_chain,
         task_type=getattr(args, "task_type", "unspecified"),
         base_ref=getattr(args, "base_ref", None),
     )
+
+
+def parse_candidate_chain(
+    candidates: list[str] | None,
+    provider: str | None,
+    model: str | None,
+) -> list[tuple[str | None, str | None]]:
+    parsed: list[tuple[str | None, str | None]] = []
+    if candidates:
+        for item in candidates:
+            text = item.strip()
+            if not text:
+                continue
+            if "::" in text:
+                raw_provider, raw_model = text.split("::", 1)
+            elif ":" in text:
+                raw_provider, raw_model = text.split(":", 1)
+            else:
+                raw_provider, raw_model = text, None
+            parsed.append((raw_provider.strip() or None, raw_model.strip() or None))
+    if not parsed and (provider or model):
+        parsed.append((provider.strip() if provider else None, model.strip() if model else None))
+    return parsed
 
 
 def notify_statuses_from_args(args: argparse.Namespace) -> set[str] | None:

@@ -7,7 +7,13 @@ from datetime import datetime
 from agent_workflow.state import RunState
 
 
-def failure_category(step_name: str, status: str, timed_out: bool) -> str | None:
+def failure_category(
+    step_name: str,
+    status: str,
+    timed_out: bool,
+    error: str | None = None,
+    exit_code: int | None = None,
+) -> str | None:
     if status in {"running", "succeeded"}:
         return None
     if timed_out or status == "timed_out":
@@ -19,6 +25,12 @@ def failure_category(step_name: str, status: str, timed_out: bool) -> str | None
     if step_name == "run_qc":
         return "qc_failure"
     if step_name == "run_executor":
+        if exit_code in {10, 51}:
+            return "provider_rate_limit"
+        if exit_code == 11:
+            return "provider_auth"
+        if exit_code in {12, 13}:
+            return "provider_unavailable"
         return "executor_failure"
     return status
 
