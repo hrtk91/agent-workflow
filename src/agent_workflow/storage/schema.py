@@ -35,6 +35,10 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
           executor_bin text not null,
           provider text,
           model text,
+          candidate_chain text,
+          candidate_index integer not null default 0,
+          lineage_id text,
+          candidate_checkpoint text,
           task_type text not null,
           base_ref text,
           purpose text not null,
@@ -103,6 +107,14 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "run_steps", "stderr_path", "text")
     ensure_column(conn, "step_attempts", "stdout_path", "text")
     ensure_column(conn, "step_attempts", "stderr_path", "text")
+    ensure_column(conn, "step_attempts", "candidate_index", "integer")
+    ensure_column(conn, "step_attempts", "candidate_provider", "text")
+    ensure_column(conn, "step_attempts", "candidate_model", "text")
+    ensure_column(conn, "step_attempts", "candidate_execution_id", "text")
+    ensure_column(conn, "runs", "candidate_chain", "text")
+    ensure_column(conn, "runs", "candidate_index", "integer not null default 0")
+    ensure_column(conn, "runs", "lineage_id", "text")
+    ensure_column(conn, "runs", "candidate_checkpoint", "text")
     ensure_column(conn, "runs", "qc_repair_attempts", "integer not null default 0")
 
     # [2] 分析tableしか残っていないrunも参照可能なraw runへ移す。

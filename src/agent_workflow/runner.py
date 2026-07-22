@@ -10,21 +10,28 @@ import subprocess
 import sys
 import time
 import configparser
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
 from agent_workflow.notify.discord import render_llm_notification
-from agent_workflow.state import WORKFLOW_STEPS, RunState, StepState
+from agent_workflow.analytics.normalization import failure_category
+from agent_workflow.state import WORKFLOW_STEPS, RunState, StepState, _coerce_candidate_chain
 from agent_workflow.storage import RunStore
 from agent_workflow.tracing import TraceRecorder
 
 STEPS = list(WORKFLOW_STEPS)
-FAILURE_NOTIFY_STATUSES = {"blocked", "failed", "interrupted", "qc_failed", "timed_out"}
+FAILURE_NOTIFY_STATUSES = {"blocked", "failed", "interrupted", "qc_failed", "timed_out", "recovery_exhausted"}
 AUTO_REPAIR_MAX_ATTEMPTS = 2
 QC_REPAIR_MAX_ATTEMPTS = 5
 AUTO_REPAIR_SCAN_EXISTING_MAX_AGE_SECONDS = 21600
+RECOVERABLE_CANDIDATE_FAILURE_CATEGORIES = {
+    "provider_auth",
+    "provider_rate_limit",
+    "provider_unavailable",
+    "timeout",
+}
 
 
 @dataclass
@@ -40,6 +47,7 @@ class RunnerConfig:
     executor_bin: str = "takt"
     provider: str | None = None
     model: str | None = None
+    candidate_chain: list[tuple[str | None, str | None]] = field(default_factory=list)
     task_type: str = "unspecified"
     base_ref: str | None = None
     purpose: str = "workflow"
@@ -90,6 +98,8 @@ class WorkflowRunner:
             raise ValueError("--repo is required")
         if not config.verify_command:
             raise ValueError("--verify-command is required; QC must be explicit")
+        candidate_chain = config.candidate_chain or [(config.provider, config.model)]
+        candidate_provider, candidate_model = self._candidate_from_index(candidate_chain, 0)
         run_id = new_run_id()
         run_dir = self.runs_dir / run_id
         task_dir = run_dir / "task"
@@ -105,8 +115,12 @@ class WorkflowRunner:
             verify_command=config.verify_command,
             timeout_seconds=float(config.timeout_seconds or 0),
             executor_bin=config.executor_bin,
-            provider=config.provider,
-            model=config.model,
+            provider=candidate_provider,
+            model=candidate_model,
+            candidate_chain=candidate_chain,
+            candidate_index=0,
+            candidate_checkpoint=self._candidate_checkpoint(run_id, 0),
+            lineage_id=run_id,
             task_type=config.task_type,
             base_ref=config.base_ref,
             purpose=config.purpose,
@@ -571,7 +585,11 @@ class WorkflowRunner:
         )
         try:
             # [2] current stateを先に永続化し、未完了stepだけを順次実行する。
+            if state.status == "recovery_exhausted":
+                self._finalize_failed_summary(state)
+                return state
             state.status = "running"
+            self._prepare_active_candidate(state)
             self.save_state(state)
             index = start_index
             while index < len(state.steps):
@@ -587,6 +605,16 @@ class WorkflowRunner:
                         self._prepare_qc_repair_loop(state, state.qc_repair_attempts)
                         index = STEPS.index("run_executor")
                         continue
+                    if step.name == "run_executor":
+                        if step.status in {"failed", "timed_out"}:
+                            if self._should_switch_candidate(state, step):
+                                if self._switch_to_next_candidate(state):
+                                    index = STEPS.index("create_worktree")
+                                    continue
+                            if step.status == "timed_out":
+                                state.status = "timed_out"
+                            else:
+                                state.status = "recovery_exhausted"
                     self._finalize_failed_summary(state)
                     return state
                 index += 1
@@ -654,6 +682,7 @@ class WorkflowRunner:
         # [1] retry前の結果を残さず、今回attemptの開始状態として保存する。
         step.status = "running"
         step.attempts += 1
+        self._prepare_candidate_for_step(state, step)
         step.started_at = utc_now()
         step.finished_at = None
         step.exit_code = None
@@ -736,18 +765,96 @@ class WorkflowRunner:
         span["attributes"] = {**span["attributes"], "task_file": str(task_dir / "task.md")}
 
     def _step_create_worktree(self, state: RunState, _step: StepState, span: dict[str, object]) -> None:
-        if state.worktree_path and Path(state.worktree_path).exists():
+        candidate_worktree = self._candidate_worktree_path(state)
+        if state.worktree_path == str(candidate_worktree) and candidate_worktree.exists():
             return
         repo = Path(state.repo_path)
         ref = state.base_ref or git_output(repo, ["rev-parse", "--verify", "origin/main"], allow_fail=True)
         if not ref:
             ref = git_output(repo, ["rev-parse", "--verify", "HEAD"])
         state.base_ref = ref.strip()
-        worktree = self.worktrees_dir / state.run_id / "repo"
+        worktree = candidate_worktree
         worktree.parent.mkdir(parents=True, exist_ok=True)
         run_checked(["git", "-C", str(repo), "worktree", "add", "--detach", str(worktree), state.base_ref], cwd=repo)
         state.worktree_path = str(worktree)
         span["attributes"] = {**span["attributes"], "worktree_path": state.worktree_path, "base_ref": state.base_ref}
+
+    def _candidate_from_index(self, candidates: list[tuple[str | None, str | None]], candidate_index: int) -> tuple[str | None, str | None]:
+        if not candidates:
+            return None, None
+        if candidate_index < 0:
+            candidate_index = 0
+        elif candidate_index >= len(candidates):
+            return None, None
+        return candidates[candidate_index]
+
+    def _candidate_checkpoint(self, lineage_id: str, candidate_index: int) -> str:
+        return f"{lineage_id}-candidate-{candidate_index}"
+
+    def _candidate_worktree_path(self, state: RunState) -> Path:
+        return self.worktrees_dir / state.lineage_id / state.candidate_checkpoint / "repo"
+
+    def _candidate_execution_id(self, state: RunState, step: StepState) -> str:
+        provider = state.provider or ""
+        model = state.model or ""
+        return f"{state.lineage_id}:{state.candidate_index}:{provider}:{model}:{step.attempts}"
+
+    def _prepare_active_candidate(self, state: RunState) -> None:
+        provider, model = self._candidate_from_index(state.candidate_chain, state.candidate_index)
+        state.provider = provider
+        state.model = model
+        state.candidate_checkpoint = self._candidate_checkpoint(state.lineage_id, state.candidate_index)
+
+    def _prepare_candidate_for_step(self, state: RunState, step: StepState) -> None:
+        self._prepare_active_candidate(state)
+        step.candidate_index = state.candidate_index
+        step.candidate_provider = state.provider
+        step.candidate_model = state.model
+        step.candidate_execution_id = self._candidate_execution_id(state, step)
+
+    def _should_switch_candidate(self, state: RunState, step: StepState) -> bool:
+        if step.name != "run_executor":
+            return False
+        if step.status not in {"failed", "timed_out"}:
+            return False
+        category = failure_category(
+            step_name=step.name,
+            status=step.status,
+            timed_out=step.timed_out,
+            error=step.error,
+            exit_code=step.exit_code,
+        )
+        if category not in RECOVERABLE_CANDIDATE_FAILURE_CATEGORIES:
+            return False
+        return state.candidate_index + 1 < len(state.candidate_chain)
+
+    def _switch_to_next_candidate(self, state: RunState) -> bool:
+        next_index = state.candidate_index + 1
+        if next_index >= len(state.candidate_chain):
+            state.status = "recovery_exhausted"
+            return False
+
+        state.candidate_index = next_index
+        state.provider, state.model = self._candidate_from_index(state.candidate_chain, next_index)
+        state.candidate_checkpoint = self._candidate_checkpoint(state.lineage_id, next_index)
+        state.worktree_path = str(self._candidate_worktree_path(state))
+        self._reset_candidate_steps_for_retry(state)
+        state.status = "running"
+        state.current_step = "create_worktree"
+        self.save_state(state)
+        return True
+
+    def _reset_candidate_steps_for_retry(self, state: RunState) -> None:
+        for step_name in ["create_worktree", "run_executor", "run_qc", "write_summary"]:
+            step = state.step(step_name)
+            if step.status != "pending":
+                step.status = "pending"
+            if step_name in {"run_executor", "run_qc", "write_summary"}:
+                step.error = None
+                step.exit_code = None
+                step.timed_out = False
+                step.stdout_path = None
+                step.stderr_path = None
 
     def _step_run_executor(self, state: RunState, step: StepState, span: dict[str, object]) -> None:
         task_text = render_task_text(Path(state.task_dir))
@@ -1194,6 +1301,7 @@ class WorkflowRunner:
             executor_bin=config.executor_bin,
             provider=config.provider,
             model=config.model,
+            candidate_chain=config.candidate_chain,
             task_type=config.task_type.strip() or "unspecified",
             base_ref=config.base_ref,
             purpose=config.purpose,
@@ -1813,6 +1921,7 @@ def config_to_dict(config: RunnerConfig) -> dict[str, object]:
         "executor_bin": config.executor_bin,
         "provider": config.provider,
         "model": config.model,
+        "candidate_chain": config.candidate_chain,
         "task_type": config.task_type,
         "base_ref": config.base_ref,
         "purpose": config.purpose,
@@ -1833,6 +1942,7 @@ def config_from_dict(data: dict[str, object], state_dir: Path) -> RunnerConfig:
         executor_bin=str(data.get("executor_bin") or "takt"),
         provider=str(data["provider"]) if data.get("provider") else None,
         model=str(data["model"]) if data.get("model") else None,
+        candidate_chain=_coerce_candidate_chain(data.get("candidate_chain")),
         task_type=str(data.get("task_type") or "unspecified"),
         base_ref=str(data["base_ref"]) if data.get("base_ref") else None,
         purpose=str(data.get("purpose") or "workflow"),
@@ -1851,6 +1961,7 @@ def runner_config_from_state(state: RunState, state_dir: Path) -> RunnerConfig:
         executor_bin=state.executor_bin,
         provider=state.provider,
         model=state.model,
+        candidate_chain=state.candidate_chain,
         task_type=state.task_type,
         base_ref=state.base_ref,
         purpose=state.purpose,

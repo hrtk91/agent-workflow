@@ -32,6 +32,7 @@ class LightweightRunnerTest(unittest.TestCase):
         self.state_dir = self.root / "state"
         self.repo = self._make_repo()
         self.fake_takt = self._make_fake_takt()
+        self.fake_candidate_takt = self._make_fake_candidate_takt()
         self.fake_notification_provider = self._make_fake_notification_provider()
 
     def tearDown(self) -> None:
@@ -399,6 +400,97 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertIn("qc_repair_attempts: `5/5`", summary_text)
         context = Path(state["task_dir"], "context.md").read_text()
         self.assertIn("QC repair loop 5/5", context)
+
+    def test_candidate_chain_switches_to_next_provider_on_executor_failure(self) -> None:
+        result = self._aw(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Use fallback provider after first provider fails.",
+            "--verify-command",
+            "true",
+            "--executor-bin",
+            str(self.fake_candidate_takt),
+            "--candidate",
+            "provider-fail:gpt-small",
+            "--candidate",
+            "provider-ok:gpt-large",
+            env={"FAKE_TAKT_FAIL_KEYS": "provider-fail:gpt-small:11"},
+        )
+
+        state = self._state(Path(result.stdout.strip()))
+        self.assertEqual("succeeded", state["status"])
+        self.assertEqual(1, state["candidate_index"])
+        self.assertEqual("provider-ok", state["provider"])
+        self.assertEqual("gpt-large", state["model"])
+        self.assertIn("-candidate-1", state["worktree_path"])
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        rows = conn.execute(
+            """
+            select attempt, status, candidate_index, candidate_provider, candidate_model, failure_category
+            from step_attempts
+            where run_id = ? and step_name = 'run_executor'
+            order by attempt
+            """,
+            (state["run_id"],),
+        ).fetchall()
+        self.assertEqual(
+            [
+                (1, "failed", 0, "provider-fail", "gpt-small", "provider_auth"),
+                (2, "succeeded", 1, "provider-ok", "gpt-large", None),
+            ],
+            rows,
+        )
+
+    def test_candidate_chain_exhaustion_sets_recovery_exhausted_once_and_persists(self) -> None:
+        result = self._aw(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--task-text",
+            "Try every candidate and persist recovery_exhausted when all fail.",
+            "--verify-command",
+            "true",
+            "--executor-bin",
+            str(self.fake_candidate_takt),
+            "--candidate",
+            "provider-a:gpt-a",
+            "--candidate",
+            "provider-b:gpt-b",
+            env={"FAKE_TAKT_FAIL_KEYS": "provider-a:gpt-a:12;provider-b:gpt-b:13"},
+            check=False,
+        )
+
+        self.assertEqual(1, result.returncode)
+        state = self._state(Path(result.stdout.strip()))
+        self.assertEqual("recovery_exhausted", state["status"])
+        self.assertEqual(1, state["candidate_index"])
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        rows = conn.execute(
+            """
+            select attempt, status, candidate_index, candidate_provider, candidate_model, failure_category
+            from step_attempts
+            where run_id = ? and step_name = 'run_executor'
+            order by attempt
+            """,
+            (state["run_id"],),
+        ).fetchall()
+        self.assertEqual(
+            [
+                (1, "failed", 0, "provider-a", "gpt-a", "provider_unavailable"),
+                (2, "failed", 1, "provider-b", "gpt-b", "provider_unavailable"),
+            ],
+            rows,
+        )
+
+        resumed = self._aw("resume", "--run-id", state["run_id"], check=False)
+        self.assertEqual(1, resumed.returncode)
+        resumed_state = self._state(Path(resumed.stdout.strip()))
+        self.assertEqual("recovery_exhausted", resumed_state["status"])
+        self.assertEqual(state["steps"], resumed_state["steps"])
 
     def test_qc_repair_budget_is_shared_across_resume(self) -> None:
         """Run-level QC repair budget must not reset when resume re-enters the loop."""
@@ -1696,6 +1788,84 @@ class LightweightRunnerTest(unittest.TestCase):
         subprocess.run(["git", "add", "."], cwd=repo, check=True)
         subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, stdout=subprocess.PIPE)
         return repo
+
+    def _make_fake_candidate_takt(self) -> Path:
+        path = self.root / "fake-candidate-takt"
+        path.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "provider=\"\"\n"
+            "model=\"\"\n"
+            "while [[ $# -gt 0 ]]; do\n"
+            "  case \"$1\" in\n"
+            "    --provider)\n"
+            "      provider=\"$2\"\n"
+            "      shift 2\n"
+            "      ;;\n"
+            "    --model)\n"
+            "      model=\"$2\"\n"
+            "      shift 2\n"
+            "      ;;\n"
+            "    *)\n"
+            "      shift\n"
+            "      ;;\n"
+            "  esac\n"
+            "done\n"
+            "if [[ \"${FAKE_TAKT_SLEEP:-}\" != \"\" ]]; then\n"
+            "  sleep \"$FAKE_TAKT_SLEEP\"\n"
+            "fi\n"
+            "if [[ \"${FAKE_TAKT_FAIL_KEYS:-}\" != \"\" ]]; then\n"
+            "  IFS=';' read -ra FAIL_ENTRIES <<< \"$FAKE_TAKT_FAIL_KEYS\"\n"
+            "  for entry in \"${FAIL_ENTRIES[@]}\"; do\n"
+            "    IFS=':' read -r fail_provider fail_model fail_exit <<< \"$entry\"\n"
+            "    if [[ \"$provider\" == \"$fail_provider\" && \"$model\" == \"$fail_model\" ]]; then\n"
+            "      exit ${fail_exit:-11}\n"
+            "    fi\n"
+            "  done\n"
+            "fi\n"
+            "if [[ \"${FAKE_TAKT_EXIT:-0}\" != \"0\" ]]; then\n"
+            "  exit \"$FAKE_TAKT_EXIT\"\n"
+            "fi\n"
+            "printf '%s\\n' \"$@\" > .candidate-takt.args\n"
+            "mkdir -p .takt/runs/fake-run/logs .takt/runs/fake-run/reports\n"
+            "cat > .takt/runs/fake-run/trace.md <<'TRACE'\n"
+            "# Execution Trace: default\n"
+            "- Started: 2026-01-01T00:00:00.000Z\n"
+            "- Ended: 2026-01-01T00:00:01.000Z\n"
+            "- Status: succeeded\n"
+            "- Iterations: 1\n"
+            "- Reason: complete\n"
+            "TRACE\n"
+            "cat > .takt/runs/fake-run/monitor.json <<'MONITOR'\n"
+            "{\n"
+            "  \"schemaVersion\": 1,\n"
+            "  \"scopeMetrics\": [\n"
+            "    {\n"
+            "      \"metrics\": [\n"
+            "        {\n"
+            "          \"name\": \"takt.workflow.runs\",\n"
+            "          \"points\": [\n"
+            "            {\"attributes\": {\"takt.workflow.status\": \"succeeded\"}, \"value\": 1}\n"
+            "          ]\n"
+            "        }\n"
+            "      ]\n"
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "MONITOR\n"
+            "echo ok > .fake-takt-attempted\n"
+            "cat > .takt/runs/fake-run/reports/00-analysis.md <<'ANALYSIS'\n"
+            "fixture analysis\n"
+            "ANALYSIS\n"
+            "cat > .takt/runs/fake-run/reports/01-implementation.md <<'IMPLEMENTATION'\n"
+            "fixture implementation\n"
+            "IMPLEMENTATION\n"
+            "echo ok > implemented.txt\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+        return path
 
     def _make_fake_takt(self) -> Path:
         path = self.root / "fake-takt"
