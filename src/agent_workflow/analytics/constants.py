@@ -1,6 +1,14 @@
 """分析データの保存・集計で共有する定数。"""
 
-TERMINAL_RUN_STATUSES = {"blocked", "failed", "interrupted", "qc_failed", "succeeded", "timed_out"}
+TERMINAL_RUN_STATUSES = {
+    "blocked",
+    "failed",
+    "interrupted",
+    "qc_failed",
+    "recovery_exhausted",
+    "succeeded",
+    "timed_out",
+}
 TERMINAL_STEP_STATUSES = TERMINAL_RUN_STATUSES
 
 GROUP_FIELDS = {
