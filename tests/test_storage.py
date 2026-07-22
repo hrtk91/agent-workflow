@@ -91,6 +91,79 @@ class RunStoreMigrationTest(unittest.TestCase):
             restored = store.load("run-with-budget")
             self.assertEqual(4, restored.qc_repair_attempts)
 
+    def test_candidate_chain_and_attempt_metadata_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            store = RunStore(state_dir)
+            store.initialize()
+            run_dir = state_dir / "runs" / "run-with-candidates"
+            task_dir = run_dir / "task"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.md").write_text("task\n", encoding="utf-8")
+            state = self._legacy_state(state_dir, "run-with-candidates")
+            state["status"] = "failed"
+            state["candidate_chain"] = [["provider-a", "gpt-a"], ["provider-b", "gpt-b"]]
+            state["candidate_index"] = 1
+            state["lineage_id"] = "lineage-xyz"
+            state["candidate_checkpoint"] = "lineage-xyz-candidate-1"
+            for step in state["steps"]:
+                if step["name"] == "run_executor":
+                    step["candidate_index"] = 1
+                    step["candidate_provider"] = "provider-b"
+                    step["candidate_model"] = "gpt-b"
+                    step["candidate_execution_id"] = "lineage-xyz:1:provider-b:gpt-b:1"
+                    step["status"] = "failed"
+                    step["exit_code"] = 12
+                    step["timed_out"] = False
+                    step["error"] = "provider unavailable"
+            loaded = RunState.from_dict(state)
+            store.save(loaded)
+
+            restored = store.load("run-with-candidates")
+            self.assertEqual([("provider-a", "gpt-a"), ("provider-b", "gpt-b")], restored.candidate_chain)
+            self.assertEqual(1, restored.candidate_index)
+            self.assertEqual("lineage-xyz", restored.lineage_id)
+            self.assertEqual("lineage-xyz-candidate-1", restored.candidate_checkpoint)
+
+            with sqlite3.connect(state_dir / "jobs.sqlite") as conn:
+                row = conn.execute(
+                    """
+                    select candidate_chain, candidate_index, lineage_id, candidate_checkpoint
+                    from runs where run_id = ?
+                    """,
+                    ("run-with-candidates",),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                attempts = conn.execute(
+                    """
+                    select candidate_index, candidate_provider, candidate_model, candidate_execution_id, failure_category
+                    from step_attempts
+                    where run_id = ? and step_name = 'run_executor'
+                    order by attempt
+                    """,
+                    ("run-with-candidates",),
+                ).fetchall()
+            self.assertIsNotNone(row[0])
+            self.assertEqual([["provider-a", "gpt-a"], ["provider-b", "gpt-b"]], json.loads(row[0]))
+            self.assertEqual("provider-b", attempts[0][1])
+            self.assertEqual("gpt-b", attempts[0][2])
+            self.assertEqual("lineage-xyz:1:provider-b:gpt-b:1", attempts[0][3])
+            self.assertEqual("provider_unavailable", attempts[0][4])
+
+    def test_legacy_row_without_candidate_chain_falls_back_to_provider_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            store = RunStore(state_dir)
+            store.initialize()
+            state = self._legacy_state(state_dir, "legacy-candidates")
+            loaded = RunState.from_dict(state)
+            store.save(loaded)
+            with sqlite3.connect(state_dir / "jobs.sqlite") as conn:
+                conn.execute("update runs set candidate_chain = NULL where run_id = ?", ("legacy-candidates",))
+                conn.commit()
+            restored = store.load("legacy-candidates")
+            self.assertEqual([("openai", "gpt-state")], restored.candidate_chain)
+
     @staticmethod
     def _legacy_state(state_dir: Path, run_id: str) -> dict[str, object]:
         run_dir = state_dir / "runs" / run_id

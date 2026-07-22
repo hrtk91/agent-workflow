@@ -84,11 +84,12 @@ class RunStore:
                 """
                 insert into runs(
                   run_id, status, repo_path, workflow, verify_command, timeout_seconds,
-                  executor_bin, provider, model, task_type, base_ref, purpose,
+                  executor_bin, provider, model, candidate_chain, candidate_index, lineage_id,
+                  candidate_checkpoint, task_type, base_ref, purpose,
                   repair_for_run_id, worktree_path, current_step, summary_path, qc_repair_attempts,
                   created_at, updated_at, finished_at, elapsed_seconds,
                   task_sha256, task_bytes, changed_files, additions, deletions
-                ) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(run_id) do update set
                   status=excluded.status,
                   repo_path=excluded.repo_path,
@@ -98,6 +99,10 @@ class RunStore:
                   executor_bin=excluded.executor_bin,
                   provider=excluded.provider,
                   model=excluded.model,
+                  candidate_chain=excluded.candidate_chain,
+                  candidate_index=excluded.candidate_index,
+                  lineage_id=excluded.lineage_id,
+                  candidate_checkpoint=excluded.candidate_checkpoint,
                   task_type=excluded.task_type,
                   base_ref=excluded.base_ref,
                   purpose=excluded.purpose,
@@ -125,6 +130,10 @@ class RunStore:
                     state.executor_bin,
                     state.provider,
                     state.model,
+                    json.dumps(state.candidate_chain, ensure_ascii=False),
+                    state.candidate_index,
+                    state.lineage_id,
+                    state.candidate_checkpoint,
                     state.task_type,
                     state.base_ref,
                     state.purpose,
@@ -177,6 +186,16 @@ class RunStore:
         steps = [self._step_from_row(item) for item in step_rows]
         if not steps:
             steps = [StepState(name=name) for name in WORKFLOW_STEPS]
+        candidate_chain = _decode_candidate_chain(row)
+        if not candidate_chain:
+            candidate_chain = [(_coalesce_optional(row["provider"]), _coalesce_optional(row["model"]))]
+        candidate_index = int(row["candidate_index"] or 0)
+        if candidate_chain:
+            candidate_count = len(candidate_chain)
+            if candidate_index < 0:
+                candidate_index = 0
+            elif candidate_index >= candidate_count:
+                candidate_index = max(candidate_count - 1, 0)
         # [3] task・summaryなどimmutable artifact pathはrun IDから導出する。
         return RunState(
             run_id=str(row["run_id"]),
@@ -190,6 +209,10 @@ class RunStore:
             executor_bin=str(row["executor_bin"]),
             provider=str(row["provider"]) if row["provider"] is not None else None,
             model=str(row["model"]) if row["model"] is not None else None,
+            candidate_chain=candidate_chain,
+            candidate_index=candidate_index,
+            candidate_checkpoint=str(row["candidate_checkpoint"] or ""),
+            lineage_id=str(row["lineage_id"] or row["run_id"]),
             task_type=str(row["task_type"]),
             base_ref=str(row["base_ref"]) if row["base_ref"] is not None else None,
             purpose=str(row["purpose"]),
@@ -244,13 +267,20 @@ class RunStore:
         )
 
     def _upsert_step_attempt(self, conn: sqlite3.Connection, run_id: str, step: StepState) -> None:
-        category = failure_category(step.name, step.status, step.timed_out)
+        category = failure_category(
+            step_name=step.name,
+            status=step.status,
+            timed_out=step.timed_out,
+            error=step.error,
+            exit_code=step.exit_code,
+        )
         conn.execute(
             """
             insert into step_attempts(
               run_id, step_name, attempt, status, started_at, finished_at, duration_seconds,
-              exit_code, timed_out, error, failure_category, stdout_path, stderr_path
-            ) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              exit_code, timed_out, error, failure_category, stdout_path, stderr_path,
+              candidate_index, candidate_provider, candidate_model, candidate_execution_id
+            ) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(run_id, step_name, attempt) do update set
               status=excluded.status,
               started_at=coalesce(step_attempts.started_at, excluded.started_at),
@@ -261,7 +291,11 @@ class RunStore:
               error=excluded.error,
               failure_category=excluded.failure_category,
               stdout_path=excluded.stdout_path,
-              stderr_path=excluded.stderr_path
+              stderr_path=excluded.stderr_path,
+              candidate_index=excluded.candidate_index,
+              candidate_provider=excluded.candidate_provider,
+              candidate_model=excluded.candidate_model,
+              candidate_execution_id=excluded.candidate_execution_id
             """,
             (
                 run_id,
@@ -277,6 +311,10 @@ class RunStore:
                 category,
                 step.stdout_path,
                 step.stderr_path,
+                step.candidate_index,
+                step.candidate_provider,
+                step.candidate_model,
+                step.candidate_execution_id,
             ),
         )
 
@@ -321,12 +359,14 @@ class RunStore:
                         error=str(row[7]) if row[7] is not None else None,
                         stdout_path=str(row[8]) if row[8] is not None else None,
                         stderr_path=str(row[9]) if row[9] is not None else None,
+                        candidate_index=None,
                     )
                 # [3] 全stepを固定順で揃え、未実行stepも明示的にpendingとする。
                 self._upsert_run_step(conn, run_id, position, step)
 
     @staticmethod
     def _step_from_row(row: sqlite3.Row) -> StepState:
+        keys = set(row.keys())
         return StepState(
             name=str(row["step_name"]),
             status=str(row["status"]),
@@ -338,6 +378,24 @@ class RunStore:
             error=str(row["error"]) if row["error"] is not None else None,
             stdout_path=str(row["stdout_path"]) if row["stdout_path"] is not None else None,
             stderr_path=str(row["stderr_path"]) if row["stderr_path"] is not None else None,
+            candidate_index=(
+                int(row["candidate_index"])
+                if "candidate_index" in keys and row["candidate_index"] is not None
+                else None
+            ),
+            candidate_provider=(
+                str(row["candidate_provider"])
+                if "candidate_provider" in keys and row["candidate_provider"] is not None
+                else None
+            ),
+            candidate_model=(
+                str(row["candidate_model"]) if "candidate_model" in keys and row["candidate_model"] is not None else None
+            ),
+            candidate_execution_id=(
+                str(row["candidate_execution_id"])
+                if "candidate_execution_id" in keys and row["candidate_execution_id"] is not None
+                else None
+            ),
         )
 
     def _db(self) -> sqlite3.Connection:
@@ -345,3 +403,30 @@ class RunStore:
         conn.execute("pragma journal_mode=wal")
         conn.execute("pragma foreign_keys=on")
         return conn
+
+
+def _decode_candidate_chain(row: sqlite3.Row) -> list[tuple[str | None, str | None]]:
+    raw = row["candidate_chain"]
+    if not raw:
+        return []
+    try:
+        chain = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(chain, list):
+        return []
+    parsed: list[tuple[str | None, str | None]] = []
+    for item in chain:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            parsed.append((
+                str(item[0]) if item[0] is not None else None,
+                str(item[1]) if item[1] is not None else None,
+            ))
+    return parsed
+
+
+def _coalesce_optional(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
