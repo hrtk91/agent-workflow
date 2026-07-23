@@ -85,7 +85,7 @@ class WorkflowRunner:
         self.run_store.initialize()
         self._init_db()
 
-    def run_new(self, config: RunnerConfig) -> RunState:
+    def run_new(self, config: RunnerConfig, queue_job_id: str | None = None) -> RunState:
         config = self._normalize_config(config)
         if config.repo_path is None:
             raise ValueError("--repo is required")
@@ -111,6 +111,7 @@ class WorkflowRunner:
             task_type=config.task_type,
             base_ref=config.base_ref,
             purpose=config.purpose,
+            queue_job_id=queue_job_id,
             repair_for_run_id=config.repair_for_run_id,
             summary_path=str(summary_path),
             created_at=now,
@@ -253,7 +254,7 @@ class WorkflowRunner:
         if config is None:
             config = self._load_claimed_queue_config(job_id)
         try:
-            state = self.run_new(config)
+            state = self.run_new(config, queue_job_id=job_id)
             self._finish_queue_job(job_id, state.status, state.run_id, state.summary_path, "")
             result = {"job_id": job_id, "status": state.status, "run_id": state.run_id, "summary_path": state.summary_path}
             try:
@@ -402,45 +403,55 @@ class WorkflowRunner:
             queue_rows = conn.execute("select job_id, run_id from queue where status = 'running'").fetchall()
         handled_run_ids: set[str] = set()
         for job_id, linked_run_id in queue_rows:
-            if linked_run_id:
-                run_id = str(linked_run_id)
-                handled_run_ids.add(run_id)
-                try:
-                    state = self.load_state(run_id)
-                except FileNotFoundError:
-                    with self._db() as conn:
-                        conn.execute(
-                            """
-                            update queue
-                            set status = 'failed', error = ?, updated_at = ?
-                            where job_id = ?
-                            """,
-                            (error, utc_now(), job_id),
-                        )
-                    recovered += 1
-                    continue
-                if state.status == "running":
-                    state.status = "failed"
-                    if state.current_step:
-                        for step in state.steps:
-                            if step.name == state.current_step and step.status == "running":
-                                step.status = "failed"
-                                step.error = error
-                                step.finished_at = utc_now()
-                                break
-                    self._finalize_failed_summary(state)
-                self._finish_queue_job(job_id, state.status, state.run_id, state.summary_path, "")
+            run_id = str(linked_run_id) if linked_run_id else None
+            if run_id is None:
+                with self._db() as conn:
+                    linked_by_job = conn.execute(
+                        "select run_id from runs where queue_job_id = ?",
+                        (job_id,),
+                    ).fetchone()
+                if linked_by_job is not None and linked_by_job[0] is not None:
+                    run_id = str(linked_by_job[0])
+
+            if run_id is None:
+                with self._db() as conn:
+                    conn.execute(
+                        """
+                        update queue
+                        set status = 'failed', error = ?, updated_at = ?
+                        where job_id = ?
+                        """,
+                        (error, utc_now(), job_id),
+                    )
                 recovered += 1
                 continue
-            with self._db() as conn:
-                conn.execute(
-                    """
-                    update queue
-                    set status = 'failed', error = ?, updated_at = ?
-                    where job_id = ?
-                    """,
-                    (error, utc_now(), job_id),
-                )
+
+            handled_run_ids.add(run_id)
+            try:
+                state = self.load_state(run_id)
+            except FileNotFoundError:
+                with self._db() as conn:
+                    conn.execute(
+                        """
+                        update queue
+                        set status = 'failed', error = ?, updated_at = ?
+                        where job_id = ?
+                        """,
+                        (error, utc_now(), job_id),
+                    )
+                recovered += 1
+                continue
+            if state.status == "running":
+                state.status = "failed"
+                if state.current_step:
+                    for step in state.steps:
+                        if step.name == state.current_step and step.status == "running":
+                            step.status = "failed"
+                            step.error = error
+                            step.finished_at = utc_now()
+                            break
+                self._finalize_failed_summary(state)
+            self._finish_queue_job(job_id, state.status, state.run_id, state.summary_path, "")
             recovered += 1
         return recovered
 

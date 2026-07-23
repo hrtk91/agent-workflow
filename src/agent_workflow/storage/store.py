@@ -85,10 +85,10 @@ class RunStore:
                 insert into runs(
                   run_id, status, repo_path, workflow, verify_command, timeout_seconds,
                   executor_bin, provider, model, task_type, base_ref, purpose,
-                  repair_for_run_id, worktree_path, current_step, summary_path, qc_repair_attempts,
+                  repair_for_run_id, queue_job_id, worktree_path, current_step, summary_path, qc_repair_attempts,
                   created_at, updated_at, finished_at, elapsed_seconds,
                   task_sha256, task_bytes, changed_files, additions, deletions
-                ) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(run_id) do update set
                   status=excluded.status,
                   repo_path=excluded.repo_path,
@@ -101,6 +101,7 @@ class RunStore:
                   task_type=excluded.task_type,
                   base_ref=excluded.base_ref,
                   purpose=excluded.purpose,
+                  queue_job_id=excluded.queue_job_id,
                   repair_for_run_id=excluded.repair_for_run_id,
                   worktree_path=excluded.worktree_path,
                   current_step=excluded.current_step,
@@ -129,6 +130,7 @@ class RunStore:
                     state.base_ref,
                     state.purpose,
                     state.repair_for_run_id,
+                    state.queue_job_id,
                     state.worktree_path,
                     state.current_step,
                     state.summary_path,
@@ -194,6 +196,7 @@ class RunStore:
             base_ref=str(row["base_ref"]) if row["base_ref"] is not None else None,
             purpose=str(row["purpose"]),
             repair_for_run_id=str(row["repair_for_run_id"]) if row["repair_for_run_id"] is not None else None,
+            queue_job_id=str(row["queue_job_id"]) if row["queue_job_id"] is not None else None,
             worktree_path=str(row["worktree_path"]) if row["worktree_path"] is not None else None,
             summary_path=str(row["summary_path"] or run_dir / "summary.md"),
             current_step=str(row["current_step"]) if row["current_step"] is not None else None,

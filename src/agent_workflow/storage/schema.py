@@ -39,6 +39,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
           base_ref text,
           purpose text not null,
           repair_for_run_id text,
+          queue_job_id text,
           worktree_path text,
           current_step text,
           summary_path text not null,
@@ -104,6 +105,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "step_attempts", "stdout_path", "text")
     ensure_column(conn, "step_attempts", "stderr_path", "text")
     ensure_column(conn, "runs", "qc_repair_attempts", "integer not null default 0")
+    ensure_column(conn, "runs", "queue_job_id", "text")
 
     # [2] 分析tableしか残っていないrunも参照可能なraw runへ移す。
     if table_exists(conn, "run_metrics"):

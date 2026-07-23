@@ -91,6 +91,18 @@ class RunStoreMigrationTest(unittest.TestCase):
             restored = store.load("run-with-budget")
             self.assertEqual(4, restored.qc_repair_attempts)
 
+    def test_queue_job_id_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            store = RunStore(state_dir)
+            store.initialize()
+            state = RunState.from_dict(self._legacy_state(state_dir, "run-with-queue"))
+            state.queue_job_id = "job-abc123"
+            store.save(state)
+
+            restored = store.load("run-with-queue")
+            self.assertEqual("job-abc123", restored.queue_job_id)
+
     @staticmethod
     def _legacy_state(state_dir: Path, run_id: str) -> dict[str, object]:
         run_dir = state_dir / "runs" / run_id

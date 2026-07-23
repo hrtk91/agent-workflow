@@ -42,6 +42,7 @@ class RunState:
     base_ref: str | None = None
     purpose: str = "workflow"
     repair_for_run_id: str | None = None
+    queue_job_id: str | None = None
     worktree_path: str | None = None
     summary_path: str = ""
     current_step: str | None = None

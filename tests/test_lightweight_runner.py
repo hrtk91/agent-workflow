@@ -1700,6 +1700,49 @@ class LightweightRunnerTest(unittest.TestCase):
         recovered_again = runner.recover_stale_running("idempotency")
         self.assertEqual(0, recovered_again)
 
+    def test_recover_stale_running_uses_queue_job_link_to_recover_running_row(self) -> None:
+        runner = WorkflowRunner(self.state_dir)
+        stale_parent_job = runner.enqueue(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.repo,
+                task_text="stale parent queue row should recover via explicit queue_job_id",
+                verify_command="test -f implemented.txt",
+                executor_bin=str(self.fake_takt),
+            )
+        )
+        linked_run = runner.run_new(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.repo,
+                task_text="linked completed run",
+                verify_command="test -f implemented.txt",
+                executor_bin=str(self.fake_takt),
+            ),
+            queue_job_id=stale_parent_job,
+        )
+        with sqlite3.connect(self.state_dir / "jobs.sqlite") as conn:
+            conn.execute(
+                "update queue set status='running', run_id=null, summary_path=null, error=null, updated_at=? where job_id = ?",
+                ("2026-01-01T00:00:00+00:00", stale_parent_job),
+            )
+
+        recovered = runner.recover_stale_running("linked queue job id should recover deterministic state")
+        self.assertEqual(1, recovered)
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        queue_row = conn.execute(
+            "select status, run_id, summary_path, error from queue where job_id = ?",
+            (stale_parent_job,),
+        ).fetchone()
+        run_row = conn.execute(
+            "select queue_job_id from runs where run_id = ?",
+            (linked_run.run_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(stale_parent_job, run_row[0])
+        self.assertEqual((linked_run.status, linked_run.run_id, linked_run.summary_path, ""), queue_row)
+
     def test_recover_stale_running_stale_unlinked_parent_does_not_fail_unrelated_run(self) -> None:
         runner = WorkflowRunner(self.state_dir)
         orphan_run = RunState(
