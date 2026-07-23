@@ -442,24 +442,6 @@ class WorkflowRunner:
                     (error, utc_now(), job_id),
                 )
             recovered += 1
-        if handled_run_ids:
-            return recovered
-        if not queue_rows:
-            return recovered
-        with self._db() as conn:
-            rows = conn.execute("select run_id from runs where status = 'running'").fetchall()
-        if len(rows) == 1:
-            state = self.load_state(str(rows[0][0]))
-            state.status = "failed"
-            if state.current_step:
-                for step in state.steps:
-                    if step.name == state.current_step and step.status == "running":
-                        step.status = "failed"
-                        step.error = error
-                        step.finished_at = utc_now()
-                        break
-            self._finalize_failed_summary(state)
-            recovered += 1
         return recovered
 
     def resume(self, run_id: str, verify_command: str | None = None, timeout_seconds: float | None = None) -> RunState:

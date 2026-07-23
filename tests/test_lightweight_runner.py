@@ -1636,6 +1636,8 @@ class LightweightRunnerTest(unittest.TestCase):
         ).fetchone()
         conn.close()
         self.assertEqual(("running", "run_executor"), run_row)
+        recovered_again = runner.recover_stale_running("idempotency")
+        self.assertEqual(0, recovered_again)
 
     def test_recover_stale_running_reconciles_parent_without_run_id_and_completed_child(self) -> None:
         runner = WorkflowRunner(self.state_dir)
@@ -1695,6 +1697,63 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertEqual(("failed", None, None, "completed child run with missing parent run_id should not be guessed"), parent_row)
         self.assertEqual((completed_child.status, completed_child.run_id, completed_child.summary_path), sibling_row)
 
+        recovered_again = runner.recover_stale_running("idempotency")
+        self.assertEqual(0, recovered_again)
+
+    def test_recover_stale_running_stale_unlinked_parent_does_not_fail_unrelated_run(self) -> None:
+        runner = WorkflowRunner(self.state_dir)
+        orphan_run = RunState(
+            run_id="stale-unlinked-orphan",
+            status="running",
+            repo_path=str(self.repo.resolve()),
+            run_dir=str(self.state_dir / "runs" / "stale-unlinked-orphan"),
+            task_dir=str(self.state_dir / "runs" / "stale-unlinked-orphan" / "task"),
+            workflow="default",
+            verify_command="test -f implemented.txt",
+            timeout_seconds=0.1,
+            executor_bin=str(self.fake_takt),
+            summary_path=str(self.state_dir / "runs" / "stale-unlinked-orphan" / "summary.md"),
+            current_step="run_executor",
+            created_at="2026-01-01T00:00:01+00:00",
+            updated_at="2026-01-01T00:00:01+00:00",
+            steps=[
+                StepState(name=name, status=("running" if name == "run_executor" else "pending"))
+                for name in ["load_task", "create_worktree", "run_executor", "run_qc", "write_summary"]
+            ],
+        )
+        Path(orphan_run.task_dir).mkdir(parents=True, exist_ok=True)
+        Path(orphan_run.task_dir, "task.md").write_text("task\n", encoding="utf-8")
+        runner.save_state(orphan_run)
+
+        stale_job = runner.enqueue(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.repo,
+                task_text="parent queue job left running without run_id",
+                verify_command="test -f implemented.txt",
+                executor_bin=str(self.fake_takt),
+            )
+        )
+        with sqlite3.connect(self.state_dir / "jobs.sqlite") as conn:
+            conn.execute(
+                "update queue set status='running', run_id=null, summary_path=null, error=null, updated_at=? where job_id = ?",
+                ("2026-01-01T00:00:00+00:00", stale_job),
+            )
+
+        recovered = runner.recover_stale_running("unlinked stale queue should be deterministic")
+        self.assertEqual(1, recovered)
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        queue_row = conn.execute(
+            "select status, run_id, summary_path, error from queue where job_id = ?",
+            (stale_job,),
+        ).fetchone()
+        run_row = conn.execute(
+            "select status, current_step from runs where run_id = ?",
+            (orphan_run.run_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(("failed", None, None, "unlinked stale queue should be deterministic"), queue_row)
+        self.assertEqual(("running", "run_executor"), run_row)
         recovered_again = runner.recover_stale_running("idempotency")
         self.assertEqual(0, recovered_again)
 
