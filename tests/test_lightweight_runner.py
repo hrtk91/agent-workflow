@@ -1255,6 +1255,161 @@ class LightweightRunnerTest(unittest.TestCase):
         status_after = self._aw("status")
         self.assertIn(f"job\t{job_id}\tfailed", status_after.stdout)
 
+    def test_claim_stores_run_id_before_run_and_updates_queue_by_link(self) -> None:
+        runner = WorkflowRunner(self.state_dir)
+        job_id = runner.enqueue(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.repo,
+                task_text="Queue this fixture task and verify run_id linkage.",
+                verify_command="test -f implemented.txt",
+                executor_bin=str(self.fake_takt),
+            )
+        )
+        claimed = runner._claim_next_job()
+        self.assertIsNotNone(claimed)
+        claimed_job_id, config = claimed
+        self.assertEqual(job_id, claimed_job_id)
+        self.assertIsNotNone(config.run_id)
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        row = conn.execute("select status, run_id from queue where job_id = ?", (job_id,)).fetchone()
+        conn.close()
+        self.assertEqual(("running", config.run_id), row)
+
+        result = runner.run_claimed_job(job_id, config)
+        self.assertEqual("succeeded", result["status"])
+        self.assertEqual(config.run_id, result["run_id"])
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        row = conn.execute(
+            "select status, run_id, summary_path from queue where job_id = ?",
+            (job_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual((result["status"], result["run_id"], result["summary_path"]), row)
+
+    def test_recover_stale_running_reconciles_queue_with_completed_run(self) -> None:
+        runner = WorkflowRunner(self.state_dir)
+        completed = runner.run_new(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.repo,
+                task_text="Completed run for stale queue reconciliation.",
+                verify_command="test -f implemented.txt",
+                executor_bin=str(self.fake_takt),
+            )
+        )
+        job_id = runner.enqueue(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.repo,
+                task_text="stale queue row",
+                verify_command="test -f implemented.txt",
+                executor_bin=str(self.fake_takt),
+            )
+        )
+        with sqlite3.connect(self.state_dir / "jobs.sqlite") as conn:
+            conn.execute(
+                """
+                update queue
+                set status = 'running', run_id = ?, summary_path = ?, error = null, updated_at = ?
+                where job_id = ?
+                """,
+                (completed.run_id, completed.summary_path, completed.updated_at, job_id),
+            )
+
+        recovered = runner.recover_stale_running("stale queue rows should be reconciled")
+        self.assertEqual(1, recovered)
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        row = conn.execute(
+            "select status, run_id, summary_path, error from queue where job_id = ?",
+            (job_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual((completed.status, completed.run_id, completed.summary_path, ""), row)
+
+    def test_recover_stale_running_targets_linked_run_id_not_repo_guess(self) -> None:
+        runner = WorkflowRunner(self.state_dir)
+        victim_run = RunState(
+            run_id="stale-linked-victim",
+            status="running",
+            repo_path=str(self.repo.resolve()),
+            run_dir=str(self.state_dir / "runs" / "stale-linked-victim"),
+            task_dir=str(self.state_dir / "runs" / "stale-linked-victim" / "task"),
+            workflow="default",
+            verify_command="test -f implemented.txt",
+            timeout_seconds=0.1,
+            executor_bin=str(self.fake_takt),
+            summary_path=str(self.state_dir / "runs" / "stale-linked-victim" / "summary.md"),
+            current_step="run_executor",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:01+00:00",
+            steps=[
+                StepState(name=name, status=("running" if name == "run_executor" else "pending"))
+                for name in ["load_task", "create_worktree", "run_executor", "run_qc", "write_summary"]
+            ],
+        )
+        survivor_run = RunState(
+            run_id="stale-linked-survivor",
+            status="running",
+            repo_path=str(self.repo.resolve()),
+            run_dir=str(self.state_dir / "runs" / "stale-linked-survivor"),
+            task_dir=str(self.state_dir / "runs" / "stale-linked-survivor" / "task"),
+            workflow="default",
+            verify_command="test -f implemented.txt",
+            timeout_seconds=0.1,
+            executor_bin=str(self.fake_takt),
+            summary_path=str(self.state_dir / "runs" / "stale-linked-survivor" / "summary.md"),
+            current_step="run_executor",
+            created_at="2026-01-01T00:00:02+00:00",
+            updated_at="2026-01-01T00:00:03+00:00",
+            steps=[
+                StepState(name=name, status=("running" if name == "run_executor" else "pending"))
+                for name in ["load_task", "create_worktree", "run_executor", "run_qc", "write_summary"]
+            ],
+        )
+        Path(victim_run.task_dir).mkdir(parents=True, exist_ok=True)
+        Path(victim_run.task_dir, "task.md").write_text("task\n", encoding="utf-8")
+        Path(survivor_run.task_dir).mkdir(parents=True, exist_ok=True)
+        Path(survivor_run.task_dir, "task.md").write_text("task\n", encoding="utf-8")
+        runner.save_state(victim_run)
+        runner.save_state(survivor_run)
+
+        job_id = runner.enqueue(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.repo,
+                task_text="link to victim run",
+                verify_command="test -f implemented.txt",
+                executor_bin=str(self.fake_takt),
+            )
+        )
+        with sqlite3.connect(self.state_dir / "jobs.sqlite") as conn:
+            conn.execute(
+                "update queue set status = 'running', run_id = ? where job_id = ?",
+                (victim_run.run_id, job_id),
+            )
+
+        recovered = runner.recover_stale_running("target linked run")
+        self.assertEqual(1, recovered)
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        queue_row = conn.execute("select status, run_id from queue where job_id = ?", (job_id,)).fetchone()
+        victim_row = conn.execute(
+            "select status, current_step from runs where run_id = ?",
+            (victim_run.run_id,),
+        ).fetchone()
+        survivor_row = conn.execute(
+            "select status, current_step from runs where run_id = ?",
+            (survivor_run.run_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(("failed", victim_run.run_id), queue_row)
+        self.assertEqual(("failed", "run_executor"), victim_row)
+        self.assertEqual(("running", "run_executor"), survivor_row)
+
     def test_worker_active_child_timeout_predicate(self) -> None:
         runner = WorkflowRunner(self.state_dir)
         process = subprocess.Popen(["sleep", "0.1"], start_new_session=True)
