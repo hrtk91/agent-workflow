@@ -1371,8 +1371,6 @@ class WorkflowRunner:
             )
 
     def _fail_running_worker_child(self, job_id: str, child: ActiveWorkerJob, error: str) -> None:
-        self._fail_running_queue_job(job_id, error)
-        run_id: str | None = None
         with self._db() as conn:
             row = conn.execute(
                 """
@@ -1382,25 +1380,8 @@ class WorkflowRunner:
                 """,
                 (job_id,),
             ).fetchone()
-        if row is not None and row[0]:
-            run_id = str(row[0])
-
-        if run_id is None:
-            with self._db() as conn:
-                row = conn.execute(
-                    """
-                    select run_id
-                    from runs
-                    where status = 'running'
-                      and repo_path = ?
-                      and created_at >= ?
-                    order by created_at
-                    limit 1
-                    """,
-                    (child.repo_key, child.started_at_utc),
-                ).fetchone()
-            if row is not None:
-                run_id = str(row[0])
+        run_id = str(row[0]) if row and row[0] else None
+        self._fail_running_queue_job(job_id, error)
         if run_id is None:
             return
         try:

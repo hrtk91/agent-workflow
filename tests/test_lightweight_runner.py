@@ -1524,6 +1524,15 @@ class LightweightRunnerTest(unittest.TestCase):
         Path(state.task_dir).mkdir(parents=True)
         Path(state.task_dir, "task.md").write_text("task\n", encoding="utf-8")
         runner.save_state(state)
+        with sqlite3.connect(self.state_dir / "jobs.sqlite") as conn:
+            conn.execute(
+                """
+                update queue
+                set status='running', run_id=?, summary_path=?, error = null, updated_at=?
+                where job_id = ?
+                """,
+                (state.run_id, state.summary_path, "2026-01-01T00:00:00+00:00", job_id),
+            )
         process = subprocess.Popen(["sleep", "0.1"], start_new_session=True)
         self.addCleanup(process.wait)
         self.addCleanup(lambda: process.poll() is None and process.kill())
@@ -1555,6 +1564,139 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertEqual("timed_out", run_executor["status"])
         self.assertTrue(run_executor["timed_out"])
         self.assertEqual(error, run_executor["error"])
+
+    def test_worker_child_timeout_without_linked_run_id_fails_queue_only(self) -> None:
+        runner = WorkflowRunner(self.state_dir)
+        job_id = runner.enqueue(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.repo,
+                task_text="Queue this fixture task with an unrelated running run.",
+                verify_command="test -f implemented.txt",
+                executor_bin=str(self.fake_takt),
+                timeout_seconds=0.1,
+            )
+        )
+        orphan_run = RunState(
+            run_id="running-orphan-run",
+            status="running",
+            repo_path=str(self.repo.resolve()),
+            run_dir=str(self.state_dir / "runs" / "running-orphan-run"),
+            task_dir=str(self.state_dir / "runs" / "running-orphan-run" / "task"),
+            workflow="default",
+            verify_command="test -f implemented.txt",
+            timeout_seconds=0.1,
+            executor_bin=str(self.fake_takt),
+            summary_path=str(self.state_dir / "runs" / "running-orphan-run" / "summary.md"),
+            current_step="run_executor",
+            created_at="2026-01-01T00:00:01+00:00",
+            updated_at="2026-01-01T00:00:01+00:00",
+            steps=[
+                StepState(name=name, status=("running" if name == "run_executor" else "pending"))
+                for name in ["load_task", "create_worktree", "run_executor", "run_qc", "write_summary"]
+            ],
+        )
+        Path(orphan_run.task_dir).mkdir(parents=True)
+        Path(orphan_run.task_dir, "task.md").write_text("task\n", encoding="utf-8")
+        runner.save_state(orphan_run)
+        with sqlite3.connect(self.state_dir / "jobs.sqlite") as conn:
+            conn.execute(
+                "update queue set status='running', run_id=null, summary_path=null, error=null, updated_at=? where job_id = ?",
+                ("2026-01-01T00:00:00+00:00", job_id),
+            )
+        process = subprocess.Popen(["sleep", "0.1"], start_new_session=True)
+        self.addCleanup(process.wait)
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+
+        child = ActiveWorkerJob(
+            process=process,
+            repo_key=str(self.repo.resolve()),
+            started_at=0,
+            started_at_utc="2026-01-01T00:00:00+00:00",
+            timeout_seconds=0.1,
+        )
+        error = "worker child exceeded timeout_seconds=0.1"
+
+        runner._fail_running_worker_child(job_id, child, error)
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        queue_row = conn.execute(
+            "select status, run_id, summary_path, error from queue where job_id = ?",
+            (job_id,),
+        ).fetchone()
+        self.assertEqual(("failed", None, None, error), queue_row)
+        conn.close()
+
+        recovered = runner.recover_stale_running("timeout fallback should remain deterministic")
+        self.assertEqual(0, recovered)
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        run_row = conn.execute(
+            "select status, current_step from runs where run_id = ?",
+            (orphan_run.run_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(("running", "run_executor"), run_row)
+
+    def test_recover_stale_running_reconciles_parent_without_run_id_and_completed_child(self) -> None:
+        runner = WorkflowRunner(self.state_dir)
+        completed_child = runner.run_new(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.repo,
+                task_text="completed child run for stale-parent reproduction",
+                verify_command="test -f implemented.txt",
+                executor_bin=str(self.fake_takt),
+            )
+        )
+        stale_parent_job = runner.enqueue(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.repo,
+                task_text="parent queue job with missing run_id",
+                verify_command="test -f implemented.txt",
+                executor_bin=str(self.fake_takt),
+            )
+        )
+        sibling_job = runner.enqueue(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.repo,
+                task_text="linked sibling queue row",
+                verify_command="test -f implemented.txt",
+                executor_bin=str(self.fake_takt),
+            )
+        )
+        with sqlite3.connect(self.state_dir / "jobs.sqlite") as conn:
+            conn.execute(
+                "update queue set status='running', run_id=null, error=null, updated_at=? where job_id = ?",
+                ("2026-01-01T00:00:00+00:00", stale_parent_job),
+            )
+            conn.execute(
+                """
+                update queue
+                set status='running', run_id=?, summary_path=?, error=null, updated_at=?
+                where job_id = ?
+                """,
+                (completed_child.run_id, completed_child.summary_path, "2026-01-01T00:00:01+00:00", sibling_job),
+            )
+
+        recovered = runner.recover_stale_running("completed child run with missing parent run_id should not be guessed")
+        self.assertEqual(2, recovered)
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        parent_row = conn.execute(
+            "select status, run_id, summary_path, error from queue where job_id = ?",
+            (stale_parent_job,),
+        ).fetchone()
+        sibling_row = conn.execute(
+            "select status, run_id, summary_path from queue where job_id = ?",
+            (sibling_job,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(("failed", None, None, "completed child run with missing parent run_id should not be guessed"), parent_row)
+        self.assertEqual((completed_child.status, completed_child.run_id, completed_child.summary_path), sibling_row)
+
+        recovered_again = runner.recover_stale_running("idempotency")
+        self.assertEqual(0, recovered_again)
 
     def test_auto_repair_scan_skips_repair_action_failures(self) -> None:
         runner = WorkflowRunner(self.state_dir)
