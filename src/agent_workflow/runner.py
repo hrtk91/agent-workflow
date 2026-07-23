@@ -42,6 +42,7 @@ class RunnerConfig:
     model: str | None = None
     task_type: str = "unspecified"
     base_ref: str | None = None
+    run_id: str | None = None
     purpose: str = "workflow"
     repair_for_run_id: str | None = None
 
@@ -90,7 +91,7 @@ class WorkflowRunner:
             raise ValueError("--repo is required")
         if not config.verify_command:
             raise ValueError("--verify-command is required; QC must be explicit")
-        run_id = new_run_id()
+        run_id = config.run_id or new_run_id()
         run_dir = self.runs_dir / run_id
         task_dir = run_dir / "task"
         summary_path = run_dir / "summary.md"
@@ -398,13 +399,57 @@ class WorkflowRunner:
     def recover_stale_running(self, error: str) -> int:
         recovered = 0
         with self._db() as conn:
-            rows = conn.execute("select run_id from runs where status = 'running'").fetchall()
-        for row in rows:
-            run_id = str(row[0])
-            try:
-                state = self.load_state(run_id)
-            except FileNotFoundError:
+            queue_rows = conn.execute("select job_id, run_id from queue where status = 'running'").fetchall()
+        handled_run_ids: set[str] = set()
+        for job_id, linked_run_id in queue_rows:
+            if linked_run_id:
+                run_id = str(linked_run_id)
+                handled_run_ids.add(run_id)
+                try:
+                    state = self.load_state(run_id)
+                except FileNotFoundError:
+                    with self._db() as conn:
+                        conn.execute(
+                            """
+                            update queue
+                            set status = 'failed', error = ?, updated_at = ?
+                            where job_id = ?
+                            """,
+                            (error, utc_now(), job_id),
+                        )
+                    recovered += 1
+                    continue
+                if state.status == "running":
+                    state.status = "failed"
+                    if state.current_step:
+                        for step in state.steps:
+                            if step.name == state.current_step and step.status == "running":
+                                step.status = "failed"
+                                step.error = error
+                                step.finished_at = utc_now()
+                                break
+                    self._finalize_failed_summary(state)
+                self._finish_queue_job(job_id, state.status, state.run_id, state.summary_path, "")
+                recovered += 1
                 continue
+            with self._db() as conn:
+                conn.execute(
+                    """
+                    update queue
+                    set status = 'failed', error = ?, updated_at = ?
+                    where job_id = ?
+                    """,
+                    (error, utc_now(), job_id),
+                )
+            recovered += 1
+        if handled_run_ids:
+            return recovered
+        if not queue_rows:
+            return recovered
+        with self._db() as conn:
+            rows = conn.execute("select run_id from runs where status = 'running'").fetchall()
+        if len(rows) == 1:
+            state = self.load_state(str(rows[0][0]))
             state.status = "failed"
             if state.current_step:
                 for step in state.steps:
@@ -415,16 +460,6 @@ class WorkflowRunner:
                         break
             self._finalize_failed_summary(state)
             recovered += 1
-        with self._db() as conn:
-            cursor = conn.execute(
-                """
-                update queue
-                set status = 'failed', error = ?, updated_at = ?
-                where status = 'running'
-                """,
-                (error, utc_now()),
-            )
-            recovered += int(cursor.rowcount or 0)
         return recovered
 
     def resume(self, run_id: str, verify_command: str | None = None, timeout_seconds: float | None = None) -> RunState:
@@ -1194,6 +1229,7 @@ class WorkflowRunner:
             model=config.model,
             task_type=config.task_type.strip() or "unspecified",
             base_ref=config.base_ref,
+            run_id=config.run_id,
             purpose=config.purpose,
             repair_for_run_id=config.repair_for_run_id,
         )
@@ -1204,36 +1240,41 @@ class WorkflowRunner:
         with self._db() as conn:
             conn.execute("begin immediate")
             rows = conn.execute(
-                "select job_id, config_json from queue where status = 'queued' order by created_at limit 100"
+                "select job_id, config_json, run_id from queue where status = 'queued' order by created_at limit 100"
             ).fetchall()
-            selected: tuple[str, str] | None = None
+            selected: tuple[str, str, str] | None = None
             for row in rows:
                 config = config_from_dict(json.loads(row[1]), self.state_dir)
                 if self._repo_key(config) in blocked_repo_paths:
                     continue
-                selected = (str(row[0]), str(row[1]))
+                selected = (str(row[0]), str(row[1]), str(row[2]) if row[2] else "")
                 break
             if selected is None:
                 conn.execute("commit")
                 return None
+            run_id = selected[2] if selected[2] else new_run_id()
             conn.execute(
-                "update queue set status = 'running', updated_at = ? where job_id = ?",
-                (now, selected[0]),
+                "update queue set status = 'running', run_id = ?, updated_at = ? where job_id = ?",
+                (run_id, now, selected[0]),
             )
             conn.execute("commit")
-        return selected[0], config_from_dict(json.loads(selected[1]), self.state_dir)
+        config = config_from_dict(json.loads(selected[1]), self.state_dir)
+        config.run_id = run_id
+        return selected[0], config
 
     def _load_claimed_queue_config(self, job_id: str) -> RunnerConfig:
         with self._db() as conn:
             row = conn.execute(
-                "select status, config_json from queue where job_id = ?",
+                "select status, config_json, run_id from queue where job_id = ?",
                 (job_id,),
             ).fetchone()
         if row is None:
             raise ValueError(f"queued job not found: {job_id}")
         if row[0] != "running":
             raise ValueError(f"queued job is not claimed/running: {job_id} status={row[0]}")
-        return config_from_dict(json.loads(row[1]), self.state_dir)
+        config = config_from_dict(json.loads(row[1]), self.state_dir)
+        config.run_id = str(row[2]) if row[2] else None
+        return config
 
     def _spawn_claimed_job(
         self,
@@ -1331,24 +1372,43 @@ class WorkflowRunner:
 
     def _fail_running_worker_child(self, job_id: str, child: ActiveWorkerJob, error: str) -> None:
         self._fail_running_queue_job(job_id, error)
+        run_id: str | None = None
         with self._db() as conn:
             row = conn.execute(
                 """
                 select run_id
-                from runs
-                where status = 'running'
-                  and repo_path = ?
-                  and created_at >= ?
-                order by created_at
-                limit 1
+                from queue
+                where job_id = ? and status = 'running'
                 """,
-                (child.repo_key, child.started_at_utc),
+                (job_id,),
             ).fetchone()
-        if row is None:
+        if row is not None and row[0]:
+            run_id = str(row[0])
+
+        if run_id is None:
+            with self._db() as conn:
+                row = conn.execute(
+                    """
+                    select run_id
+                    from runs
+                    where status = 'running'
+                      and repo_path = ?
+                      and created_at >= ?
+                    order by created_at
+                    limit 1
+                    """,
+                    (child.repo_key, child.started_at_utc),
+                ).fetchone()
+            if row is not None:
+                run_id = str(row[0])
+        if run_id is None:
             return
         try:
-            state = self.load_state(str(row[0]))
+            state = self.load_state(run_id)
         except FileNotFoundError:
+            return
+        if state.status != "running":
+            self._finish_queue_job(job_id, state.status, state.run_id, state.summary_path, error)
             return
         state.status = "failed"
         if state.current_step:
