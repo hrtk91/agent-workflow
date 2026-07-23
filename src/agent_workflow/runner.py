@@ -401,17 +401,8 @@ class WorkflowRunner:
         recovered = 0
         with self._db() as conn:
             queue_rows = conn.execute("select job_id, run_id from queue where status = 'running'").fetchall()
-        handled_run_ids: set[str] = set()
         for job_id, linked_run_id in queue_rows:
-            run_id = str(linked_run_id) if linked_run_id else None
-            if run_id is None:
-                with self._db() as conn:
-                    linked_by_job = conn.execute(
-                        "select run_id from runs where queue_job_id = ?",
-                        (job_id,),
-                    ).fetchone()
-                if linked_by_job is not None and linked_by_job[0] is not None:
-                    run_id = str(linked_by_job[0])
+            run_id = self._resolve_linked_run_id_for_queue_job(job_id, str(linked_run_id) if linked_run_id else None)
 
             if run_id is None:
                 with self._db() as conn:
@@ -426,7 +417,6 @@ class WorkflowRunner:
                 recovered += 1
                 continue
 
-            handled_run_ids.add(run_id)
             try:
                 state = self.load_state(run_id)
             except FileNotFoundError:
@@ -454,6 +444,16 @@ class WorkflowRunner:
             self._finish_queue_job(job_id, state.status, state.run_id, state.summary_path, "")
             recovered += 1
         return recovered
+
+    def _resolve_linked_run_id_for_queue_job(self, job_id: str, linked_run_id: str | None) -> str | None:
+        if linked_run_id:
+            return linked_run_id
+        with self._db() as conn:
+            row = conn.execute(
+                "select run_id from runs where queue_job_id = ?",
+                (job_id,),
+            ).fetchone()
+        return str(row[0]) if row and row[0] else None
 
     def resume(self, run_id: str, verify_command: str | None = None, timeout_seconds: float | None = None) -> RunState:
         state = self.load_state(run_id)
@@ -1373,7 +1373,7 @@ class WorkflowRunner:
                 """,
                 (job_id,),
             ).fetchone()
-        run_id = str(row[0]) if row and row[0] else None
+        run_id = self._resolve_linked_run_id_for_queue_job(job_id, str(row[0]) if row and row[0] else None)
         self._fail_running_queue_job(job_id, error)
         if run_id is None:
             return

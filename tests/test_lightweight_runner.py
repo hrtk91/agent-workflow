@@ -1565,6 +1565,74 @@ class LightweightRunnerTest(unittest.TestCase):
         self.assertTrue(run_executor["timed_out"])
         self.assertEqual(error, run_executor["error"])
 
+    def test_worker_child_timeout_marks_linked_run_failed(self) -> None:
+        runner = WorkflowRunner(self.state_dir)
+        job_id = runner.enqueue(
+            RunnerConfig(
+                state_dir=self.state_dir,
+                repo_path=self.repo,
+                task_text="Queue this fixture task with linked running run.",
+                verify_command="test -f implemented.txt",
+                executor_bin=str(self.fake_takt),
+                timeout_seconds=0.1,
+            )
+        )
+        linked_state = RunState(
+            run_id="running-linked-child-run",
+            status="running",
+            repo_path=str(self.repo.resolve()),
+            run_dir=str(self.state_dir / "runs" / "running-linked-child-run"),
+            task_dir=str(self.state_dir / "runs" / "running-linked-child-run" / "task"),
+            workflow="default",
+            verify_command="test -f implemented.txt",
+            timeout_seconds=0.1,
+            executor_bin=str(self.fake_takt),
+            queue_job_id=job_id,
+            summary_path=str(self.state_dir / "runs" / "running-linked-child-run" / "summary.md"),
+            current_step="run_executor",
+            created_at="2026-01-01T00:00:01+00:00",
+            updated_at="2026-01-01T00:00:01+00:00",
+            steps=[
+                StepState(name=name, status=("running" if name == "run_executor" else "pending"))
+                for name in ["load_task", "create_worktree", "run_executor", "run_qc", "write_summary"]
+            ],
+        )
+        Path(linked_state.task_dir).mkdir(parents=True)
+        Path(linked_state.task_dir, "task.md").write_text("task\n", encoding="utf-8")
+        runner.save_state(linked_state)
+        with sqlite3.connect(self.state_dir / "jobs.sqlite") as conn:
+            conn.execute(
+                "update queue set status='running', run_id=null, summary_path=null, error=null, updated_at=? where job_id = ?",
+                ("2026-01-01T00:00:00+00:00", job_id),
+            )
+        process = subprocess.Popen(["sleep", "0.1"], start_new_session=True)
+        self.addCleanup(process.wait)
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+
+        child = ActiveWorkerJob(
+            process=process,
+            repo_key=str(self.repo.resolve()),
+            started_at=0,
+            started_at_utc="2026-01-01T00:00:00+00:00",
+            timeout_seconds=0.1,
+        )
+        error = "worker child exceeded timeout_seconds=0.1"
+
+        runner._fail_running_worker_child(job_id, child, error)
+
+        conn = sqlite3.connect(self.state_dir / "jobs.sqlite")
+        queue_row = conn.execute(
+            "select status, run_id, summary_path, error from queue where job_id = ?",
+            (job_id,),
+        ).fetchone()
+        run_row = conn.execute(
+            "select queue_job_id, status, current_step from runs where run_id = ?",
+            (linked_state.run_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(("failed", linked_state.run_id, linked_state.summary_path, error), queue_row)
+        self.assertEqual((job_id, "failed", "run_executor"), run_row)
+
     def test_worker_child_timeout_without_linked_run_id_fails_queue_only(self) -> None:
         runner = WorkflowRunner(self.state_dir)
         job_id = runner.enqueue(
